@@ -1,3 +1,10 @@
+mod api;
+mod questions;
+mod sse;
+mod tools;
+mod transcript;
+mod types;
+
 fn main() {
-  println!("Hello, world!");
+  println!("slopfile: not yet wired");
 }
