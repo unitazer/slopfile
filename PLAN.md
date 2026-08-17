@@ -9,13 +9,34 @@
 - [x] Decisions locked (see below)
 - [x] `cargo init` + git init in `slopfile/`
 - [x] Deps added (tokio full, serde derive, serde_json, toml, tracing, tracing-subscriber, clap derive, reqwest no-default + json,stream,rustls, futures-util)
-- [ ] Scaffold transcript.rs (3-region parser, first-```toml-fence-only config)
-- [ ] Spike llama-server: reasoning_content / tool_calls / image_url parts (curl)
-- [ ] Headless turn loop + dangling-tail resume
-- [ ] 7 tools + question tool round-trip
+- [x] Scaffold transcript.rs (3-region parser, first-```toml-fence-only config)
+- [x] Spike llama-server: reasoning_content / tool_calls / image_url parts (curl)
+- [x] Headless turn loop + dangling-tail resume (live smoke-tested: draft → promote → stream → tool → @done)
+- [x] 7 tools + question tool round-trip + QUESTIONS rendering
+- [ ] QUESTION block answer resolution (ask vs yolo) end-to-end test
 - [ ] nvim plugin `:Send` `:Resume` `:Abort` + autoread live reload
 - [ ] compose `slopfile` service + host run
 - [ ] Polish: abort, truncation, yolo, /skip
+
+## Notes from live testing (2026-08-18)
+
+- llama-server REQUIRES the nested OpenAI tool-call shape on the wire:
+  `{"id", "type":"function", "function":{"name","arguments"}}` — a flat
+  `{id,name,arguments}` is rejected with 500. ToolCall now has custom
+  (De)serialize for this; `type_` always "function".
+- Streamed assistant output lives BELOW the last `@done`; after a tool round
+  the file is re-parsed and the below-`@done` sections are re-appended to the
+  LLM context via `transcript::tail_sections` (scan_lines extracted for reuse).
+- Dangling detection refined: an assistant section that closes all its tool
+  blocks (`<!-- result:` for each `<!-- tool:`) is NOT dangling — the daemon
+  continues the turn without cutting it. Only unclosed tool blocks or plain
+  partial text are cut on resume.
+- `app` config file lives at `docker-pi/shared/slopfile.toml` (host path
+  `[app]` section optional; flat fields now: confirmations, api_base, workdir,
+  transcripts_dir, sweep_interval_ms, model, tool_timeout_ms,
+  max_context_tokens).
+- Error throttle: a session that errors is skipped for 5 s (was hammering the
+  API every 250 ms on a bad file).
 
 ## What we are building
 
