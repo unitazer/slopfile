@@ -154,11 +154,7 @@ mod tests {
         let mut a = Agent::new(LlamaClient::new("http://x", "m"), SessionConfig::default());
         a.start_generation(&pf_with_history());
         a.last_gen = Some(StreamResult {
-            tool_calls: vec![ToolCall {
-                id: "1".into(),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            }],
+            tool_calls: vec![ToolCall::new("1", "bash", "{}")],
             ..Default::default()
         });
         a.finalize_generation();

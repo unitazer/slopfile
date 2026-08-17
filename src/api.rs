@@ -85,13 +85,11 @@ impl ToolCallAccumulator {
             .iter()
             .filter_map(|c| {
                 let name = c.function.as_ref()?.name.clone()?;
-                let id = c.id.clone().unwrap_or_default();
-                let args = c.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                Some(ToolCall {
-                    id,
+                Some(ToolCall::new(
+                    c.id.clone().unwrap_or_default(),
                     name,
-                    arguments: args,
-                })
+                    c.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default(),
+                ))
             })
             .collect()
     }

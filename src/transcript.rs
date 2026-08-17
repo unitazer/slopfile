@@ -139,6 +139,198 @@ enum Mode {
     ToolOutput,
 }
 
+/// Parse just the conversation sections of a text (no system-prompt glue):
+/// the section scan step shared by `parse_file` (history up to the last
+/// `@done`) and `tail_sections` (drafts / in-flight turns below `@done`).
+fn scan_lines(
+    lines: &[&str],
+    history: &mut Vec<ChatMessage>,
+    mode: &mut Mode,
+    user_buf: &mut String,
+    asst_text: &mut String,
+    asst_reasoning: &mut String,
+    in_thinking: &mut bool,
+    tool_calls: &mut Vec<ToolCall>,
+    tool_result: &mut Option<(String, String, String, bool)>,
+) {
+    // Finalize the current tool block (assistant + tool messages).
+    fn emit_tool(
+        history: &mut Vec<ChatMessage>,
+        asst_text: &mut String,
+        asst_reasoning: &mut String,
+        tool_calls: &mut Vec<ToolCall>,
+        tr: &mut Option<(String, String, String, bool)>,
+    ) {
+        let (name, args, output, _ok) = tr.take().expect("tool block open");
+        let id = tool_call_id(&name, &args);
+        let mut calls = std::mem::take(tool_calls);
+        calls.push(ToolCall::new(id.clone(), name.clone(), args));
+        // Assistant message carrying the call (with whatever text/reasoning
+        // preceded it inside this section).
+        history.push(ChatMessage {
+            role: Role::Assistant,
+            content: (!asst_text.trim().is_empty()).then(|| std::mem::take(asst_text)),
+            parts: None,
+            reasoning_content: (!asst_reasoning.trim().is_empty())
+                .then(|| std::mem::take(asst_reasoning)),
+            tool_calls: Some(calls),
+            tool_call_id: None,
+            name: None,
+        });
+        history.push(ChatMessage::tool(id, name, output));
+    }
+
+    // Finalize the current assistant plain message (or with accumulated calls).
+    fn emit_assistant(
+        history: &mut Vec<ChatMessage>,
+        asst_text: &mut String,
+        asst_reasoning: &mut String,
+        tool_calls: &mut Vec<ToolCall>,
+    ) {
+        let text = std::mem::take(asst_text);
+        let reasoning = std::mem::take(asst_reasoning);
+        let calls = std::mem::take(tool_calls);
+        if text.trim().is_empty() && reasoning.trim().is_empty() && calls.is_empty() {
+            return;
+        }
+        history.push(ChatMessage {
+            role: Role::Assistant,
+            content: (!text.trim().is_empty()).then_some(text),
+            parts: None,
+            reasoning_content: (!reasoning.trim().is_empty()).then_some(reasoning),
+            tool_calls: (!calls.is_empty()).then_some(calls),
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
+    for raw in lines {
+        let line = raw.trim();
+
+        // Section transitions (only outside a tool block).
+        if tool_result.is_none() {
+            match line {
+                "### You" => {
+                    // Close current assistant (if any).
+                    if *mode != Mode::System
+                        && (!asst_text.is_empty() || !asst_reasoning.is_empty() || !tool_calls.is_empty())
+                    {
+                        emit_assistant(history, asst_text, asst_reasoning, tool_calls);
+                    }
+                    user_buf.clear();
+                    *mode = Mode::You;
+                    continue;
+                }
+                "### Assistant" => {
+                    if *mode == Mode::You {
+                        if !user_buf.trim().is_empty() {
+                            history.push(ChatMessage::user(user_buf.trim()));
+                        }
+                        user_buf.clear();
+                    } else if *mode != Mode::System {
+                        emit_assistant(history, asst_text, asst_reasoning, tool_calls);
+                    }
+                    *mode = Mode::Asst;
+                    continue;
+                }
+                _ => {}
+            }
+        } else {
+            // Inside a tool block: wait for the closing result marker.
+            if line.starts_with("<!-- result:") {
+                let name = line
+                    .trim_start_matches("<!-- result:")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                emit_tool(history, asst_text, asst_reasoning, tool_calls, tool_result);
+                let _ = name;
+                *mode = Mode::Asst;
+                continue;
+            }
+        }
+
+        match mode {
+            Mode::System => {
+                // Extra stray content before first section: ignore.
+            }
+            Mode::You => {
+                user_buf.push_str(raw);
+                user_buf.push('\n');
+            }
+            Mode::Asst => {
+                // Thinking markers toggle accumulation into reasoning.
+                if line == THINK_START {
+                    *in_thinking = true;
+                    continue;
+                }
+                if line == THINK_END {
+                    *in_thinking = false;
+                    continue;
+                }
+                // Tool block opener: `<!-- tool:NAME ARGS_JSON -->`
+                if let Some(rest) = line.strip_prefix("<!-- tool:") {
+                    let Some(end_ix) = rest.find(" -->") else {
+                        continue;
+                    };
+                    let payload = &rest[..end_ix];
+                    let (name, args) = payload.split_once(' ').unwrap_or((payload, "{}"));
+                    *tool_result = Some((name.to_string(), args.to_string(), String::new(), true));
+                    *mode = Mode::ToolOutput;
+                    continue;
+                }
+                // Pre-tool text / reasoning.
+                if *in_thinking {
+                    asst_reasoning.push_str(raw);
+                    asst_reasoning.push('\n');
+                } else {
+                    asst_text.push_str(raw);
+                    asst_text.push('\n');
+                }
+            }
+            Mode::ToolOutput => {
+                if let Some((_, _, out, _)) = tool_result.as_mut() {
+                    out.push_str(raw);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+
+    // Flush trailing state.
+    if *mode == Mode::You && !user_buf.trim().is_empty() {
+        history.push(ChatMessage::user(user_buf.trim()));
+    }
+    if tool_result.is_some() {
+        // Unterminated tool block (resume point): emit as assistant tool call
+        // with the partial output as the result.
+        emit_tool(history, asst_text, asst_reasoning, tool_calls, tool_result);
+    } else {
+        emit_assistant(history, asst_text, asst_reasoning, tool_calls);
+    }
+}
+
+/// Parse the below-`@done` region into conversation messages (drafts,
+/// in-flight turns, tool blocks). The daemon appends these to the history
+/// when building the next request so mid-turn state survives re-parses.
+pub fn tail_sections(tail: &str) -> Vec<ChatMessage> {
+    let lines: Vec<&str> = tail.lines().collect();
+    let mut history = Vec::new();
+    let mut mode = Mode::System;
+    let mut user_buf = String::new();
+    let mut asst_text = String::new();
+    let mut asst_reasoning = String::new();
+    let mut in_thinking = false;
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_result: Option<(String, String, String, bool)> = None;
+    scan_lines(
+        &lines, &mut history, &mut mode, &mut user_buf, &mut asst_text, &mut asst_reasoning,
+        &mut in_thinking, &mut tool_calls, &mut tool_result,
+    );
+    history
+}
+
 pub fn parse_file(text: &str) -> ParsedFile {
     let config = header_config(text);
     let lines: Vec<&str> = text.lines().collect();
@@ -220,172 +412,34 @@ pub fn parse_file(text: &str) -> ParsedFile {
     // (name, args_json, output_text, ok)
     let mut tool_result: Option<(String, String, String, bool)> = None;
 
-    // Finalize the current tool block (assistant + tool messages).
-    fn emit_tool(
-        history: &mut Vec<ChatMessage>,
-        asst_text: &mut String,
-        asst_reasoning: &mut String,
-        tool_calls: &mut Vec<ToolCall>,
-        tr: &mut Option<(String, String, String, bool)>,
-    ) {
-        let (name, args, output, _ok) = tr.take().expect("tool block open");
-        let id = tool_call_id(&name, &args);
-        let mut calls = std::mem::take(tool_calls);
-        calls.push(ToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            arguments: args,
-        });
-        // Assistant message carrying the call (with whatever text/reasoning
-        // preceded it inside this section).
-        history.push(ChatMessage {
-            role: Role::Assistant,
-            content: (!asst_text.trim().is_empty()).then(|| std::mem::take(asst_text)),
-            parts: None,
-            reasoning_content: (!asst_reasoning.trim().is_empty())
-                .then(|| std::mem::take(asst_reasoning)),
-            tool_calls: Some(calls),
-            tool_call_id: None,
-            name: None,
-        });
-        history.push(ChatMessage::tool(id, name, output));
-    }
-
-    // Finalize the current assistant plain message (or with accumulated calls).
-    fn emit_assistant(
-        history: &mut Vec<ChatMessage>,
-        asst_text: &mut String,
-        asst_reasoning: &mut String,
-        tool_calls: &mut Vec<ToolCall>,
-    ) {
-        let text = std::mem::take(asst_text);
-        let reasoning = std::mem::take(asst_reasoning);
-        let calls = std::mem::take(tool_calls);
-        if text.trim().is_empty() && reasoning.trim().is_empty() && calls.is_empty() {
-            return;
-        }
-        history.push(ChatMessage {
-            role: Role::Assistant,
-            content: (!text.trim().is_empty()).then_some(text),
-            parts: None,
-            reasoning_content: (!reasoning.trim().is_empty()).then_some(reasoning),
-            tool_calls: (!calls.is_empty()).then_some(calls),
-            tool_call_id: None,
-            name: None,
-        });
-    }
-
-    for (idx, raw) in lines.iter().enumerate().take(history_end) {
-        let line = raw.trim();
-
-        // Section transitions (only outside a tool block).
-        if tool_result.is_none() {
-            match line {
-                "### You" => {
-                    // Close current assistant (if any).
-                    if mode != Mode::System && !asst_text.is_empty() || !asst_reasoning.is_empty() || !tool_calls.is_empty() {
-                        emit_assistant(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls);
-                    }
-                    user_buf = String::new();
-                    mode = Mode::You;
-                    continue;
-                }
-                "### Assistant" => {
-                    if mode == Mode::You {
-                        if !user_buf.trim().is_empty() {
-                            history.push(ChatMessage::user(user_buf.trim()));
-                        }
-                        user_buf.clear();
-                    } else if mode != Mode::System {
-                        emit_assistant(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls);
-                    }
-                    mode = Mode::Asst;
-                    continue;
-                }
-                _ => {}
-            }
-        } else {
-            // Inside a tool block: wait for the closing result marker.
-            if let Some(rest) = line.strip_prefix("<!-- result:") {
-                let name = rest.split_whitespace().next().unwrap_or("").to_string();
-                emit_tool(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls, &mut tool_result);
-                let _ = name;
-                mode = Mode::Asst;
-                continue;
-            }
-        }
-
-        match mode {
-            Mode::System => {
-                // Extra stray content before first section: ignore.
-            }
-            Mode::You => {
-                user_buf.push_str(raw);
-                user_buf.push('\n');
-            }
-            Mode::Asst => {
-                // Thinking markers toggle accumulation into reasoning.
-                if line == THINK_START {
-                    in_thinking = true;
-                    continue;
-                }
-                if line == THINK_END {
-                    in_thinking = false;
-                    continue;
-                }
-                // Tool block opener: `<!-- tool:NAME ARGS_JSON -->`
-                if let Some(rest) = line.strip_prefix("<!-- tool:") {
-                    let Some(end_ix) = rest.find(" -->") else {
-                        continue;
-                    };
-                    let payload = &rest[..end_ix];
-                    let (name, args) = payload.split_once(' ').unwrap_or((payload, "{}"));
-                    tool_result = Some((name.to_string(), args.to_string(), String::new(), true));
-                    mode = Mode::ToolOutput;
-                    continue;
-                }
-                // Pre-tool text / reasoning.
-                if in_thinking {
-                    asst_reasoning.push_str(raw);
-                    asst_reasoning.push('\n');
-                } else {
-                    asst_text.push_str(raw);
-                    asst_text.push('\n');
-                }
-            }
-            Mode::ToolOutput => {
-                if let Some((_, _, out, _)) = tool_result.as_mut() {
-                    out.push_str(raw);
-                    out.push('\n');
-                }
-            }
-        }
-    }
-
-    // Flush trailing state.
-    if mode == Mode::You && !user_buf.trim().is_empty() {
-        history.push(ChatMessage::user(user_buf.trim()));
-    }
-    if tool_result.is_some() {
-        // Unterminated tool block (resume point): emit as assistant tool call
-        // with the partial output as the result.
-        emit_tool(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls, &mut tool_result);
-    } else {
-        emit_assistant(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls);
-    }
+    scan_lines(&lines[..history_end], &mut history, &mut mode, &mut user_buf, &mut asst_text, &mut asst_reasoning, &mut in_thinking, &mut tool_calls, &mut tool_result);
 
     // ── Dangling detection ──
+    //
+    // An assistant section is "dangling" (interrupted output) only when it
+    // has no `@done` below it, no `### You` after it, and its tool blocks
+    // are not all closed (`<!-- result:` for every `<!-- tool:`). A closed
+    // tool round is complete history — the daemon continues the turn without
+    // cutting it away.
     let dangling = if let Some(&last_asst) = asst_lines.last() {
         let after_ix = line_offset(text, last_asst);
         let after = &text[after_ix..];
         let has_done_after = after.contains(DONE_MARKER);
-        // Only the final assistant (no later You turning it into history).
         let has_next_you = you_lines.last().is_some_and(|&y| y > last_asst);
         if !has_done_after && !has_next_you {
-            Some(DanglingTail {
-                resume_offset: after_ix + "### Assistant\n".len(),
-                partial_text: after.strip_prefix("### Assistant").unwrap_or(after).to_string(),
-            })
+            let header_off = after.find("### Assistant").unwrap_or(0) + "### Assistant".len();
+            let section = &after[header_off..];
+            let tools = section.matches("<!-- tool:").count();
+            let results = section.matches("<!-- result:").count();
+            let has_content = !section.trim().is_empty();
+            if tools > results || (tools == 0 && has_content) {
+                Some(DanglingTail {
+                    resume_offset: after_ix + "### Assistant\n".len(),
+                    partial_text: after.strip_prefix("### Assistant").unwrap_or(after).to_string(),
+                })
+            } else {
+                None
+            }
         } else {
             None
         }

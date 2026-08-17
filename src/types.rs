@@ -34,14 +34,76 @@ pub struct ImageUrl {
 
 // ── Tool calls ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A tool call issued by the assistant.
+///
+/// Kept in OpenAI wire shape: `{"id", "type", "function": {"name",
+/// "arguments"}}`. The struct fields stay flat internally; custom
+/// (De)serialize maps to the nested shape llama-server expects.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
   /// Server-assigned id, e.g. "2p4IMWaD5dEwtO0iFX36MTxBj5cYNF1".
   pub id: String,
+  /// Wire-required discriminator; always "function".
+  pub type_: String,
   pub name: String,
   /// Raw JSON string of the arguments object (never pre-parsed to Value
   /// because re-serializing must round-trip byte-exactly).
   pub arguments: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FunctionCallWire {
+  name: String,
+  arguments: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ToolCallWire {
+  id: String,
+  #[serde(rename = "type", default = "default_tool_call_type")]
+  type_: String,
+  function: FunctionCallWire,
+}
+
+impl serde::Serialize for ToolCall {
+  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    ToolCallWire {
+      id: self.id.clone(),
+      type_: "function".to_string(),
+      function: FunctionCallWire {
+        name: self.name.clone(),
+        arguments: self.arguments.clone(),
+      },
+    }
+    .serialize(s)
+  }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolCall {
+  fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+    let w = ToolCallWire::deserialize(d)?;
+    Ok(Self {
+      id: w.id,
+      type_: w.type_,
+      name: w.function.name,
+      arguments: w.function.arguments,
+    })
+  }
+}
+
+impl ToolCall {
+  pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
+    Self {
+      id: id.into(),
+      type_: "function".to_string(),
+      name: name.into(),
+      arguments: arguments.into(),
+    }
+  }
+}
+
+fn default_tool_call_type() -> String {
+  "function".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
