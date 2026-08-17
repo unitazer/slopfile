@@ -211,7 +211,7 @@ pub struct SseFunctionDelta {
   pub arguments: Option<String>, // incremental fragments
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct Usage {
   #[serde(default)]
   pub prompt_tokens: u32,
