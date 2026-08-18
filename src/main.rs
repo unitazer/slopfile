@@ -910,11 +910,35 @@ fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String>
 /// Can the pending questions be resolved right now? In ask mode: the user
 /// must have written answers below `> ` or typed `/skip`. In yolo mode:
 /// always (defaults or the first option).
+///
+/// Only the FIRST pending block gates progress: `resolve_questions` works
+/// first-to-last and re-reads the leftmost `❓ QUESTIONS` header each pass.
+/// Scoping resolvability to that same leftmost block keeps the two in sync —
+/// if a later block were answered while an earlier one sat unanswered,
+/// `resolve_questions` would skip the leading block (never consuming it) and
+/// the caller would livelock re-entering the identical file.
 fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
   if cfg.confirmations == "yolo" {
     return true;
   }
-  user_answers_from_tail(&pf.tail).is_some() || has_skip(&pf.tail)
+  match questions_block_region(&pf.tail) {
+    Some(block) => user_answers_from_tail(block).is_some() || has_skip(block),
+    None => false,
+  }
+}
+
+/// The text of the leftmost QUESTIONS block in `tail`: from the `❓ QUESTIONS`
+/// header through the end of its `<!-- call: ... -->` line.
+fn questions_block_region(tail: &str) -> Option<&str> {
+  let header_ix = tail.find(questions::BLOCK_HEADER)?;
+  let end_ix = tail[header_ix..]
+    .find("<!-- call:")
+    .and_then(|ix| {
+      let line_start = header_ix + ix;
+      tail[line_start..].find('\n').map(|nl| line_start + nl + 1)
+    })
+    .unwrap_or(tail.len());
+  Some(&tail[header_ix..end_ix])
 }
 
 /// True if the tail contains a `/skip` line (answer questions with
@@ -992,8 +1016,11 @@ fn resolve_questions(
           (q.id, ans)
         })
         .collect::<Vec<_>>(),
-      // ask: not answered, not skipped — keep waiting for the user.
-      (None, false) => continue,
+      // ask: not answered, not skipped — keep waiting for the user. A
+      // leading unanswered block stalls later blocks (they resolve in file
+      // order), so stop: this pass has already flushed any earlier resolved
+      // blocks via `out`, and the caller re-checks the leftmost block.
+      (None, false) => break,
     };
 
     // Re-read the stash comment for the full tool call.

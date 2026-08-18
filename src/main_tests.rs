@@ -160,6 +160,38 @@ fn yolo_cfg() -> AppConfig {
   }
 
   #[test]
+  fn ask_mode_unanswered_leading_block_stalls_later_answered_block() {
+    let dir = std::env::temp_dir().join("slopfile-test-ask-order");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.md");
+
+    // Block A: id 1, empty answer line (still awaiting the user).
+    // Block B: id 2, answered with `> blue`.
+    let block_a = "❓ QUESTIONS\n| # | Question | Options |\n| 1 | red or blue | red, blue |\nANSWER: (numbers or text, comma separated)\n>\n";
+    let block_b = "❓ QUESTIONS\n| # | Question | Options |\n| 2 | how long? | 3, 5, 10 |\nANSWER: (numbers or text, comma separated)\n> \nblue\n";
+    let text = format!(
+      "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\n<!-- @done -->\n\n{block_a}<!-- q:1 {{\"question\":\"red or blue?\",\"answers\":[\"red\",\"blue\"]}} -->\n<!-- call:question {{\"data\":[{{\"question\":\"red or blue?\",\"answers\":[\"red\",\"blue\"]}}]}} -->\n\n{block_b}<!-- q:2 {{\"question\":\"how long?\",\"answers\":[\"3\",\"5\",\"10\"]}} -->\n<!-- call:question {{\"data\":[{{\"question\":\"how long?\",\"answers\":[\"3\",\"5\",\"10\"]}}]}} -->\n"
+    );
+    std::fs::write(&path, &text).unwrap();
+
+    let pf = transcript::parse_file(&text);
+    assert_eq!(pf.pending_questions.len(), 2, "two pending blocks parsed");
+    let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
+    assert!(
+      !questions_resolvable(&pf, &cfg),
+      "leading unanswered block must gate resolvability"
+    );
+
+    // Must not resolve the later answered block out of order nor livelock.
+    resolve_questions(&path, &text, &pf, &cfg).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("❓ QUESTIONS"), "block A stays pending");
+    assert!(after.contains("\nblue\n"), "block B answer not consumed");
+    assert!(!after.contains("<!-- tool:question"), "no block resolved");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
   fn abort_marker_is_stripped_but_rest_preserved() {
     let dir = std::env::temp_dir().join("slopfile-test-abort");
     std::fs::create_dir_all(&dir).unwrap();
