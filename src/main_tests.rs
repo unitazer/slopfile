@@ -210,3 +210,51 @@ use crate::types::Role;
     assert_eq!(draft_tail_after_done(&text).map(|s| s.trim().to_string()), Some("keep running daemons".into()));
     std::fs::remove_dir_all(&dir).ok();
   }
+
+  #[test]
+  fn session_template_has_default_header_and_prompt() {
+    let cfg = yolo_cfg();
+    let tpl = session_template(&cfg);
+    assert!(tpl.contains("```toml\n"), "header fence: {tpl}");
+    assert!(tpl.contains("model = \"qwen3.8-27b\""), "default model: {tpl}");
+    assert!(tpl.contains("tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\"]"));
+    assert!(tpl.contains("# Session\n"), "session heading: {tpl}");
+    // pi-derived system prompt.
+    assert!(tpl.contains("You are an expert coding assistant operating inside slopfile"));
+    assert!(tpl.contains("This session is a Markdown transcript file"));
+    assert!(tpl.contains("- read: Read files as numbered lines"));
+    assert!(tpl.contains("Use read to examine files before editing"));
+    assert!(tpl.contains("Current working directory: /tmp"));
+    // Empty first-user slot; the file itself parses back as system-only.
+    assert!(tpl.ends_with("### You\n"));
+    let pf = transcript::parse_file(&tpl);
+    assert_eq!(pf.history.len(), 1, "system message only");
+    assert_eq!(pf.history[0].role, Role::System);
+    assert!(pf.system_prompt.contains("expert coding assistant"));
+    assert!(!pf.system_prompt.contains("# Session"), "heading stripped from prompt");
+  }
+
+  #[test]
+  fn init_refuses_nonempty_and_initializes_empty() {
+    let dir = std::env::temp_dir().join("slopfile-test-init");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = yolo_cfg();
+
+    let with_content = dir.join("busy.md");
+    std::fs::write(&with_content, "user wrote this\n").unwrap();
+    let err = init_template_for(&with_content.to_string_lossy(), &cfg);
+    assert!(err.is_err(), "non-empty file must be refused");
+    assert_eq!(std::fs::read_to_string(&with_content).unwrap(), "user wrote this\n");
+
+    let empty = dir.join("fresh.md");
+    std::fs::write(&empty, "").unwrap();
+    let tpl = init_template_for(&empty.to_string_lossy(), &cfg).expect("empty file initializes");
+    assert!(tpl.contains("### You"));
+    assert_eq!(std::fs::read_to_string(&empty).unwrap(), "", "init_template_for must not write");
+
+    let missing = dir.join("missing.md");
+    let tpl2 = init_template_for(&missing.to_string_lossy(), &cfg).expect("missing file initializes");
+    assert!(tpl2.contains("model = \"qwen3.8-27b\""));
+
+    std::fs::remove_dir_all(&dir).ok();
+  }

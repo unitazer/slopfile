@@ -2,6 +2,7 @@
 --
 -- The slopfile daemon watches session `.md` files (transcripts dir) and
 -- streams deltas into them. This plugin gives you:
+--   :Init    — save an empty buffer; the daemon formats it as a new session
 --   :Send    — save the buffer, trigger the daemon sweep (draft → history)
 --   :Resume  — save + force a re-parse of dangling output / question block
 --   :Abort   — append the abort marker; daemon stops streaming, closes @done
@@ -29,6 +30,16 @@ local function checktime()
   -- Pick up daemon-written changes (status line, streamed text).
   vim.o.autoread = true
   pcall(vim.cmd, "checktime")
+end
+
+function M.init()
+  if not is_session_buf() then
+    vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
+    return
+  end
+  vim.cmd("write")
+  checktime()
+  vim.notify("slopfile: init requested (daemon formats empty sessions)", vim.log.levels.INFO)
 end
 
 function M.send()
@@ -103,6 +114,7 @@ function M.setup(opts)
 end
 
 -- Commands (no Pi prefix, per project convention).
+vim.api.nvim_create_user_command("Init", M.init, {})
 vim.api.nvim_create_user_command("Send", M.send, {})
 vim.api.nvim_create_user_command("Resume", M.resume, {})
 vim.api.nvim_create_user_command("Abort", M.abort, {})

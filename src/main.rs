@@ -12,6 +12,7 @@ mod transcript;
 mod types;
 
 use api::LlamaClient;
+use clap::{Parser, Subcommand};
 use questions::{parse_answers, QuestionsBlock};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -23,6 +24,26 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use transcript::{DONE_MARKER, ParsedFile};
 use types::{AppConfig, ChatMessage, Role, ToolCall};
+
+#[derive(Parser)]
+#[command(
+  name = "slopfile",
+  about = "file-as-UI coding agent daemon: streams llama-server responses into session .md files"
+)]
+struct Cli {
+  #[command(subcommand)]
+  command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+  /// Write the default session template (header + system prompt) into a new
+  /// or empty .md file. Refuses to touch a non-empty file.
+  Init {
+    /// Path of the session file to initialize
+    path: String,
+  },
+}
 
 /// Host path; the container variant sets `SLOPFILE_CONFIG` to
 /// `/shared/slopfile.toml`.
@@ -62,6 +83,11 @@ async fn main() {
     .init();
 
   let app_cfg = load_app_config();
+  let cli = Cli::parse();
+  if let Some(Command::Init { path }) = cli.command {
+    return cmd_init(&path, &app_cfg);
+  }
+
   info!(
     "slopfile: workdir={} transcripts={} model={} api={} sweep={}ms confirmations={}",
     app_cfg.workdir,
@@ -139,6 +165,17 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
     }
 
     let text = read_file(path)?;
+
+    // A fresh empty file is a brand-new session: lay down the default
+    // template (header + system prompt). Re-check the disk so we never
+    // clobber text the user typed between the two reads.
+    if text.trim().is_empty() {
+      if read_file(path)?.trim().is_empty() {
+        write_file(path, session_template(cfg))?;
+        info!("→ {path:?}: initialized empty session");
+      }
+      return Ok(());
+    }
 
     // Abort marker present while idle: nothing is running, just drop the
     // marker line and refresh the status. (During a stream the marker is
@@ -518,6 +555,86 @@ impl<'a> StreamWriter<'a> {
       warn!("stream write failed: {e}");
     }
   }
+}
+
+// ── Session init ────────────────────────────────────────────────────────
+
+/// `slopfile init <path>`: write the default template into a new or empty
+/// file. Refuses to overwrite anything with content.
+fn cmd_init(path: &str, cfg: &AppConfig) {
+  match init_template_for(path, cfg) {
+    Ok(content) => match std::fs::write(path, content) {
+      Ok(()) => println!("initialized {path}"),
+      Err(e) => {
+        eprintln!("slopfile init: cannot write {path}: {e}");
+        std::process::exit(1);
+      }
+    },
+    Err(e) => {
+      eprintln!("slopfile init: {e}");
+      std::process::exit(1);
+    }
+  }
+}
+
+/// Resolve what `init` would write. Err when the file exists with content.
+fn init_template_for(path: &str, cfg: &AppConfig) -> Result<String, String> {
+  if let Ok(existing) = std::fs::read_to_string(path) {
+    if !existing.trim().is_empty() {
+      return Err(format!("{path} exists and is not empty; refusing to overwrite"));
+    }
+  }
+  Ok(session_template(cfg))
+}
+
+/// The default session file: header (default settings) + system prompt
+/// (adapted from pi) + an empty `### You` section for the first message.
+pub fn session_template(cfg: &AppConfig) -> String {
+  let mut out = String::new();
+  out.push_str("```toml\n");
+  out.push_str(&format!("model = \"{}\"\n", cfg.model));
+  out.push_str("thinking = \"auto\"\n");
+  out.push_str("tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\"]\n");
+  out.push_str("```\n");
+  out.push_str("# Session\n");
+  out.push_str(&system_prompt_default(cfg));
+  out.push_str("\n### You\n");
+  out
+}
+
+/// The default system prompt, adapted from pi's `default_system_prompt`
+/// (pi_agent_rust/src/app.rs) to slopfile's tool set and file-as-UI format.
+fn system_prompt_default(cfg: &AppConfig) -> String {
+  format!(
+    "You are an expert coding assistant operating inside slopfile, a file-as-UI coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+
+This session is a Markdown transcript file:
+- Your replies are streamed under `### Assistant` headings.
+- Tool calls and results appear as `<!-- tool:NAME ARGS -->` / `<!-- result:NAME ok=... -->` blocks.
+- A completed turn ends with `<!-- @done -->`; anything below the last `@done` is the next turn's draft.
+- When you need the user to make a choice, call the `question` tool instead of guessing.
+
+Available tools:
+- read: Read files as numbered lines
+- write: Create or overwrite files
+- edit: Replace the first occurrence of a text fragment in a file
+- bash: Execute shell commands (ls, grep, find, etc.) in the workdir
+- grep: Search file contents for a substring
+- find: Find files by name suffix pattern
+- ls: List directory contents
+
+Guidelines:
+- Prefer grep/find/ls tools over bash for file exploration
+- Use read to examine files before editing. You must use this tool instead of cat or sed.
+- Use edit for precise changes (old text must match exactly)
+- Use write only for new files or complete rewrites
+- When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did
+- Be concise in your responses
+- Show file paths clearly when working with files
+
+Current working directory: {}",
+    cfg.workdir
+  )
 }
 
 // ── Conversation truncation ─────────────────────────────────────────────
