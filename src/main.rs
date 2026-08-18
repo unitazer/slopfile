@@ -250,18 +250,26 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
   false
 }
 
-/// Raw text below the last `@done` marker (status line stripped).
+/// Raw user text below the last `@done` marker (status line and daemon-owned
+/// comment lines stripped).
 fn section_below_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
   let done = transcript::find_done_marker(&body)?;
-  let tail = body[done + DONE_MARKER.len()..].trim().to_string();
-  if tail.is_empty() {
+  let tail = &body[done + DONE_MARKER.len()..];
+  let user_tail = tail
+    .lines()
+    .filter(|l| !is_daemon_owned(l))
+    .collect::<Vec<_>>()
+    .join("\n")
+    .trim()
+    .to_string();
+  if user_tail.is_empty() {
     return None;
   }
-  if tail.starts_with(questions::BLOCK_HEADER) {
+  if user_tail.starts_with(questions::BLOCK_HEADER) {
     return None;
   }
-  Some(tail)
+  Some(user_tail)
 }
 
 enum TurnOutcome {
@@ -369,6 +377,29 @@ async fn run_generation_turn(
   }
 
   active.finish_section();
+
+  if result.finish_reason.as_deref() == Some("length") {
+    // The model hit the token cap mid-turn. Close the turn and stop: the
+    // partial output stays, a note tells the user to trim old turns, and the
+    // daemon goes idle. Any partially-streamed tool calls are NOT executed
+    // (their argument JSON may be truncated).
+    let text_now = read_file(path)?;
+    let (body, live) = strip_live_line(&text_now);
+    let mut out = body;
+    if !out.ends_with('\n') {
+      out.push('\n');
+    }
+    out.push_str(&format!("{DONE_MARKER}\n"));
+    out.push_str(&format!("{CONTEXT_FULL_NOTE}\n"));
+    if let Some(live) = live {
+      out.push('\n');
+      out.push_str(&live);
+    }
+    write_file(path, out)?;
+    write_status(path, pf, "idle")?;
+    warn!("⚠ {path:?}: context exhausted mid-turn (finish_reason=length)");
+    return Ok(TurnOutcome::Done);
+  }
 
   if !result.tool_calls.is_empty() {
     let is_question = result.tool_calls.iter().any(|t| t.name == "question");
@@ -558,6 +589,19 @@ impl<'a> StreamWriter<'a> {
 }
 
 // ── Session init ────────────────────────────────────────────────────────
+
+/// Daemon-owned comment lines never reach the LLM and are never treated as
+/// user drafts. Written below `@done` when the model hits the token cap
+/// mid-response; the user trims old turns and writes the next message below
+/// it.
+pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit the token cap mid-response; trim the useless old turns above, then write your next message below this note -->";
+
+/// True for daemon-owned control comments (`<!-- slopfile:... -->`): the
+/// live status line, the abort marker, the context-full note. These are
+/// never user content — strip them from draft/section scans.
+fn is_daemon_owned(line: &str) -> bool {
+  line.trim_start().starts_with("<!-- slopfile:")
+}
 
 /// `slopfile init <path>`: write the default template into a new or empty
 /// file. Refuses to overwrite anything with content.
@@ -979,15 +1023,28 @@ fn resolve_questions(
 // ── Draft promotion ─────────────────────────────────────────────────────
 
 /// Insert a `### You` header before drafted tail text (below the last
-/// `@done` marker) so it becomes history.
+/// `@done` marker) so it becomes history. Daemon-owned comment lines
+/// (e.g. the context-full note) are skipped and stay above the section.
 fn promote_draft(path: &Path, text: &str, pf: &ParsedFile) -> Result<(), String> {
   let (body, live) = strip_live_line(text);
   let done_ix = transcript::find_done_marker(&body)
     .map(|ix| ix + DONE_MARKER.len())
     .unwrap_or(0);
 
-  // Insert `### You\n` right after the marker's newline.
-  let marker_end = done_ix;
+  // Byte length of the leading blank + daemon-owned comment lines.
+  let rest = &body[done_ix..];
+  let mut skip = 0usize;
+  for l in rest.lines() {
+    if l.trim().is_empty() || is_daemon_owned(l) {
+      skip += l.len() + 1;
+    } else {
+      break;
+    }
+  }
+  skip = skip.min(rest.len());
+
+  // Insert `### You\n` right after the skipped lines.
+  let marker_end = done_ix + skip;
   let mut out = String::new();
   out.push_str(&body[..marker_end]);
   if !out.is_empty() && !out.ends_with('\n') {
@@ -1004,27 +1061,35 @@ fn promote_draft(path: &Path, text: &str, pf: &ParsedFile) -> Result<(), String>
   Ok(())
 }
 
-/// Tail text below the last `@done` that is NOT a questions block and NOT an
-/// existing section header (`### You` / `### Assistant`) — i.e. user draft to
-/// promote. Returns None when there is no draft.
+/// Tail text below the last `@done` that is NOT a questions block, NOT an
+/// existing section header (`### You` / `### Assistant`), and NOT a
+/// daemon-owned comment — i.e. user draft to promote. Returns None when
+/// there is no draft.
 fn draft_tail_after_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
   let done = transcript::find_done_marker(&body)?;
-  let tail = body[done + DONE_MARKER.len()..].trim().to_string();
-  if tail.is_empty() {
+  let tail = &body[done + DONE_MARKER.len()..];
+  let user_tail = tail
+    .lines()
+    .filter(|l| !is_daemon_owned(l))
+    .collect::<Vec<_>>()
+    .join("\n")
+    .trim()
+    .to_string();
+  if user_tail.is_empty() {
     return None;
   }
   // If the tail is ONLY the QUESTIONS block (and its stash comments), it is
   // not a draft — questions are handled separately.
-  if tail.starts_with(questions::BLOCK_HEADER) {
+  if user_tail.starts_with(questions::BLOCK_HEADER) {
     return None;
   }
   // Already stays in history: user typed `### You`, or daemon promoted and
   // the turn is running / waiting. Do NOT re-promote.
-  if tail.starts_with("### ") {
+  if user_tail.starts_with("### ") {
     return None;
   }
-  Some(tail)
+  Some(user_tail)
 }
 
 // ── Misc helpers ────────────────────────────────────────────────────────

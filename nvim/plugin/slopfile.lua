@@ -8,32 +8,80 @@
 --   :Abort   — append the abort marker; daemon stops streaming, closes @done
 --   :Status  — re-render the live status line
 --
--- Autoread: the buffer auto-reloads on CursorHold / BufEnter so streamed
--- tokens appear live.
+-- Autoread: a 1s timer reloads the buffer while the daemon streams (a pure
+-- CursorHold approach fails because every keystroke/move resets the idle
+-- timer). When your cursor is on the last line the view follows the stream
+-- to the new tail. Unsaved text is never clobbered — `:checktime` refuses
+-- to reload a modified buffer, so save (:Send) before expecting updates.
 --
 -- Install: put this file anywhere on &runtimepath (e.g.
 -- `nvim/plugin/slopfile.lua` or add it with lazy.nvim), or
 -- `:source slopfile.nvim` from your config.
 --
--- Config: g:slopfile_autoread (default 1) enables checktime-on-hold.
+-- Config: g:slopfile_autoread (default 1) enables the poll + checktime;
+-- g:slopfile_poll_ms (default 1000) sets the poll interval.
 
 local M = {}
 
 local ABORT_MARKER = "<!-- slopfile:abort -->"
 
-local function is_session_buf()
-  local name = vim.api.nvim_buf_get_name(0)
+local function is_session_buf(bufnr)
+  local name = vim.api.nvim_buf_get_name(bufnr or 0)
   return name:match("%.md$") ~= nil
 end
 
-local function checktime()
-  -- Pick up daemon-written changes (status line, streamed text).
-  vim.o.autoread = true
+-- Reload the current buffer if the file changed on disk (daemon writes).
+-- Never clobbers unsaved text: `:checktime` refuses to reload a modified
+-- buffer. If the cursor was on the last line, follow the stream so newly
+-- streamed tokens stay visible.
+function M._refresh()
+  if not is_session_buf(0) then
+    return
+  end
+  local buf = vim.api.nvim_get_current_buf()
+  local last_before = vim.api.nvim_buf_line_count(buf)
+  local cursor_before = vim.api.nvim_win_get_cursor(0)[1]
   pcall(vim.cmd, "checktime")
+  local last_after = vim.api.nvim_buf_line_count(buf)
+  if last_after ~= last_before and cursor_before == last_before then
+    vim.api.nvim_win_set_cursor(0, { last_after, 0 })
+  end
+end
+
+local function checktime()
+  vim.o.autoread = true
+  M._refresh()
+end
+
+local function start_poll()
+  if M.timer ~= nil then
+    return
+  end
+  local interval = vim.g.slopfile_poll_ms or 1000
+  -- 1s poll: streamed tokens appear even while the cursor moves or the user
+  -- types (CursorHold keeps resetting on any input).
+  M.timer = vim.fn.timer_start(interval, function()
+    M._refresh()
+  end, { ["repeat"] = -1 })
+end
+
+local function setup_autoread()
+  if vim.g.slopfile_autoread == 0 then
+    return
+  end
+  vim.o.autoread = true
+  local group = vim.api.nvim_create_augroup("slopfile_autoread", { clear = true })
+  -- Fast paths on top of the poll: CursorHold after idle, entering a window,
+  -- refocusing, and right after a :write.
+  vim.api.nvim_create_autocmd(
+    { "CursorHold", "CursorHoldI", "BufEnter", "FocusGained", "BufWritePost" },
+    { group = group, pattern = "*.md", callback = checktime }
+  )
+  start_poll()
 end
 
 function M.init()
-  if not is_session_buf() then
+  if not is_session_buf(0) then
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
@@ -43,7 +91,7 @@ function M.init()
 end
 
 function M.send()
-  if not is_session_buf() then
+  if not is_session_buf(0) then
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
@@ -53,7 +101,7 @@ function M.send()
 end
 
 function M.resume()
-  if not is_session_buf() then
+  if not is_session_buf(0) then
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
@@ -63,7 +111,7 @@ function M.resume()
 end
 
 function M.abort()
-  if not is_session_buf() then
+  if not is_session_buf(0) then
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
@@ -92,23 +140,13 @@ function M.status()
   vim.notify("slopfile: no live status line (daemon may be down)", vim.log.levels.WARN)
 end
 
-local function setup_autoread()
-  if vim.g.slopfile_autoread == 0 then
-    return
-  end
-  vim.o.autoread = true
-  local group = vim.api.nvim_create_augroup("slopfile_autoread", { clear = true })
-  vim.api.nvim_create_autocmd({ "CursorHold", "CursorHoldI", "BufEnter", "FocusGained" }, {
-    group = group,
-    pattern = "*.md",
-    callback = checktime,
-  })
-end
-
 function M.setup(opts)
   opts = opts or {}
   if opts.autoread ~= nil then
     vim.g.slopfile_autoread = opts.autoread and 1 or 0
+  end
+  if opts.poll_ms ~= nil then
+    vim.g.slopfile_poll_ms = opts.poll_ms
   end
   setup_autoread()
 end
@@ -119,5 +157,8 @@ vim.api.nvim_create_user_command("Send", M.send, {})
 vim.api.nvim_create_user_command("Resume", M.resume, {})
 vim.api.nvim_create_user_command("Abort", M.abort, {})
 vim.api.nvim_create_user_command("Status", M.status, {})
+
+-- Debug/testing handle; also makes the module requireable as 'slopfile'.
+vim.g.slopfile_plugin = M
 
 return M

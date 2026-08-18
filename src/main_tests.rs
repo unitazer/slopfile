@@ -212,6 +212,63 @@ use crate::types::Role;
   }
 
   #[test]
+  fn context_full_note_is_daemon_owned_and_never_a_draft() {
+    let base = "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\npartial reply here\n<!-- @done -->\n";
+    let note = format!("{CONTEXT_FULL_NOTE}\n");
+
+    // Note-only tail: no draft, no section, no work.
+    let note_only = format!("{base}{note}");
+    let text = &note_only;
+    let pf = transcript::parse_file(text);
+    assert!(draft_tail_after_done(text).is_none(), "note is not a draft");
+    assert!(section_below_done(text).is_none(), "note is not a section");
+    assert!(!has_work(&pf, text, &yolo_cfg()), "note-only tail must be idle");
+    // The note never enters history.
+    assert!(!pf
+      .history
+      .iter()
+      .any(|m| m.content.as_deref().is_some_and(|c| c.contains("context-full"))));
+
+    // Note + a real draft: the draft is work, the note is not part of it.
+    let note_and_draft = format!("{base}{note}\ncontinue the work\n");
+    let text = &note_and_draft;
+    let pf = transcript::parse_file(text);
+    assert_eq!(
+      draft_tail_after_done(text).map(|s| s.trim().to_string()),
+      Some("continue the work".into())
+    );
+    assert!(has_work(&pf, text, &yolo_cfg()));
+  }
+
+  #[test]
+  fn promote_draft_skips_daemon_owned_note() {
+    let dir = std::env::temp_dir().join("slopfile-test-promote-note");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.md");
+    let text = format!(
+      "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\npartial reply\n<!-- @done -->\n{CONTEXT_FULL_NOTE}\n\nnext message\n"
+    );
+    std::fs::write(&path, &text).unwrap();
+    let pf = transcript::parse_file(&text);
+    promote_draft(&path, &text, &pf).expect("promote");
+    let after = std::fs::read_to_string(&path).unwrap();
+    // The note stays above the promoted section, never inside it.
+    let note_ix = after.find(CONTEXT_FULL_NOTE).expect("note kept");
+    let you_ix = after.find("### You\nnext message").expect("section right before draft");
+    let done_ix = after.find("<!-- @done -->").expect("done marker");
+    assert!(done_ix < note_ix && note_ix < you_ix, "layout: {after}");
+    // Re-parsing: the draft is now a `### You` section below @done (tail),
+    // parsed as a user message; the note is not part of it.
+    let section = section_below_done(&after).expect("promoted section");
+    let msgs = transcript::tail_sections(&section);
+    assert!(msgs
+      .iter()
+      .any(|m| m.role == Role::User && m.content.as_deref() == Some("next message")));
+    assert!(!section.contains("context-full"), "note must stay out of the section");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
   fn session_template_has_default_header_and_prompt() {
     let cfg = yolo_cfg();
     let tpl = session_template(&cfg);
