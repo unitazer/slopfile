@@ -180,7 +180,7 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
     // Abort marker present while idle: nothing is running, just drop the
     // marker line and refresh the status. (During a stream the marker is
     // handled inside StreamWriter; this path covers the in-between state.)
-    if text.contains(transcript::ABORT_MARKER) {
+    if transcript::abort_marker_present(&text) {
       strip_abort_marker(path, &text)?;
       return Ok(());
     }
@@ -353,7 +353,7 @@ async fn run_generation_turn(
     let (body, live) = strip_live_line(&text_now);
     let mut out = String::new();
     for l in body.split('\n') {
-      if l.trim_start().starts_with(transcript::ABORT_MARKER) {
+      if transcript::is_abort_line(l) {
         continue;
       }
       out.push_str(l);
@@ -513,14 +513,14 @@ impl<'a> StreamWriter<'a> {
     !self.aborted
   }
 
-  /// True while no abort marker is in the file (continue streaming).
+  /// True while no abort marker is in the file (continue streaming). The
+  /// marker must be its own line (or glued to the status line) — prose that
+  /// merely mentions the marker must not stop the stream.
   fn marker_present(&self) -> bool {
     let Ok(disk) = std::fs::read_to_string(self.path) else {
       return true;
     };
-    // Substring, not line-start: the marker may be glued to the status line
-    // (the daemon writes it without a trailing newline).
-    disk.contains(transcript::ABORT_MARKER)
+    transcript::abort_marker_present(&disk)
   }
 
   /// Flush, dropping any abort marker line from the disk content (it is
@@ -530,7 +530,7 @@ impl<'a> StreamWriter<'a> {
       self.aborted = true;
       let mut kept = Vec::new();
       for l in self.out.split('\n') {
-        if !l.contains(transcript::ABORT_MARKER) {
+        if !transcript::is_abort_line(l) {
           kept.push(l);
         }
       }
@@ -556,7 +556,7 @@ impl<'a> StreamWriter<'a> {
     }
     let mut clean = String::new();
     for l in out.split('\n') {
-      if l.contains(transcript::ABORT_MARKER) {
+      if transcript::is_abort_line(l) {
         continue;
       }
       clean.push_str(l);
@@ -570,7 +570,7 @@ impl<'a> StreamWriter<'a> {
     // Daemon-owned control lines (e.g. abort marker) never reach the file.
     let mut out = String::new();
     for l in self.out.split('\n') {
-      if l.contains(transcript::ABORT_MARKER) {
+      if transcript::is_abort_line(l) {
         continue;
       }
       out.push_str(l);
@@ -1100,7 +1100,7 @@ fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
   let (body, live) = strip_live_line(text);
   let mut out = String::new();
   for l in body.split('\n') {
-    if l.trim_start().starts_with(transcript::ABORT_MARKER) {
+    if transcript::is_abort_line(l) {
       continue;
     }
     out.push_str(l);

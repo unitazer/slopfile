@@ -20,6 +20,24 @@ pub const STATUS_PREFIX: &str = "slopfile:live";
 pub const ABORT_MARKER: &str = "<!-- slopfile:abort -->";
 pub const HEADER_FENCE: &str = "```toml";
 
+/// True when `text` contains an abort request: a line that IS the marker
+/// (at the start, or glued after the status line at the end). Line-based,
+/// never a bare substring — prose like `47: - Abort: ``<!-- ... -->`` ...`
+/// (e.g. copied PLAN.md content) must NOT trigger an abort.
+pub fn abort_marker_present(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with(ABORT_MARKER) || t.ends_with(ABORT_MARKER)
+    })
+}
+
+/// True for a line that IS the abort marker (identical line, with the
+/// marker at the start or end of the line).
+pub fn is_abort_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with(ABORT_MARKER) || t.ends_with(ABORT_MARKER)
+}
+
 // ── Parsed output ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

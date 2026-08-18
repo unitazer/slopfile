@@ -89,6 +89,39 @@ use crate::types::Role;
   }
 
   #[test]
+  fn prose_mentioning_abort_marker_is_not_an_abort() {
+    // A tool result / file content that happens to mention the marker inside
+    // a line (e.g. PLAN.md notes about the abort feature) must never trigger
+    // the abort path — this deadlocked a live session by making drive_file
+    // return early on every sweep.
+    let prose = "\
+```toml
+model = \"qwen3.8-27b\"
+```
+# S
+Sys.
+
+### You
+hi
+
+### Assistant
+Let me read a file.
+<!-- tool:read {\"path\":\"PLAN.md\"} -->
+47: - Abort: `<!-- slopfile:abort -->` marker line appended by `:Abort`
+<!-- result:read ok=0ms -->
+";
+    assert!(!transcript::abort_marker_present(prose), "prose mention must not abort");
+    assert!(transcript::abort_marker_present("hi\n<!-- slopfile:abort -->\n"));
+    // Glued to the status line (daemon writes it without a trailing newline).
+    assert!(transcript::abort_marker_present(
+      "<!-- slopfile:live {\"phase\":\"generating\"} --><!-- slopfile:abort -->\n"
+    ));
+    // drive_file must proceed (has_work true) despite the prose mention.
+    let pf = transcript::parse_file(prose);
+    assert!(has_work(&pf, prose, &yolo_cfg()), "prose mention must not stall the file");
+  }
+
+  #[test]
   fn stream_writer_stops_and_strips_when_marker_appears_mid_stream() {
     let dir = std::env::temp_dir().join("slopfile-test-streamabort");
     std::fs::create_dir_all(&dir).unwrap();
@@ -315,3 +348,4 @@ use crate::types::Role;
 
     std::fs::remove_dir_all(&dir).ok();
   }
+
