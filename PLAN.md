@@ -17,7 +17,7 @@
 - [x] yolo confirmations path (unit-tested: auto-resolve with default/first; live run pending)
 - [x] nvim plugin `:Send` `:Resume` `:Abort` `:Status` + autoread live reload (`nvim/plugin/slopfile.lua`, headless-tested)
 - [x] compose `slopfile` service + host run (live-verified in container: draft → ls tool → @done)
-- [ ] Polish: abort live test, truncation, /skip
+- [x] Polish: abort (live-verified mid-stream: ✗ aborted, @done + idle), truncation (request-side prune of oldest turns), yolo, /skip (answer questions with defaults)
 
 ## Notes from live testing (2026-08-18)
 
