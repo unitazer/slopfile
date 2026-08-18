@@ -563,13 +563,19 @@ fn resolve_questions(
     let Some(header_ix) = out.find(questions::BLOCK_HEADER) else {
       continue;
     };
-    // The block runs until the line after the answer `>` or the stash
-    // comments. Find the end of the block: next `<!--` comment that is a
-    // call stash, or EOF.
+    // The block runs until after the `<!-- q:... -->` stash comments and the
+    // `<!-- call:... -->` line, so none of the block survives as stray
+    // assistant text after resolution.
     let rest = &out[header_ix..];
     let end_ix = rest
       .find("<!-- call:")
-      .map(|ix| header_ix + ix)
+      .map(|ix| {
+        let line_start = header_ix + ix;
+        out[line_start..]
+          .find('\n')
+          .map(|nl| line_start + nl + 1)
+          .unwrap_or(out.len())
+      })
       .unwrap_or(out.len());
     let block_text = &out[header_ix..end_ix];
 

@@ -2,7 +2,7 @@
 
 use crate::sse::{stream_chunks, SseError};
 use crate::types::{
-    ChatMessage, SseToolCallDelta, StreamEvent, StreamResult, ToolCall, ToolDefinition,
+    ChatMessage, Role, SseToolCallDelta, StreamEvent, StreamResult, ToolCall, ToolDefinition,
 };
 use futures_util::StreamExt;
 use std::error::Error;
@@ -119,12 +119,13 @@ impl LlamaClient {
         max_new_tokens: u32,
         on_event: impl FnMut(StreamEvent),
     ) -> Result<StreamResult, ApiError> {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.model,
-            "messages": messages,
+            "messages": sanitize_messages(messages),
             "stream": true,
             "max_tokens": max_new_tokens,
         });
+        let mut body = body;
         if let Some(tools) = tools {
             body["tools"] = serde_json::to_value(tools).map_err(|e| {
                 ApiError::Sse(SseError::Io(format!("tool serialization: {e}")))
@@ -205,6 +206,22 @@ impl LlamaClient {
         let url = format!("{}/health", self.base);
         self.client.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
     }
+}
+
+/// Drop wire-invalid messages: assistant messages with neither `content` nor
+/// `tool_calls` (e.g. reasoning-only leftovers from a dangling turn) are
+/// rejected by llama-server with 400.
+fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .cloned()
+        .filter(|m| match m.role {
+            Role::Assistant => {
+                m.content.is_some() || m.tool_calls.is_some() || m.parts.is_some()
+            }
+            _ => true,
+        })
+        .collect()
 }
 
 #[cfg(test)]

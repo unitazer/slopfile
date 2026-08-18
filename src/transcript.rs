@@ -401,7 +401,28 @@ pub fn parse_file(text: &str) -> ParsedFile {
         }
         last
     };
-    let history_end = last_done_line.map_or(n, |d| d + 1);
+    // The daemon status line is daemon-owned output: never part of history.
+    // It is the last line when present.
+    let status_line_ix: Option<usize> = {
+        let t = text.trim_end();
+        let mut count = 0;
+        let mut last_match = None;
+        for (idx, line) in t.lines().map(str::trim_start).enumerate() {
+            count = idx;
+            if line.starts_with(&format!("<!-- {STATUS_PREFIX}")) {
+                last_match = Some(idx);
+            }
+        }
+        let _ = count;
+        last_match
+    };
+    // history_end: up to the last @done, but never past the status line.
+    let history_end = match (last_done_line, status_line_ix) {
+        (Some(d), Some(s)) if s > d => s,
+        (Some(d), _) => d + 1,
+        (None, Some(s)) => s,
+        (None, None) => n,
+    };
 
     let mut mode = Mode::System;
     let mut user_buf = String::new();
@@ -624,6 +645,45 @@ Here is the listing.
         let pf = parse_file(&txt);
         assert!(!pf.tail.contains("slopfile:live"));
         assert!(!pf.tail.contains("{\"phase\":\"idle\"}"));
+        // The status line must never leak into history as an assistant turn.
+        assert!(!pf
+            .history
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| c.contains("slopfile:live"))));
+    }
+
+    #[test]
+    fn status_line_after_closed_tool_block_is_not_history() {
+        // No @done: history ends with a closed tool round, then the daemon
+        // status line. The status line must NOT become a trailing Assistant.
+        let txt = "\
+```toml
+model = \"qwen3.8-27b\"
+```
+# Smoke
+You are a helpful test agent.
+
+### You
+Question?
+
+### Assistant
+<!-- thinking -->
+Which questions?
+<!-- /thinking -->
+I will ask.
+<!-- tool:question {\"desc\":\"x\"} -->
+answers json
+<!-- result:question ok=ask -->
+
+<!-- slopfile:live {\"phase\":\"waiting_answer\",\"model\":\"qwen3.8-27b\"} -->
+";
+        let pf = parse_file(txt);
+        assert_eq!(pf.history.last().map(|m| m.role), Some(Role::Tool));
+        assert!(!pf
+            .history
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| c.contains("slopfile:live"))));
+        assert!(pf.dangling.is_none());
     }
 
     #[test]
