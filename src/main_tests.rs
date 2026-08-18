@@ -27,6 +27,22 @@ use crate::types::Role;
   }
 
   #[test]
+  fn cli_abort_appends_marker_and_is_idempotent() {
+    let dir = std::env::temp_dir().join("slopfile-test-cliabort");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.md");
+    std::fs::write(&path, "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n").unwrap();
+    cmd_abort(path.to_str().unwrap());
+    let one = std::fs::read_to_string(&path).unwrap();
+    assert!(one.ends_with("<!-- slopfile:abort -->\n"), "marker appended at end");
+    assert_eq!(one.matches(transcript::ABORT_MARKER).count(), 1);
+    cmd_abort(path.to_str().unwrap());
+    let two = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(two, one, "second abort must not duplicate the marker");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
   fn yolo_resolves_questions_with_first_option() {
     let dir = std::env::temp_dir().join("slopfile-test-yolo");
     std::fs::create_dir_all(&dir).unwrap();

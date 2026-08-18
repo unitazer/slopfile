@@ -43,6 +43,13 @@ enum Command {
     /// Path of the session file to initialize
     path: String,
   },
+  /// Interrupt the agent on a session file: append the abort marker; the
+  /// daemon stops the current stream, closes the turn with @done and goes
+  /// idle.
+  Abort {
+    /// Path of the session file to abort
+    path: String,
+  },
 }
 
 /// Host path; the container variant sets `SLOPFILE_CONFIG` to
@@ -86,6 +93,9 @@ async fn main() {
   let cli = Cli::parse();
   if let Some(Command::Init { path }) = cli.command {
     return cmd_init(&path, &app_cfg);
+  }
+  if let Some(Command::Abort { path }) = cli.command {
+    return cmd_abort(&path);
   }
 
   info!(
@@ -629,6 +639,33 @@ fn init_template_for(path: &str, cfg: &AppConfig) -> Result<String, String> {
     }
   }
   Ok(session_template(cfg))
+}
+
+/// `slopfile abort <path>`: append the abort marker to a session file. The
+/// daemon notices it on the next sweep and stops the running stream.
+fn cmd_abort(path: &str) {
+  let content = match std::fs::read_to_string(path) {
+    Ok(c) => c,
+    Err(e) => {
+      eprintln!("slopfile abort: cannot read {path}: {e}");
+      std::process::exit(1);
+    }
+  };
+  if transcript::abort_marker_present(&content) {
+    println!("abort already requested on {path}");
+    return;
+  }
+  let mut out = content;
+  if !out.is_empty() && !out.ends_with('\n') {
+    out.push('\n');
+  }
+  out.push_str(transcript::ABORT_MARKER);
+  out.push('\n');
+  if let Err(e) = std::fs::write(path, out) {
+    eprintln!("slopfile abort: cannot write {path}: {e}");
+    std::process::exit(1);
+  }
+  println!("abort requested on {path}; the daemon stops the turn on its next sweep");
 }
 
 /// The default session file: header (default settings) + system prompt
