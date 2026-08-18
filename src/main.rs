@@ -24,8 +24,33 @@ use tracing::{error, info, warn};
 use transcript::{DONE_MARKER, ParsedFile};
 use types::{AppConfig, ChatMessage, Role, ToolCall};
 
-/// Host path; the container variant is `/shared/slopfile.toml`.
+/// Host path; the container variant sets `SLOPFILE_CONFIG` to
+/// `/shared/slopfile.toml`.
 const APP_CONFIG_PATH: &str = "/home/unitazer/things/clanker/docker-pi/shared/slopfile.toml";
+
+/// Load app config, then apply env overrides so the same file works on the
+/// host and inside the compose network:
+///   SLOPFILE_CONFIG      path to the toml (default APP_CONFIG_PATH)
+///   SLOPFILE_API_BASE    e.g. http://llama-server:8080 (container)
+///   SLOPFILE_TRANSCRIPTS transcripts dir
+///   SLOPFILE_WORKDIR     tool working directory
+fn load_app_config() -> AppConfig {
+  let path = std::env::var("SLOPFILE_CONFIG").unwrap_or_else(|_| APP_CONFIG_PATH.to_string());
+  let mut cfg = AppConfig::load_from_file(&path).unwrap_or_else(|e| {
+    warn!("could not load app config ({e}); using defaults");
+    AppConfig::default()
+  });
+  if let Ok(v) = std::env::var("SLOPFILE_API_BASE") {
+    cfg.api_base = v;
+  }
+  if let Ok(v) = std::env::var("SLOPFILE_TRANSCRIPTS") {
+    cfg.transcripts_dir = v;
+  }
+  if let Ok(v) = std::env::var("SLOPFILE_WORKDIR") {
+    cfg.workdir = v;
+  }
+  cfg
+}
 
 #[tokio::main]
 async fn main() {
@@ -36,10 +61,7 @@ async fn main() {
     )
     .init();
 
-  let app_cfg = AppConfig::load_from_file(APP_CONFIG_PATH).unwrap_or_else(|e| {
-    warn!("could not load app config ({e}); using defaults");
-    AppConfig::default()
-  });
+  let app_cfg = load_app_config();
   info!(
     "slopfile: workdir={} transcripts={} model={} api={} sweep={}ms confirmations={}",
     app_cfg.workdir,
