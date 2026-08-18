@@ -227,9 +227,6 @@ pub struct SseChunk {
   pub choices: Vec<SseChoice>,
   #[serde(default)]
   pub usage: Option<Usage>,
-  /// llama-server puts stats here; we surface them for the status line.
-  #[serde(default)]
-  pub timings: Option<Timings>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,8 +239,6 @@ pub struct SseChoice {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SseDelta {
-  #[serde(default)]
-  pub role: Option<String>,
   #[serde(default)]
   pub content: Option<String>,
   /// Qwen3 extended-thinking channel (llama-server exposes it).
@@ -281,18 +276,6 @@ pub struct Usage {
   pub completion_tokens: u32,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct Timings {
-  #[serde(default)]
-  pub prompt_per_second: f64,
-  #[serde(default)]
-  pub predicted_per_second: f64,
-  #[serde(default)]
-  pub predicted_n: u64,
-  #[serde(default)]
-  pub prompt_n: u64,
-}
-
 // ── Aggregated stream result (what the agent loop consumes) ─────────────
 
 #[derive(Debug, Clone, Default)]
@@ -302,14 +285,18 @@ pub struct StreamResult {
   pub tool_calls: Vec<ToolCall>,
   pub finish_reason: Option<String>,
   pub usage: Option<Usage>,
-  pub timings: Option<Timings>,
   /// Set when the consumer asked the stream to stop early (abort).
   pub aborted: bool,
 }
 
 /// Union of everything a turn encounter can be, used by the agent loop to
 /// decide next steps (more text vs. execute tool vs. done).
+///
+/// `ToolCallFragment`/`Done` payloads are emitted as a live preview while the
+/// full data is also returned from `consume_stream`; the loop reads the
+/// returned copy, so the preview payloads are intentionally untouched.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum StreamEvent {
   Text(String),
   Reasoning(String),
@@ -475,6 +462,3 @@ pub struct LiveStatus {
   #[serde(default)]
   pub elapsed_secs: u64,
 }
-
-/// Rendered/parsed form of the `<!-- slopfile:live ... -->` comment.
-pub const LIVE_MARKER: &str = "slopfile:live";

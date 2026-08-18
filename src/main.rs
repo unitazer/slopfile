@@ -3,8 +3,8 @@
 //! file. The file is the entire UI — the daemon only ever writes below the
 //! last `@done` marker (or replaces daemon-owned partial output).
 
-mod agent;
 mod api;
+mod lex;
 mod questions;
 mod sse;
 mod tools;
@@ -13,7 +13,8 @@ mod types;
 
 use api::LlamaClient;
 use clap::{Parser, Subcommand};
-use questions::{parse_answers, QuestionsBlock};
+use lex::{lex, lex_line, DONE_MARKER, TokKind};
+use questions::parse_answers;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
-use transcript::{DONE_MARKER, ParsedFile};
+use transcript::{strip_live_line, ParsedFile};
 use types::{AppConfig, ChatMessage, Role, ToolCall};
 
 #[derive(Parser)]
@@ -230,7 +231,6 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
     match outcome {
       TurnOutcome::Done => return Ok(()),
       TurnOutcome::AwaitsNextTurn => continue,
-      TurnOutcome::ErrorStop => return Ok(()),
     }
   }
 }
@@ -270,11 +270,12 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
 /// comment lines stripped).
 fn section_below_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
-  let done = transcript::find_done_marker(&body)?;
-  let tail = &body[done + DONE_MARKER.len()..];
-  let user_tail = tail
-    .lines()
-    .filter(|l| !is_daemon_owned(l))
+  let done = lex(&body).into_iter().find(|t| t.kind == TokKind::Done)?;
+  let tail = &body[done.offset + lex::DONE_MARKER.len()..];
+  let user_tail = lex(tail)
+    .into_iter()
+    .filter(|t| !t.kind.is_daemon_owned())
+    .map(|t| t.text)
     .collect::<Vec<_>>()
     .join("\n")
     .trim()
@@ -291,7 +292,6 @@ fn section_below_done(text: &str) -> Option<String> {
 enum TurnOutcome {
   Done,
   AwaitsNextTurn,
-  ErrorStop,
 }
 
 /// Stream one assistant response into the file. May end with:
@@ -631,13 +631,6 @@ impl<'a> StreamWriter<'a> {
 /// it.
 pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit the token cap mid-response; trim the useless old turns above, then write your next message below this note -->";
 
-/// True for daemon-owned control comments (`<!-- slopfile:... -->`): the
-/// live status line, the abort marker, the context-full note. These are
-/// never user content — strip them from draft/section scans.
-fn is_daemon_owned(line: &str) -> bool {
-  line.trim_start().starts_with("<!-- slopfile:")
-}
-
 /// `slopfile init <path>`: write the default template into a new or empty
 /// file. Refuses to overwrite anything with content.
 fn cmd_init(path: &str, cfg: &AppConfig) {
@@ -941,37 +934,18 @@ fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
 /// defaults / nothing, don't wait for the user). Matches both `/skip` and
 /// `> /skip` (the user types on the `>` answer line).
 fn has_skip(tail: &str) -> bool {
-  tail.lines().any(|l| {
-    let l = l.trim_start();
-    let l = l.strip_prefix('>').unwrap_or(l).trim_start();
-    l == "/skip"
+  lex(tail).into_iter().any(|t| {
+    t.kind == TokKind::Skip || (t.kind == TokKind::Answer && t.payload == "/skip")
   })
-}
-
-/// Cheap heuristic used only for `block_answered` — superseded by
-/// `questions_resolvable` (tail-based). Kept for symmetry.
-fn block_answered(_block: &QuestionsBlock) -> bool {
-  false
 }
 
 /// Extract the raw answer text the user typed below the `>` marker of a
 /// QUESTIONS block in `tail`.
 fn user_answers_from_tail(tail: &str) -> Option<String> {
-  let header = questions::BLOCK_HEADER;
-  let start = tail.find(header)?;
-  let rest = &tail[start..];
-  // Answer line: "> " followed by the user's text (until the next line that
-  // is a comment or blank-sections out).
-  for line in rest.lines() {
-    if let Some(ans) = line.trim_start().strip_prefix('>') {
-      let ans = ans.trim();
-      if !ans.is_empty() {
-        return Some(ans.to_string());
-      }
-    }
-  }
-  let _ = rest;
-  None
+  lex(tail)
+    .into_iter()
+    .find(|t| t.kind == TokKind::Answer && !t.payload.is_empty())
+    .map(|t| t.payload.to_string())
 }
 
 /// Replace an answered QUESTIONS block with a normal tool block so the next
@@ -1057,16 +1031,7 @@ fn resolve_questions(
     updated.replace_range(header_ix..end_ix.min(updated.len()), &tool_out);
     // Drop stray /skip lines (below the block / typed on their own line);
     // they are commands, not user messages.
-    let had_trailing_nl = updated.ends_with('\n');
-    updated = updated
-      .lines()
-      .filter(|l| !has_skip(l))
-      .collect::<Vec<_>>()
-      .join("\n");
-    if had_trailing_nl && !updated.ends_with('\n') {
-      updated.push('\n');
-    }
-    out = updated;
+    out = drop_skip_lines(&updated);
 
     if cfg.confirmations == "yolo" && raw.is_some() {
       // fallthrough
@@ -1095,15 +1060,12 @@ fn promote_draft(path: &Path, text: &str, pf: &ParsedFile) -> Result<(), String>
 
   // Byte length of the leading blank + daemon-owned comment lines.
   let rest = &body[done_ix..];
-  let mut skip = 0usize;
-  for l in rest.lines() {
-    if l.trim().is_empty() || is_daemon_owned(l) {
-      skip += l.len() + 1;
-    } else {
-      break;
-    }
-  }
-  skip = skip.min(rest.len());
+  let skip = rest
+    .lines()
+    .take_while(|l| l.trim().is_empty() || lex_line(l).is_daemon_owned())
+    .map(|l| l.len() + 1)
+    .sum::<usize>()
+    .min(rest.len());
 
   // Insert `### You\n` right after the skipped lines.
   let marker_end = done_ix + skip;
@@ -1129,15 +1091,25 @@ fn promote_draft(path: &Path, text: &str, pf: &ParsedFile) -> Result<(), String>
 /// there is no draft.
 fn draft_tail_after_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
-  let done = transcript::find_done_marker(&body)?;
-  let tail = &body[done + DONE_MARKER.len()..];
-  let user_tail = tail
-    .lines()
-    .filter(|l| !is_daemon_owned(l))
+  let done = lex(&body).into_iter().find(|t| t.kind == TokKind::Done)?;
+  let tail = &body[done.offset + lex::DONE_MARKER.len()..];
+  let toks = lex(tail);
+  let user_toks: Vec<_> = toks.iter().filter(|t| !t.kind.is_daemon_owned()).collect();
+  // Already stays in history: user typed `### You`, or daemon promoted and
+  // the turn is running / waiting. Do NOT re-promote.
+  if user_toks
+    .iter()
+    .find(|t| !t.text.trim().is_empty())
+    .is_some_and(|t| t.kind == TokKind::Heading)
+  {
+    return None;
+  }
+  let user_tail = user_toks
+    .iter()
+    .map(|t| t.text)
     .collect::<Vec<_>>()
-    .join("\n")
-    .trim()
-    .to_string();
+    .join("\n");
+  let user_tail = user_tail.trim();
   if user_tail.is_empty() {
     return None;
   }
@@ -1146,12 +1118,25 @@ fn draft_tail_after_done(text: &str) -> Option<String> {
   if user_tail.starts_with(questions::BLOCK_HEADER) {
     return None;
   }
-  // Already stays in history: user typed `### You`, or daemon promoted and
-  // the turn is running / waiting. Do NOT re-promote.
-  if user_tail.starts_with("### ") {
-    return None;
+  Some(user_tail.to_string())
+}
+
+/// Remove `/skip` lines (on their own line or on a `>` answer line): they
+/// are commands, not user messages.
+fn drop_skip_lines(text: &str) -> String {
+  let had_nl = text.ends_with('\n');
+  let mut out = lex(text)
+    .into_iter()
+    .filter(|t| {
+      t.kind != TokKind::Skip && !(t.kind == TokKind::Answer && t.payload == "/skip")
+    })
+    .map(|t| t.text)
+    .collect::<Vec<_>>()
+    .join("\n");
+  if had_nl && !out.is_empty() && !out.ends_with('\n') {
+    out.push('\n');
   }
-  Some(user_tail)
+  out
 }
 
 // ── Misc helpers ────────────────────────────────────────────────────────
@@ -1221,27 +1206,6 @@ fn write_file(path: &Path, content: String) -> Result<(), String> {
   std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-fn strip_live_line(text: &str) -> (String, Option<String>) {
-  let mut lines: Vec<&str> = text.lines().collect();
-  let live = lines
-    .iter()
-    .position(|l| l.trim_start().starts_with("<!-- slopfile:live"))
-    .map(|ix| {
-      let s = lines.remove(ix);
-      s.to_string()
-    });
-  let body = if lines.is_empty() {
-    String::new()
-  } else {
-    let mut b = lines.join("\n");
-    if text.ends_with('\n') && !b.is_empty() {
-      b.push('\n');
-    }
-    b
-  };
-  (body, live)
-}
-
 fn write_status(path: &Path, pf: &ParsedFile, phase: &str) -> Result<(), String> {
   let text = read_file(path)?;
   let (body, _live) = strip_live_line(&text);
@@ -1259,19 +1223,6 @@ fn write_status(path: &Path, pf: &ParsedFile, phase: &str) -> Result<(), String>
   write_file(path, out)?;
   Ok(())
 }
-
-/// Cheap heuristic used only for `block_answered` — replaced by real parsing
-/// below (`user_answers_from_tail`). Kept for symmetry.
-fn block_text_has_answers(_s: &str) -> bool {
-  // Answer presence is checked via `user_answers_from_tail` in resolve; this
-  // resolver simply reports "answered" if the tail for the block contains an
-  // answer line. We cannot access the tail from here, so treat as always
-  // "pending parse" — resolved by resolve_questions when text exists.
-  false
-}
-
-#[allow(dead_code)]
-fn _unused(_x: () ) {}
 
 #[cfg(test)]
 mod main_tests;

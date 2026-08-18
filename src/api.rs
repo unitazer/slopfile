@@ -172,9 +172,6 @@ impl LlamaClient {
             if let Some(usage) = &chunk.usage {
                 result.usage = Some(usage.clone());
             }
-            if let Some(timings) = &chunk.timings {
-                result.timings = Some(timings.clone());
-            }
             let mut cont = true;
             for choice in &chunk.choices {
                 if let Some(fr) = &choice.finish_reason {
@@ -218,12 +215,6 @@ impl LlamaClient {
         result.tool_calls = acc.assemble();
         on_event(StreamEvent::Done(result.clone()));
         Ok(result)
-    }
-
-    /// Simple health ping: GET {base}/health → 200.
-    pub async fn health(&self) -> bool {
-        let url = format!("{}/health", self.base);
-        self.client.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
     }
 
     /// Best-effort server-side cancel of the in-flight generation (`POST

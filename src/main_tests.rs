@@ -409,8 +409,9 @@ Let me read a file.
     let pf = transcript::parse_file(&tpl);
     assert_eq!(pf.history.len(), 1, "system message only");
     assert_eq!(pf.history[0].role, Role::System);
-    assert!(pf.system_prompt.contains("expert coding assistant"));
-    assert!(!pf.system_prompt.contains("# Session"), "heading stripped from prompt");
+    let sp = pf.history[0].content.as_deref().unwrap();
+    assert!(sp.contains("expert coding assistant"));
+    assert!(!sp.contains("# Session"), "heading stripped from prompt");
   }
 
   #[test]

@@ -117,7 +117,6 @@ fn take_next_event(buf: &mut Vec<u8>) -> Result<Option<(SseChunk, bool)>, SseErr
                 SseChunk {
                     choices: Vec::new(),
                     usage: None,
-                    timings: None,
                 },
                 true,
             )));
