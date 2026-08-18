@@ -61,13 +61,30 @@ bottom.
 5. **Dangling tail detection**: if the file ends while inside an Assistant
    section (i.e. a `### Assistant` whose last content has no following
    `### You` AND no `<!-- @done -->`), then the last assistant turn is
-   incomplete: return its location so the agent can drop it and re-ask.
+   incomplete: return its location so the agent can drop it and re-ask. The
+   dangling section runs to the first daemon status line (or EOF): the live
+   line is daemon-owned and must never leak into the resume hint.
 6. **@done only** marks clean completion — the agent appends it after the
    final assistant block of a turn completes, and appends nothing after it
    until the next user turn.
 7. **Status line**: the daemon owns the last line, `<!-- slopfile:live ... -->`
    serialized JSON in the comment. The parser must EXCLUDE it from history.
-8. **Immutability**: parsing must never modify the file. The repo API exposes
+   **History end**: history stops right after the last `<!-- @done -->` line.
+   Everything below it — drafts, in-flight turns, tool rounds, the status
+   line — is the TAIL, appended ONCE to the request by the tail reader, so a
+   status line below `@done` must never pull the tail region into `history`
+   (that used to double every promoted draft / tool round in the prompt).
+   A status line with no `@done` at all only caps history in the fragmented
+   bootstrap case.
+8. **Abort marker**: `<!-- slopfile:abort -->` is a standalone abort, or may
+   be glued directly after the status line
+   (`<!-- slopfile:live {...} --><!-- slopfile:abort -->`). The status-line
+   prefix requires a trailing space (`<!-- slopfile:live `), so a user/agent
+   line that merely *mentions* the abort marker inside flowing text can never
+   trigger an abort (and a container restart). A live-prefixed line whose
+   payload is itself any `X -->` terminates with the abort glue — this is
+   still recognized because the garbled payload is daemon-owned.
+9. **Immutability**: parsing must never modify the file. The repo API exposes
    a `Transcript` struct plus methods the agent uses to rewrite the file
    incrementally (append-only below its own pointer).
 
@@ -84,9 +101,12 @@ pub struct ParsedFile {
 }
 
 pub struct DanglingTail {
-    // byte offset where resumed output should start (right after the
-    // incomplete assistant's last written text)
+    // byte offset of the END of the dangling `### Assistant` heading line:
+    // the file resumes streaming right after it (the heading itself stays
+    // put; the partial text below it is dropped and re-asked)
     pub resume_offset: usize,
+    // the partial assistant text below the heading, EXCLUDING any daemon
+    // status line that cuts the section short
     pub partial_text: String,
 }
 

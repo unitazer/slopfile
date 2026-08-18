@@ -274,6 +274,7 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true)
+    .process_group(0)
     .spawn()
   {
     Ok(c) => c,
@@ -292,7 +293,18 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
   .await;
   match outcome {
     Err(_) => {
+      // Group id == child pid (process_group(0)); capture it BEFORE the kill
+      // — tokio reaps the child and `id()` returns None after `kill()`.
+      let group_id = child.id();
       let _ = child.kill().await;
+      // `sh -c 'sleep 1000 &'` backgrounds children into the same process
+      // group; kill the whole group (negative pid), best effort.
+      if let Some(id) = group_id {
+        let _ = std::process::Command::new("kill")
+          .args(["-9", &format!("-{id}")])
+          .stderr(Stdio::null())
+          .status();
+      }
       ToolResult::err(format!(
         "bash: timeout after {timeout_ms}ms, process killed: {command}"
       ))
@@ -555,7 +567,8 @@ fn truncate(s: &str) -> String {
     .map(|(i, _)| i)
     .unwrap_or(s.len());
   let mut out = s[..cutoff].to_string();
-  out.push_str(&format!("\n… [truncated {} chars]", s.len() - cutoff));
+  let dropped = s[cutoff..].chars().count();
+  out.push_str(&format!("\n… [truncated {dropped} chars]"));
   out
 }
 
@@ -844,6 +857,35 @@ mod tests {
     assert!(!r.ok, "sleep 5 with 200ms timeout should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
     let _ = fs::remove_dir_all(&wd);
+  }
+
+  #[tokio::test]
+  async fn bash_timeout_kills_backgrounded_processes() {
+    let wd = test_dir("bash-bgkill");
+    let pid_file = wd.join("bg.pid");
+    let cmd = format!("sleep 60 & echo $! > {}", pid_file.display());
+    let r = run("bash", &json!({ "command": cmd }).to_string(), wd.clone(), 200).await;
+    assert!(!r.ok, "should have timed out");
+    assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
+    let bg_pid: i32 = fs::read_to_string(&pid_file)
+      .expect("background pid file")
+      .trim()
+      .parse()
+      .expect("pid is a number");
+    // The whole process group (incl. backgrounded grandchildren) must be
+    // gone: `kill -0` fails once the process no longer exists.
+    for _ in 0..10 {
+      let alive = std::process::Command::new("kill")
+        .args(["-0", &bg_pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill -0");
+      if !alive.success() {
+        return;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("backgrounded process {bg_pid} survived the timeout kill");
   }
 
   #[tokio::test]

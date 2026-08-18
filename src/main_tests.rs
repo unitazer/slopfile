@@ -1,7 +1,7 @@
   use super::*;
 use crate::types::Role;
 
-  fn yolo_cfg() -> AppConfig {
+fn yolo_cfg() -> AppConfig {
     AppConfig {
       confirmations: "yolo".into(),
       api_base: "http://127.0.0.1:8080".into(),
@@ -47,7 +47,7 @@ use crate::types::Role;
   #[test]
   fn docker_restart_speaks_the_docker_api_over_a_unix_socket() {
     use std::io::{Read, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::net::UnixListener;
 
     let dir = std::env::temp_dir().join("slopfile-test-dockersock");
     std::fs::create_dir_all(&dir).unwrap();
@@ -371,8 +371,8 @@ Let me read a file.
       "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\npartial reply\n<!-- @done -->\n{CONTEXT_FULL_NOTE}\n\nnext message\n"
     );
     std::fs::write(&path, &text).unwrap();
-    let pf = transcript::parse_file(&text);
-    promote_draft(&path, &text, &pf).expect("promote");
+    let _pf = transcript::parse_file(&text);
+    promote_draft(&path, &text).expect("promote");
     let after = std::fs::read_to_string(&path).unwrap();
     // The note stays above the promoted section, never inside it.
     let note_ix = after.find(CONTEXT_FULL_NOTE).expect("note kept");

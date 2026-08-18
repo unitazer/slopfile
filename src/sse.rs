@@ -176,19 +176,10 @@ mod tests {
         Ok(out)
     }
 
-    fn collect_poll<S>(mut stream: S) -> Result<Vec<SseChunk>, SseError>
-    where
-        S: Stream<Item = Result<SseChunk, SseError>> + Unpin,
-    {
-        // poll-based collection that treats Pending as "wait" (not available
-        // in a sync test, so just treat as unreachable — fixtures are sync).
-        collect(stream)
-    }
-
     #[test]
     fn parses_single_event() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
-        let chunks = collect_poll(stream_from_bytes(vec![sse])).expect("collect");
+        let chunks = collect(stream_from_bytes(vec![sse])).expect("collect");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("hi"));
     }
@@ -198,7 +189,7 @@ mod tests {
         let sse1 = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"We\"}}]}\n\n";
         let sse2 = "data: {\"choices\":[{\"delta\":{\"content\":\" need\"}}]}\n";
         let sse3 = "data: {\"choices\":[{\"delta\":{\"content\":\" rest\"}}]}\n\n";
-        let chunks = collect_poll(stream_from_bytes(vec![sse1, sse2, sse3])).expect("collect");
+        let chunks = collect(stream_from_bytes(vec![sse1, sse2, sse3])).expect("collect");
         assert_eq!(chunks.len(), 3);
         assert_eq!(
             chunks[0].choices[0].delta.reasoning_content.as_deref(),
@@ -211,7 +202,7 @@ mod tests {
     #[test]
     fn done_terminates_stream() {
         let sse = "data: [DONE]\n\n";
-        let chunks = collect_poll(stream_from_bytes(vec![sse])).expect("collect");
+        let chunks = collect(stream_from_bytes(vec![sse])).expect("collect");
         assert!(chunks.is_empty());
     }
 
@@ -219,7 +210,7 @@ mod tests {
     fn partial_line_waits_for_more() {
         let sse1 = "data: {\"choices\":[{\"delta\":{\"content\":\"par";
         let sse2 = "tial\"}}]}\n\n";
-        let chunks = collect_poll(stream_from_bytes(vec![sse1, sse2])).expect("collect");
+        let chunks = collect(stream_from_bytes(vec![sse1, sse2])).expect("collect");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("partial"));
     }
@@ -227,7 +218,7 @@ mod tests {
     #[test]
     fn bad_json_is_error() {
         let sse = "data: {not json}\n\n";
-        let err = collect_poll(stream_from_bytes(vec![sse])).expect_err("must fail");
+        let err = collect(stream_from_bytes(vec![sse])).expect_err("must fail");
         assert!(matches!(err, SseError::BadJson(_)));
     }
 }

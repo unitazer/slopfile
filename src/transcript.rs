@@ -30,38 +30,56 @@ pub fn is_abort_line(line: &str) -> bool {
   lex_line(line) == TokKind::Abort
 }
 
-/// Remove the daemon status line: find the `Live` token, drop exactly that
-/// line. Returns the body and the removed status line (if any). The single
-/// source of truth for live-line handling — the daemon, the parser and the
-/// QoL commands all go through here.
-pub fn strip_live_line(text: &str) -> (String, Option<String>) {
+/// Remove ALL daemon status lines: drop every `Live` token. Returns the
+/// body and, if any status line was removed, the LAST removed one as its
+/// original byte offset in `text` plus its text. The single source of truth
+/// for live-line handling — the daemon, the parser and the QoL commands
+/// all go through here.
+pub fn strip_live_line(text: &str) -> (String, Option<(usize, String)>) {
   let toks = lex(text);
-  let Some(live) = toks.iter().find(|t| t.kind == TokKind::Live) else {
-    return (text.to_string(), None);
-  };
+  let mut last = None;
   let mut body = String::new();
-  for (i, tok) in toks.iter().enumerate() {
-    if i == live.line {
+  for tok in toks.iter() {
+    if tok.kind == TokKind::Live {
+      last = Some((tok.offset, tok.text.to_string()));
       continue;
     }
     body.push_str(tok.text);
+    // Keep each line's original ending so CRLF files stay CRLF after a
+    // daemon write (a naive `push('\n')` rejoin would normalize them).
+    if tok.eol_len >= 2 {
+      body.push_str("\r\n");
+    } else {
+      body.push('\n');
+    }
+  }
+  if last.is_none() {
+    return (text.to_string(), None);
+  }
+  if body.ends_with('\n') {
+    body.pop();
+    if body.ends_with('\r') {
+      body.pop();
+      body.push_str("\r\n");
+    } else {
+      body.push('\n');
+    }
+  } else {
     body.push('\n');
   }
-  while body.ends_with('\n') && !body.is_empty() {
-    body.pop();
-  }
-  body.push('\n');
-  (body, Some(live.text.to_string()))
+  (body, last)
 }
 
 // ── Parsed output ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct DanglingTail {
-  /// Byte offset where resumed output should start (right after the
-  /// incomplete assistant's last written text).
+  /// Byte offset of the END of the dangling `### Assistant` heading line:
+  /// the file resumes streaming right after it (the heading itself stays
+  /// put; the partial text below it is dropped and re-asked).
   pub resume_offset: usize,
-  /// The partial text of the incomplete assistant turn.
+  /// The partial text of the incomplete assistant turn (below the heading,
+  /// excluding daemon-owned status lines).
   pub partial_text: String,
 }
 
@@ -91,11 +109,6 @@ fn tool_call_id(name: &str, arguments: &str) -> String {
   format!("{:016x}", fnv1a64(&format!("{name}{arguments}")))
 }
 
-/// Byte offset just past the complete raw line of token `t`.
-fn line_end(t: &Token) -> usize {
-  t.offset + t.text.len() + 1
-}
-
 /// Parse the header config: the FIRST ```` ```toml ```` block only.
 pub fn header_config(text: &str) -> SessionConfig {
   let toks = lex(text);
@@ -118,11 +131,7 @@ pub fn header_config(text: &str) -> SessionConfig {
 
 /// Byte offset of the LAST `@done` marker line. None if absent.
 pub fn find_done_marker(text: &str) -> Option<usize> {
-  lex(text)
-    .iter()
-    .filter(|t| t.kind == TokKind::Done)
-    .last()
-    .map(|t| t.offset)
+  lex(text).iter().rfind(|t| t.kind == TokKind::Done).map(|t| t.offset)
 }
 
 // ── Message building ────────────────────────────────────────────────────
@@ -169,7 +178,6 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize) -> Vec<ChatMessage> {
     history.push(ChatMessage {
       role: Role::Assistant,
       content: (!asst_text.trim().is_empty()).then(|| std::mem::take(asst_text)),
-      parts: None,
       reasoning_content: (!asst_reasoning.trim().is_empty())
         .then(|| std::mem::take(asst_reasoning)),
       tool_calls: Some(calls),
@@ -195,7 +203,6 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize) -> Vec<ChatMessage> {
     history.push(ChatMessage {
       role: Role::Assistant,
       content: (!text.trim().is_empty()).then_some(text),
-      parts: None,
       reasoning_content: (!reasoning.trim().is_empty()).then_some(reasoning),
       tool_calls: (!calls.is_empty()).then_some(calls),
       tool_call_id: None,
@@ -204,8 +211,11 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize) -> Vec<ChatMessage> {
   }
 
   for tok in tokens.iter().take_while(|t| t.line < stop_above) {
-    let is_you = tok.kind == TokKind::Heading && tok.payload == "You";
-    let is_asst = tok.kind == TokKind::Heading && tok.payload == "Assistant";
+    // Section transitions only on the EXACT level-3 headings. `## You`,
+    // `# Assistant`, `#### You` ... in user drafts and assistant prose are
+    // ordinary text and must never flip sections.
+    let is_you = tok.kind == TokKind::Heading && tok.text.trim() == "### You";
+    let is_asst = tok.kind == TokKind::Heading && tok.text.trim() == "### Assistant";
 
     match tok.kind {
       // Daemon-owned control lines never reach messages.
@@ -231,17 +241,27 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize) -> Vec<ChatMessage> {
         }
         mode = Mode::Asst;
       }
-      // Thinking markers toggle accumulation.
-      TokKind::ThinkingOpen => in_thinking = true,
-      TokKind::ThinkingEnd => in_thinking = false,
-      // Tool round: open on `<!-- tool:`, close on `<!-- result:`. While a
-      // block is open all lines accumulate as the tool's output.
+      // Thinking markers toggle accumulation only inside assistant prose
+      // outside a tool block; pasted markers in user sections or inside a
+      // tool block are ordinary text.
+      TokKind::ThinkingOpen if mode == Mode::Asst && tool_result.is_none() => {
+        in_thinking = true;
+      }
+      TokKind::ThinkingEnd if mode == Mode::Asst && tool_result.is_none() => {
+        in_thinking = false;
+      }
+      // Tool round: open on `<!-- tool:`, close on `<!-- result:` for the
+      // SAME tool name. While a block is open all lines accumulate as the
+      // tool's output, including mismatched `<!-- result:... -->` lines.
       TokKind::Tool if tool_result.is_none() => {
         let (name, args) = tok.name_args();
         tool_result = Some((name.to_string(), args.to_string(), String::new()));
         mode = Mode::ToolOutput;
       }
-      TokKind::Result if tool_result.is_some() => {
+      TokKind::Result if tool_result
+        .as_ref()
+        .is_some_and(|(open_name, _, _)| tok.name_args().0 == open_name) =>
+      {
         emit_tool(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls, &mut tool_result);
         mode = Mode::Asst;
       }
@@ -313,14 +333,14 @@ pub fn parse_file(text: &str) -> ParsedFile {
     })
     .map(|close_line| close_line + 1);
 
-  // Section starts.
+  // Section starts: only exact `### You` / `### Assistant` headings.
   let mut you_lines: Vec<usize> = Vec::new();
   let mut asst_lines: Vec<usize> = Vec::new();
   for tok in &toks {
-    if tok.kind == TokKind::Heading && tok.payload == "You" {
+    if tok.kind == TokKind::Heading && tok.text.trim() == "### You" {
       you_lines.push(tok.line);
     }
-    if tok.kind == TokKind::Heading && tok.payload == "Assistant" {
+    if tok.kind == TokKind::Heading && tok.text.trim() == "### Assistant" {
       asst_lines.push(tok.line);
     }
   }
@@ -353,15 +373,20 @@ pub fn parse_file(text: &str) -> ParsedFile {
     }
   }
 
-  // ── History up to the last @done (never past the status line) ──
+  // ── History up to the last @done ──
+  //
+  // History stops right after the last `@done` line. Everything below it
+  // (drafts, in-flight turns, tool rounds) is the TAIL: the daemon appends
+  // it EXACTLY ONCE to the request via `tail_sections`, so it must not be
+  // duplicated here (a status line below `@done` used to pull the tail
+  // region into history as well, doubling every promoted draft and tool
+  // round in the prompt).
   let last_done_line = toks
     .iter()
-    .filter(|t| t.kind == TokKind::Done)
-    .last()
+    .rfind(|t| t.kind == TokKind::Done)
     .map(|t| t.line);
-  let status_line = toks.iter().filter(|t| t.kind == TokKind::Live).last().map(|t| t.line);
+  let status_line = toks.iter().rfind(|t| t.kind == TokKind::Live).map(|t| t.line);
   let history_end = match (last_done_line, status_line) {
-    (Some(d), Some(s)) if s > d => s,
     (Some(d), _) => d + 1,
     (None, Some(s)) => s,
     (None, None) => n_lines,
@@ -386,7 +411,14 @@ pub fn parse_file(text: &str) -> ParsedFile {
     if has_done_after || has_next_you {
       return None;
     }
-    let section = &text[after_ix..];
+    let section_end = toks
+      .iter()
+      .find(|t| t.line > last_asst && t.kind == TokKind::Live)
+      .map(|t| t.offset)
+      .unwrap_or(text.len());
+    // The section runs to the first daemon status line (or EOF): the live
+    // line is daemon-owned and must never leak into the resume hint.
+    let section = &text[after_ix..section_end];
     let tools = toks
       .iter()
       .filter(|t| t.kind == TokKind::Tool && t.line > last_asst)
@@ -399,8 +431,8 @@ pub fn parse_file(text: &str) -> ParsedFile {
       // Heading token (the raw `### Assistant` line) sits at after_ix.
       let heading = toks.iter().find(|t| t.line == last_asst)?;
       Some(DanglingTail {
-        resume_offset: line_end(heading),
-        partial_text: text[after_ix + heading.text.len()..].to_string(),
+        resume_offset: heading.line_end(),
+        partial_text: text[after_ix + heading.text.len()..section_end].to_string(),
       })
     } else {
       None
@@ -626,7 +658,7 @@ answers json
   #[test]
   fn no_header_means_system_prompt_is_prefix() {
     let txt = "Direct system text.\n\n### You\nhi\n";
-    let pf = parse_file(&txt);
+    let pf = parse_file(txt);
     assert_eq!(pf.history[0].role, Role::System);
     assert!(pf.history[0]
       .content
@@ -663,26 +695,190 @@ answers json
 
   #[test]
   fn markers_inside_closed_fence_are_not_structural() {
+    // A fence may not contain section headings / `@done` (those are
+    // structural boundaries), but tool markers inside a closed fence are
+    // plain text and must not open a tool block.
     let txt = "\
 ### Assistant
 ```md
-### You
-<!-- @done -->
+<!-- tool:bash {\"cmd\":\"ls\"} -->
+some code
 ```
 ### Assistant
 real reply
 ";
-    let pf = parse_file(&txt);
-    // The fenced-in `### You` must not create a user turn; the fence content
-    // stays assistant text.
+    let pf = parse_file(txt);
     let asst_msgs = pf
       .history
       .iter()
       .filter(|m| m.role == Role::Assistant)
       .count();
     assert_eq!(asst_msgs, 2);
+    assert!(!pf
+      .history
+      .iter()
+      .any(|m| m.tool_calls.is_some()), "fenced tool marker must not open a block");
     let last = pf.history.last().unwrap();
     assert_eq!(last.content.as_deref().unwrap().trim(), "real reply");
+  }
+
+  #[test]
+  fn only_level_three_headings_transition_sections() {
+    let txt = "\
+### You
+first
+## You
+draft not a transition
+# Assistant
+more draft
+#### You
+still draft
+### Assistant
+reply
+### You
+second
+";
+    let pf = parse_file(txt);
+    let roles: Vec<Role> = pf.history.iter().map(|m| m.role).collect();
+    assert_eq!(roles, vec![Role::User, Role::Assistant, Role::User]);
+    let users: Vec<&str> = pf
+      .history
+      .iter()
+      .filter(|m| m.role == Role::User)
+      .flat_map(|m| m.content.as_deref())
+      .collect();
+    assert!(users[0].contains("first"));
+    assert!(users[0].contains("## You"), "lower-level headings stay in the draft");
+    assert!(users[0].contains("# Assistant"), "lower-level headings stay in the draft");
+    assert!(users[1].contains("second"));
+  }
+
+  #[test]
+  fn thinking_markers_only_toggle_inside_assistant_prose() {
+    let txt = "\
+### You
+<!-- thinking -->
+user pasted a marker
+#### /thinking more text
+### Assistant
+plain
+### You
+<!-- /thinking -->
+still user text
+";
+    let pf = parse_file(txt);
+    let asst = pf
+      .history
+      .iter()
+      .find(|m| m.role == Role::Assistant)
+      .unwrap();
+    assert_eq!(asst.reasoning_content, None, "markers outside assistant prose never toggle");
+    assert!(asst.content.as_deref().unwrap().contains("plain"));
+    let users: Vec<&str> = pf
+      .history
+      .iter()
+      .filter(|m| m.role == Role::User)
+      .flat_map(|m| m.content.as_deref())
+      .collect();
+    assert!(users[0].contains("<!-- thinking -->"), "marker stays as user text");
+    assert!(users[0].contains("user pasted a marker"));
+    assert_eq!(users[0].find("There is"), None);
+  }
+
+  #[test]
+  fn thinking_markers_inside_tool_block_are_output_text() {
+    let txt = "\
+### Assistant
+<!-- tool:bash {\"cmd\":\"ls\"} -->
+<!-- thinking -->
+<!-- /thinking -->
+out
+<!-- result:bash ok=1ms -->
+done
+";
+    let pf = parse_file(txt);
+    let tool = pf.history.iter().find(|m| m.role == Role::Tool).unwrap();
+    let c = tool.content.as_deref().unwrap();
+    assert!(c.contains("<!-- thinking -->"), "marker is tool output");
+    assert!(c.contains("<!-- /thinking -->"), "marker is tool output");
+    assert!(c.contains("out"));
+    assert_eq!(pf.history.last().unwrap().role, Role::Assistant);
+  }
+
+  #[test]
+  fn mismatched_result_name_does_not_close_the_block() {
+    let txt = "\
+### Assistant
+<!-- tool:bash {\"cmd\":\"ls\"} -->
+src/
+<!-- result:grep ok=1ms -->
+docs/
+<!-- result:bash ok=42ms -->
+done
+";
+    let pf = parse_file(txt);
+    let tool = pf.history.iter().find(|m| m.role == Role::Tool).unwrap();
+    let c = tool.content.as_deref().unwrap();
+    assert!(c.contains("src/"));
+    assert!(c.contains("<!-- result:grep ok=1ms -->"), "mismatched result stays in output");
+    assert!(c.contains("docs/"));
+    assert!(!c.contains("<!-- result:bash ok=42ms -->"), "matching result is structural");
+    assert_eq!(pf.history.last().unwrap().role, Role::Assistant);
+    assert_eq!(pf.history.last().unwrap().content.as_deref(), Some("done\n"));
+  }
+
+  #[test]
+  fn unclosed_fence_below_next_turn_is_not_retroactive() {
+    // An unclosed fence in one turn must not swallow the `@done` and the
+    // next turn's `### You` section.
+    let txt = "\
+### Assistant
+```json
+{\"x\": 1}
+<!-- @done -->
+### You
+what now?
+";
+    let pf = parse_file(txt);
+    assert!(find_done_marker(txt).is_some(), "@done still a done marker");
+    let msgs = tail_sections(&pf.tail);
+    let last = msgs.last().unwrap();
+    assert_eq!(last.role, Role::User);
+    assert!(last.content.as_deref().unwrap().contains("what now?"));
+  }
+
+  #[test]
+  fn crlf_file_parses_without_panic_and_exact_history() {
+    let txt = "\
+### You\r
+Hello ❓ friend.\r
+\r
+### Assistant\r
+Reply ❓ ok.\r
+<!-- @done -->\r
+❓ QUESTIONS\r
+\r
+| # | Question | Options |\r
+| 1 | red or blue | red, blue |\r
+ANSWER: (numbers or text, comma separated)\r
+> \r
+";
+    let pf = parse_file(txt);
+    assert_eq!(pf.history[0].role, Role::User);
+    assert!(pf.history[0]
+      .content
+      .as_deref()
+      .unwrap()
+      .contains("Hello ❓ friend."));
+    assert_eq!(pf.history[1].role, Role::Assistant);
+    assert!(pf.history[1]
+      .content
+      .as_deref()
+      .unwrap()
+      .contains("Reply ❓ ok."));
+    assert_eq!(pf.pending_questions.len(), 1);
+    assert!(pf.tail.trim_start().starts_with("❓ QUESTIONS"));
+    assert!(pf.dangling.is_none());
   }
 
   #[test]
@@ -703,7 +899,20 @@ real reply
     let src = "a\nb\n<!-- slopfile:live {\"phase\":\"idle\"} -->\n";
     let (body, live) = strip_live_line(src);
     assert_eq!(body, "a\nb\n");
-    assert!(live.is_some());
+    let (off, text) = live.expect("live line removed");
+    assert_eq!(off, src.find("<!-- slopfile:live").unwrap());
+    assert_eq!(text, "<!-- slopfile:live {\"phase\":\"idle\"} -->");
     assert_eq!(strip_live_line("plain\n").0, "plain\n");
+  }
+
+  #[test]
+  fn strip_live_line_removes_all_live_lines_and_reports_last_offset() {
+    let src = "a\n<!-- slopfile:live {\"phase\":\"idle\"} -->\nb\n<!-- slopfile:live {\"phase\":\"gen\"} -->\nc";
+    let (body, live) = strip_live_line(src);
+    let (off, text) = live.expect("last live line reported");
+    assert_eq!(text, "<!-- slopfile:live {\"phase\":\"gen\"} -->");
+    assert_eq!(off, src.rfind("<!-- slopfile:live {\"phase\":\"gen\"").unwrap());
+    assert!(!body.contains("slopfile:live"), "all live lines removed");
+    assert_eq!(body, "a\nb\nc\n");
   }
 }

@@ -31,11 +31,17 @@ pub fn render_block(qs: &[Question]) -> String {
     out.push_str("| # | Question | Options |\n");
     out.push_str("|---|----------|---------|\n");
     for q in qs {
+        let opts = q
+            .answers
+            .iter()
+            .map(|a| a.replace('|', "\\|"))
+            .collect::<Vec<_>>()
+            .join(", ");
         out.push_str(&format!(
             "| {} | {} | {} |\n",
             q.id,
             q.question.replace('|', "\\|"),
-            q.answers.join(", ")
+            opts
         ));
     }
     out.push_str("ANSWER: (numbers or text, comma separated)\n");
@@ -48,12 +54,25 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
     let start = text.find(BLOCK_HEADER)?;
     let rest = &text[start..];
 
+    // The block ends at the next `❓ QUESTIONS` header (if any), so a later
+    // block's stashes/rows never leak into this one.
+    let mut block_end = rest.len();
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n').skip(1) {
+        if line.trim_end_matches(['\r', '\n']).trim() == BLOCK_HEADER {
+            block_end = offset;
+            break;
+        }
+        offset += line.len();
+    }
+    let block_text = &rest[..block_end];
+
     let mut questions: Vec<Question> = Vec::new();
     let mut raw_json: Vec<String> = Vec::new();
 
     // Stash comments appear after the header, one per question:
     // `<!-- q:1 {...} -->`. Build a lookup by id.
-    let stashes: Vec<(u32, String)> = rest
+    let stashes: Vec<(u32, String)> = block_text
         .lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -91,7 +110,7 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
 
     // Parse table rows: `| 1 | red or blue | red, blue |`
     let mut found_header_row = false;
-    for line in rest.lines().skip(1) {
+    for line in block_text.lines().skip(1) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -179,35 +198,16 @@ pub fn parse_answers(block: &QuestionsBlock, answer_text: &str) -> Result<Vec<(u
         out.push((q.id, resolved));
     }
 
-    if out.len() != block.questions.len() {
-        let missing: Vec<u32> = block
-            .questions
-            .iter()
-            .map(|q| q.id)
-            .filter(|id| !out.iter().any(|(qid, _)| qid == id))
-            .collect();
-        if !missing.is_empty() {
-            return Err(format!(
-                "missing answer for question(s): {}",
-                missing
-                    .iter()
-                    .map(|i| i.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-
     Ok(out)
 }
 
 fn resolve_token(token: &str, q: &Question) -> String {
     // A token may itself be comma-separated (e.g. multi-select) — not
     // supported per-question; treat the token as one answer.
-    if let Ok(k) = token.parse::<usize>() {
-        if k >= 1 && k <= q.answers.len() {
-            return q.answers[k - 1].clone();
-        }
+    if let Ok(k) = token.parse::<usize>()
+        && (1..=q.answers.len()).contains(&k)
+    {
+        return q.answers[k - 1].clone();
     }
     token.to_string()
 }
@@ -327,5 +327,36 @@ mod tests {
     #[test]
     fn parse_block_not_found() {
         assert!(parse_block("no questions here").is_none());
+    }
+
+    #[test]
+    fn parse_block_does_not_leak_later_blocks_stashes() {
+        let first = format!(
+            "{}\n| # | Question | Options |\n| 1 | red or blue | red, blue |\nANSWER: (numbers or text, comma separated)\n> \n",
+            BLOCK_HEADER
+        );
+        let second = format!(
+            "{}\n| # | Question | Options |\n| 1 | again? | yes, no |\nANSWER: (numbers or text, comma separated)\n> \n<!-- q:1 {{\"question\":\"again?\",\"answers\":[\"yes\",\"no\"],\"default\":\"no\"}} -->",
+            BLOCK_HEADER
+        );
+        let both = format!("{first}\n{second}\n");
+
+        let first_block = parse_block(&both).expect("first block");
+        assert_eq!(first_block.questions.len(), 1);
+        assert_eq!(first_block.questions[0].question, "red or blue");
+        assert_eq!(first_block.questions[0].default, None);
+        assert_eq!(
+            first_block.raw_json[0], "",
+            "first block must not see the second block's stash"
+        );
+
+        let second_block = parse_block(&both[first.len()..]).expect("second block");
+        assert_eq!(second_block.questions.len(), 1);
+        assert_eq!(second_block.questions[0].question, "again?");
+        assert_eq!(second_block.questions[0].default.as_deref(), Some("no"));
+        assert_eq!(
+            second_block.raw_json[0],
+            "{\"question\":\"again?\",\"answers\":[\"yes\",\"no\"],\"default\":\"no\"}"
+        );
     }
 }

@@ -128,13 +128,10 @@ async fn main() {
       if guard.contains(&path) {
         continue;
       }
+      if let Some(at) = throttled.lock().await.get(&path)
+        && at.elapsed() < Duration::from_secs(5)
       {
-        let th = throttled.lock().await;
-        if let Some(at) = th.get(&path) {
-          if at.elapsed() < Duration::from_secs(5) {
-            continue;
-          }
-        }
+        continue;
       }
       guard.insert(path.clone());
       drop(guard);
@@ -219,11 +216,11 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
     }
 
     // 2) Promote drafted tail text into a `### You` history section.
-    if let Some(draft) = draft_tail_after_done(&text) {
-      if !draft.trim().is_empty() {
-        promote_draft(path, &text, &pf)?;
-        continue;
-      }
+    if let Some(draft) = draft_tail_after_done(&text)
+      && !draft.trim().is_empty()
+    {
+      promote_draft(path, &text)?;
+      continue;
     }
 
     // 3) Generation turn: cut dangling partial output, stream a response.
@@ -244,17 +241,17 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
     // waiting on the user (no daemon work).
     return questions_resolvable(pf, cfg);
   }
-  if let Some(draft) = draft_tail_after_done(text) {
-    if !draft.trim().is_empty() {
-      return true;
-    }
+  if let Some(draft) = draft_tail_after_done(text)
+    && !draft.trim().is_empty()
+  {
+    return true;
   }
   // A `### You` / other section below the last @done (user wrote their own
   // header, or promotion happened) still needs work.
-  if let Some(section) = section_below_done(text) {
-    if !section.trim().is_empty() {
-      return true;
-    }
+  if let Some(section) = section_below_done(text)
+    && !section.trim().is_empty()
+  {
+    return true;
   }
   // Fresh file with a first user turn and no `@done` yet.
   if transcript::find_done_marker(text).is_none() {
@@ -270,7 +267,8 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
 /// comment lines stripped).
 fn section_below_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
-  let done = lex(&body).into_iter().find(|t| t.kind == TokKind::Done)?;
+  let toks = lex(&body);
+  let done = toks.iter().rfind(|t| t.kind == TokKind::Done)?;
   let tail = &body[done.offset + lex::DONE_MARKER.len()..];
   let user_tail = lex(tail)
     .into_iter()
@@ -307,33 +305,37 @@ async fn run_generation_turn(
   cfg: &AppConfig,
   client: &LlamaClient,
 ) -> Result<TurnOutcome, String> {
-  // Cut daemon-owned partial output (dangling) so we stream a fresh response.
+  // Cut daemon-owned partial output (dangling) so we stream a fresh
+  // response: everything up to the end of the dangling `### Assistant`
+  // heading stays (the heading is the resume point), the partial text below
+  // it is dropped and re-asked. StreamWriter rewrites the WHOLE file on
+  // every flush, so user-owned history and drafts above the heading are
+  // preserved verbatim.
   let (body, live) = strip_live_line(text);
   let base_text = match &pf.dangling {
-    Some(d) => {
-      let cut = body[..d.resume_offset.min(body.len())].to_string();
-      cut
-    }
+    Some(d) => body[..d.resume_offset.min(body.len())].to_string(),
     None => body.clone(),
   };
 
   // Messages: history + resume hint for dangling output + any in-flight
-  // below-@done sections (drafts promoted to `### You`).
+  // below-@done sections (drafts promoted to `### You`). The below-@done
+  // region is appended EXACTLY ONCE here — `parse_file` history already
+  // stops at the last `@done`.
   let mut messages = pf.history.clone();
-  if transcript::find_done_marker(text).is_some() {
-    if let Some(section) = section_below_done(text) {
-      for m in transcript::tail_sections(&section) {
-        messages.push(m);
-      }
+  if transcript::find_done_marker(text).is_some()
+    && let Some(section) = section_below_done(text)
+  {
+    for m in transcript::tail_sections(&section) {
+      messages.push(m);
     }
   }
-  if let (true, Some(d)) = (pf.dangling.is_some(), &pf.dangling) {
-    if !d.partial_text.trim().is_empty() {
-      messages.push(ChatMessage::user(format!(
-        "[resume] previous assistant output was interrupted; continue exactly where it stopped:\n```\n{}\n```",
-        d.partial_text.trim_end()
-      )));
-    }
+  if let Some(d) = &pf.dangling
+    && !d.partial_text.trim().is_empty()
+  {
+    messages.push(ChatMessage::user(format!(
+      "[resume] previous assistant output was interrupted; continue exactly where it stopped:\n```\n{}\n```",
+      d.partial_text.trim_end()
+    )));
   }
 
   // Long sessions: drop the OLDEST turns from the request (never the file)
@@ -351,13 +353,17 @@ async fn run_generation_turn(
 
   // First write: `### Assistant` header (+ thinking open if the first delta
   // is reasoning — we handle markers in the event closure).
-  let mut active = StreamWriter::new(path, &base_text, live.clone());
+  let mut active = StreamWriter::new(path, &base_text, live.map(|(_, t)| t));
 
   info!("→ {path:?}: generating (messages={})", messages.len());
   let result = client
-    .chat_stream(&messages, tool_defs.as_deref(), max_tokens, |ev| {
-      active.handle(&ev)
-    })
+    .chat_stream(
+      &messages,
+      tool_defs.as_deref(),
+      max_tokens,
+      |ev| active.handle(&ev),
+      || file_has_abort(path),
+    )
     .await
     .map_err(|e| format!("chat_stream: {e}"))?;
 
@@ -367,22 +373,14 @@ async fn run_generation_turn(
     active.finish_section();
     let text_now = read_file(path)?;
     let (body, live) = strip_live_line(&text_now);
-    let mut out = String::new();
-    for l in body.split('\n') {
-      if transcript::is_abort_line(l) {
-        continue;
-      }
-      out.push_str(l);
-      out.push('\n');
-    }
-    out.truncate(out.len().saturating_sub(1));
+    let mut out = without_abort_lines(&body);
     if !out.ends_with('\n') {
       out.push('\n');
     }
     if !out.trim_end().ends_with(DONE_MARKER) {
       out.push_str(&format!("{DONE_MARKER}\n"));
     }
-    if let Some(live) = live {
+    if let Some((_, live)) = live {
       out.push('\n');
       out.push_str(&live);
     }
@@ -426,7 +424,7 @@ async fn run_generation_turn(
     }
     out.push_str(&format!("{DONE_MARKER}\n"));
     out.push_str(&format!("{CONTEXT_FULL_NOTE}\n"));
-    if let Some(live) = live {
+    if let Some((_, live)) = live {
       out.push('\n');
       out.push_str(&live);
     }
@@ -439,7 +437,7 @@ async fn run_generation_turn(
   if !result.tool_calls.is_empty() {
     let is_question = result.tool_calls.iter().any(|t| t.name == "question");
     if is_question {
-      render_questions_block(path, &result.tool_calls, &pf)?;
+      render_questions_block(path, &result.tool_calls)?;
       return Ok(TurnOutcome::AwaitsNextTurn);
     }
     write_tool_blocks(path, &result.tool_calls, cfg, pf).await?;
@@ -455,7 +453,7 @@ async fn run_generation_turn(
     out.push('\n');
   }
   out.push_str(&format!("{DONE_MARKER}\n"));
-  if let Some(live) = live {
+  if let Some((_, live)) = live {
     out.push('\n');
     out.push_str(&live);
   }
@@ -493,9 +491,14 @@ impl<'a> StreamWriter<'a> {
 
   fn ensure_header(&mut self) {
     // On resume the dangling cut already leaves the `### Assistant` header
-    // in place; don't write a second one.
-    if self.out.trim_end().ends_with("### Assistant") {
+    // in place; don't write a second one. Only a heading at the very end of
+    // the buffer counts — a heading in the middle is streamed content.
+    let tail = self.out.trim_end();
+    if tail == "### Assistant" || tail.ends_with("\n### Assistant") {
       self.wrote_header = true;
+      if !self.out.ends_with('\n') {
+        self.out.push('\n');
+      }
       return;
     }
     if !self.wrote_header {
@@ -563,13 +566,7 @@ impl<'a> StreamWriter<'a> {
   fn flush_marker_strip(&mut self) {
     if self.marker_present() {
       self.aborted = true;
-      let mut kept = Vec::new();
-      for l in self.out.split('\n') {
-        if !transcript::is_abort_line(l) {
-          kept.push(l);
-        }
-      }
-      self.out = kept.join("\n");
+      self.out = without_abort_lines(&self.out);
     }
     self.flush();
   }
@@ -586,32 +583,16 @@ impl<'a> StreamWriter<'a> {
       out.push('\n');
     }
     if let Some(live) = &self.live {
-      out.push_str("\n");
+      out.push('\n');
       out.push_str(live);
     }
-    let mut clean = String::new();
-    for l in out.split('\n') {
-      if transcript::is_abort_line(l) {
-        continue;
-      }
-      clean.push_str(l);
-      clean.push('\n');
-    }
-    clean.truncate(clean.len().saturating_sub(1));
+    let clean = without_abort_lines(&out);
     let _ = std::fs::write(self.path, clean);
   }
 
   fn flush(&mut self) {
     // Daemon-owned control lines (e.g. abort marker) never reach the file.
-    let mut out = String::new();
-    for l in self.out.split('\n') {
-      if transcript::is_abort_line(l) {
-        continue;
-      }
-      out.push_str(l);
-      out.push('\n');
-    }
-    out.truncate(out.len().saturating_sub(1));
+    let mut out = without_abort_lines(&self.out);
     if let Some(live) = &self.live {
       out.push('\n');
       out.push_str(live);
@@ -651,10 +632,10 @@ fn cmd_init(path: &str, cfg: &AppConfig) {
 
 /// Resolve what `init` would write. Err when the file exists with content.
 fn init_template_for(path: &str, cfg: &AppConfig) -> Result<String, String> {
-  if let Ok(existing) = std::fs::read_to_string(path) {
-    if !existing.trim().is_empty() {
-      return Err(format!("{path} exists and is not empty; refusing to overwrite"));
-    }
+  if let Ok(existing) = std::fs::read_to_string(path)
+    && !existing.trim().is_empty()
+  {
+    return Err(format!("{path} exists and is not empty; refusing to overwrite"));
   }
   Ok(session_template(cfg))
 }
@@ -783,6 +764,14 @@ pub fn truncate_messages(messages: Vec<ChatMessage>, max_tokens: u32) -> Vec<Cha
   while keep_from + 1 < messages.len() && !is_turn_start(&messages[keep_from]) {
     keep_from += 1;
   }
+  // Even the newest message alone exceeds the budget: the forward walk can
+  // not advance past the end, so an orphaned Tool tail would be kept with
+  // no caller. Unwind backward to the last turn start instead.
+  if keep_from + 1 == messages.len() && !is_turn_start(&messages[keep_from]) {
+    while keep_from > 0 && !is_turn_start(&messages[keep_from]) {
+      keep_from -= 1;
+    }
+  }
   if keep_from > 1 {
     let mut out = Vec::with_capacity(messages.len() - keep_from + 1);
     out.push(messages[0].clone());
@@ -808,7 +797,7 @@ async fn write_tool_blocks(
   path: &Path,
   calls: &[ToolCall],
   cfg: &AppConfig,
-  _pf: &ParsedFile,
+  pf: &ParsedFile,
 ) -> Result<(), String> {
   let text = read_file(path)?;
   let (body, live) = strip_live_line(&text);
@@ -816,11 +805,13 @@ async fn write_tool_blocks(
   let mut block = String::new();
   for call in calls {
     let started = std::time::Instant::now();
+    // Per-session header override, else the app-wide timeout.
+    let timeout = pf.config.tool_timeout_ms.unwrap_or(cfg.tool_timeout_ms);
     let result = tools::run(
       &call.name,
       &call.arguments,
       PathBuf::from(&cfg.workdir),
-      cfg.tool_timeout_ms,
+      timeout,
     )
     .await;
     let ms = started.elapsed().as_millis();
@@ -829,7 +820,8 @@ async fn write_tool_blocks(
     if !result.output.ends_with('\n') {
       block.push('\n');
     }
-    block.push_str(&format!("<!-- result:{} ok={}ms -->\n", call.name, ms));
+    let status = if result.ok { "ok" } else { "err" };
+    block.push_str(&format!("<!-- result:{} {}={}ms -->\n", call.name, status, ms));
   }
 
   let mut out = body;
@@ -837,7 +829,7 @@ async fn write_tool_blocks(
     out.push('\n');
   }
   out.push_str(&block);
-  if let Some(live) = live {
+  if let Some((_, live)) = live {
     out.push('\n');
     out.push_str(&live);
   }
@@ -847,11 +839,7 @@ async fn write_tool_blocks(
 /// Render a `❓ QUESTIONS` block in the tail from a `question` tool call,
 /// stashing the tool-call JSON so the answer can be resolved into a normal
 /// tool result later.
-fn render_questions_block(
-  path: &Path,
-  calls: &[ToolCall],
-  pf: &ParsedFile,
-) -> Result<(), String> {
+fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String> {
   let call = calls
     .iter()
     .find(|c| c.name == "question")
@@ -909,12 +897,11 @@ fn render_questions_block(
     "<!-- call:{} {} -->\n",
     call.name, call.arguments
   ));
-  if let Some(live) = live {
+  if let Some((_, live)) = live {
     out.push('\n');
     out.push_str(&live);
   }
   write_file(path, out)?;
-  let _ = pf;
   Ok(())
 }
 
@@ -980,7 +967,9 @@ fn resolve_questions(
     let block_text = &out[header_ix..end_ix];
 
     // Answers: user text below `>`, else `/skip` (default/default=empty),
-    // else defaults/first (yolo).
+    // else defaults/first (yolo). In ask mode an unanswered block stays
+    // pending — an answer or /skip elsewhere in the tail (another block)
+    // must never auto-answer THIS block.
     let skipping = has_skip(block_text);
     let raw = user_answers_from_tail(block_text);
     let answers = match (&raw, skipping) {
@@ -989,22 +978,22 @@ fn resolve_questions(
         .iter()
         .map(|q| (q.id, q.default.clone().unwrap_or_default()))
         .collect::<Vec<_>>(),
-      (Some(t), false) => parse_answers(block, t).map_err(|e| e)?,
-      (None, false) => {
-        // yolo: default or first option per question.
-        block
-          .questions
-          .iter()
-          .map(|q| {
-            let ans = q
-              .default
-              .clone()
-              .or_else(|| q.answers.first().cloned())
-              .unwrap_or_default();
-            (q.id, ans)
-          })
-          .collect::<Vec<_>>()
-      }
+      (Some(t), false) => parse_answers(block, t)?,
+      // yolo: default or first option per question.
+      (None, false) if cfg.confirmations == "yolo" => block
+        .questions
+        .iter()
+        .map(|q| {
+          let ans = q
+            .default
+            .clone()
+            .or_else(|| q.answers.first().cloned())
+            .unwrap_or_default();
+          (q.id, ans)
+        })
+        .collect::<Vec<_>>(),
+      // ask: not answered, not skipped — keep waiting for the user.
+      (None, false) => continue,
     };
 
     // Re-read the stash comment for the full tool call.
@@ -1032,18 +1021,13 @@ fn resolve_questions(
     // Drop stray /skip lines (below the block / typed on their own line);
     // they are commands, not user messages.
     out = drop_skip_lines(&updated);
-
-    if cfg.confirmations == "yolo" && raw.is_some() {
-      // fallthrough
-    }
   }
 
-  if let Some(live) = live {
+  if let Some((_, live)) = live {
     out.push('\n');
     out.push_str(&live);
   }
   write_file(path, out)?;
-  let _ = cfg;
   Ok(())
 }
 
@@ -1052,7 +1036,7 @@ fn resolve_questions(
 /// Insert a `### You` header before drafted tail text (below the last
 /// `@done` marker) so it becomes history. Daemon-owned comment lines
 /// (e.g. the context-full note) are skipped and stay above the section.
-fn promote_draft(path: &Path, text: &str, pf: &ParsedFile) -> Result<(), String> {
+fn promote_draft(path: &Path, text: &str) -> Result<(), String> {
   let (body, live) = strip_live_line(text);
   let done_ix = transcript::find_done_marker(&body)
     .map(|ix| ix + DONE_MARKER.len())
@@ -1075,14 +1059,12 @@ fn promote_draft(path: &Path, text: &str, pf: &ParsedFile) -> Result<(), String>
     out.push('\n');
   }
   out.push_str("### You\n");
-  out.push_str(&body[marker_end..].trim_start_matches('\n'));
-  if let Some(live) = live {
+  out.push_str(body[marker_end..].trim_start_matches('\n'));
+  if let Some((_, live)) = live {
     out.push('\n');
     out.push_str(&live);
   }
-  write_file(path, out)?;
-  let _ = pf;
-  Ok(())
+  write_file(path, out)
 }
 
 /// Tail text below the last `@done` that is NOT a questions block, NOT an
@@ -1095,12 +1077,17 @@ fn draft_tail_after_done(text: &str) -> Option<String> {
   let tail = &body[done.offset + lex::DONE_MARKER.len()..];
   let toks = lex(tail);
   let user_toks: Vec<_> = toks.iter().filter(|t| !t.kind.is_daemon_owned()).collect();
-  // Already stays in history: user typed `### You`, or daemon promoted and
-  // the turn is running / waiting. Do NOT re-promote.
+  // Already stays in history: the tail starts with an EXACT `### You` or
+  // `### Assistant` section heading (daemon promoted, or an in-flight turn).
+  // Any other heading (`#`, `##`, `####` ...) is ordinary draft text and
+  // must be promoted — otherwise such drafts are silently never sent.
   if user_toks
     .iter()
     .find(|t| !t.text.trim().is_empty())
-    .is_some_and(|t| t.kind == TokKind::Heading)
+    .is_some_and(|t| {
+      t.kind == TokKind::Heading
+        && (t.text.trim() == "### You" || t.text.trim() == "### Assistant")
+    })
   {
     return None;
   }
@@ -1178,12 +1165,21 @@ fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
   }
 }
 
-/// Remove the abort marker line from the file (control state, not user
-/// text) and leave everything else untouched.
-fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
-  let (body, live) = strip_live_line(text);
+/// True while the file on disk currently holds an abort marker. Polled
+/// between SSE deltas; if the file can't be read, abort conservatively.
+fn file_has_abort(path: &Path) -> bool {
+  let Ok(disk) = std::fs::read_to_string(path) else {
+    return true;
+  };
+  transcript::abort_marker_present(&disk)
+}
+
+/// Drop every abort-marker line from `text` (daemon-owned control state,
+/// not user content). The single helper behind all abort-line stripping
+/// (StreamWriter flushes, the idle abort path, `slopfile abort` cleanup).
+fn without_abort_lines(text: &str) -> String {
   let mut out = String::new();
-  for l in body.split('\n') {
+  for l in text.split('\n') {
     if transcript::is_abort_line(l) {
       continue;
     }
@@ -1191,7 +1187,15 @@ fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
     out.push('\n');
   }
   out.truncate(out.len().saturating_sub(1));
-  if let Some(live) = live {
+  out
+}
+
+/// Remove the abort marker line from the file (control state, not user
+/// text) and leave everything else untouched.
+fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
+  let (body, live) = strip_live_line(text);
+  let mut out = without_abort_lines(&body);
+  if let Some((_, live)) = live {
     out.push('\n');
     out.push_str(&live);
   }
@@ -1212,7 +1216,6 @@ fn write_status(path: &Path, pf: &ParsedFile, phase: &str) -> Result<(), String>
   let status = types::LiveStatus {
     phase: phase.to_string(),
     model: pf.config.model.clone().unwrap_or_default(),
-    ..Default::default()
   };
   let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".into());
   let mut out = body;

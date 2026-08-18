@@ -18,20 +18,6 @@ pub enum Role {
   Tool,
 }
 
-// ── Content parts (user messages can carry images) ──────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentPart {
-  Text { text: String },
-  ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageUrl {
-  pub url: String, // data:image/png;base64,...
-}
-
 // ── Tool calls ──────────────────────────────────────────────────────────
 
 /// A tool call issued by the assistant.
@@ -126,13 +112,9 @@ pub struct FunctionDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
   pub role: Role,
-  /// Text content. For user messages may be None when only parts are used.
+  /// Text content.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub content: Option<String>,
-  /// Multi-part content (user message with images). If set, `content` is
-  /// ignored/replaced on the wire.
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub parts: Option<Vec<ContentPart>>,
   /// Assistant messages only: reasoning content (thinking).
   #[serde(skip_serializing_if = "Option::is_none")]
   pub reasoning_content: Option<String>,
@@ -150,7 +132,6 @@ impl ChatMessage {
     Self {
       role: Role::User,
       content: Some(text.into()),
-      parts: None,
       reasoning_content: None,
       tool_calls: None,
       tool_call_id: None,
@@ -162,7 +143,6 @@ impl ChatMessage {
     Self {
       role: Role::Assistant,
       content: Some(text.into()),
-      parts: None,
       reasoning_content: None,
       tool_calls: None,
       tool_call_id: None,
@@ -174,7 +154,6 @@ impl ChatMessage {
     Self {
       role: Role::System,
       content: Some(text.into()),
-      parts: None,
       reasoning_content: None,
       tool_calls: None,
       tool_call_id: None,
@@ -190,31 +169,11 @@ impl ChatMessage {
     Self {
       role: Role::Tool,
       content: Some(text.into()),
-      parts: None,
       reasoning_content: None,
       tool_calls: None,
       tool_call_id: Some(tool_call_id.into()),
       name: Some(name.into()),
     }
-  }
-
-  pub fn with_images(mut self, images: Vec<ImageUrl>) -> Self {
-    if images.is_empty() {
-      return self;
-    }
-    let text = self.content.unwrap_or_default();
-    let mut parts: Vec<ContentPart> = Vec::with_capacity(1 + images.len());
-    if !text.is_empty() {
-      parts.push(ContentPart::Text { text });
-    }
-    parts.extend(
-      images
-        .into_iter()
-        .map(|image_url| ContentPart::ImageUrl { image_url }),
-    );
-    self.parts = Some(parts);
-    self.content = None;
-    self
   }
 }
 
@@ -292,15 +251,18 @@ pub struct StreamResult {
 /// Union of everything a turn encounter can be, used by the agent loop to
 /// decide next steps (more text vs. execute tool vs. done).
 ///
-/// `ToolCallFragment`/`Done` payloads are emitted as a live preview while the
-/// full data is also returned from `consume_stream`; the loop reads the
+/// `ToolCallFragment`/`Done` payloads are emitted as a preview while the
+/// full data is also returned from `chat_stream`; the loop reads the
 /// returned copy, so the preview payloads are intentionally untouched.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum StreamEvent {
   Text(String),
   Reasoning(String),
+  /// Preview-only: the agent loop reads the returned `StreamResult`
+  /// instead, so the payload is intentionally never consumed here.
+  #[allow(dead_code)]
   ToolCallFragment(SseToolCallDelta),
+  #[allow(dead_code)]
   Done(StreamResult),
 }
 
@@ -403,8 +365,12 @@ impl AppConfig {
 pub struct SessionConfig {
   #[serde(default)]
   pub model: Option<String>,
+  /// "auto" | "on" | "off". Informational only: llama-server decides
+  /// whether to emit reasoning; parsing it keeps the header faithful.
   #[serde(default)]
-  pub thinking: Option<String>, // "auto" | "on" | "off"
+  pub thinking: Option<String>,
+  /// Per-session tool-call timeout; overrides the app-wide
+  /// `AppConfig::tool_timeout_ms` when set.
   #[serde(default)]
   pub tool_timeout_ms: Option<u64>,
   #[serde(default)]
@@ -443,22 +409,14 @@ impl ToolResult {
   }
 }
 
-// ── Live status line (rewritten ~1 Hz at file bottom) ───────────────────
+// ── Live status line (rewritten at daemon turn boundaries at file bottom) ─
 
+/// JSON payload of the `<!-- slopfile:live {...} -->` status line. Only
+/// `idle` and `waiting_answer` phases are currently emitted (the phase is
+/// set when the daemon releases the file); the streamed view is the file
+/// itself.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LiveStatus {
-  pub phase: String, // idle | generating | tool | waiting_answer | error
+  pub phase: String, // idle | waiting_answer
   pub model: String,
-  #[serde(default)]
-  pub tok_per_sec: f64,
-  #[serde(default)]
-  pub prompt_tokens: u32,
-  #[serde(default)]
-  pub completion_tokens: u32,
-  #[serde(default)]
-  pub tool: Option<String>,
-  #[serde(default)]
-  pub rtt_ms: Option<u64>,
-  #[serde(default)]
-  pub elapsed_secs: u64,
 }
