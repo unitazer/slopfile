@@ -130,6 +130,75 @@ use crate::types::Role;
   }
 
   #[test]
+  fn skip_resolves_with_defaults() {
+    let dir = std::env::temp_dir().join("slopfile-test-skip");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.md");
+    let mut src = sample_with_question_block();
+    // User answers with /skip on the answer line.
+    src = src.replace("> \n", "> /skip\n");
+    std::fs::write(&path, &src).unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let pf = transcript::parse_file(&text);
+    assert!(!pf.pending_questions.is_empty());
+    let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
+    assert!(questions_resolvable(&pf, &cfg), "/skip resolves in ask mode");
+    resolve_questions(&path, &text, &pf, &cfg).unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("<!-- tool:question"), "resolved to tool block");
+    assert!(!after.contains("/skip"), "command line removed");
+    assert!(!after.contains("❓ QUESTIONS"), "block removed");
+    let pf2 = transcript::parse_file(&after);
+    assert_eq!(pf2.history.last().map(|m| m.role), Some(Role::Tool));
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn truncate_keeps_system_and_drops_oldest_turns() {
+    let mut msgs = vec![ChatMessage::system("sys prompt here")];
+    for i in 1..=8 {
+      msgs.push(ChatMessage::user(format!("user turn number {i} with some body text")));
+      msgs.push(ChatMessage::assistant(format!("assistant answer number {i} with some body text")));
+    }
+    // Tiny budget: only the newest turns survive.
+    let small = truncate_messages(msgs.clone(), 12); // 12 tokens * 4 chars = 48 chars
+    assert_eq!(small[0].role, Role::System);
+    assert!(small.len() < msgs.len(), "old turns dropped: {} -> {}",
+      msgs.len(), small.len());
+    let last = small.last().unwrap();
+    assert_eq!(last.content.as_deref(), Some("assistant answer number 8 with some body text"));
+    // Never starts mid-turn.
+    assert!(matches!(small[1].role, Role::User | Role::Assistant));
+
+    // Big budget: everything kept.
+    let big = truncate_messages(msgs.clone(), 1_000_000);
+    assert_eq!(big.len(), msgs.len());
+  }
+
+  #[test]
+  fn truncate_cuts_tool_rounds_as_a_pair() {
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for i in 1..=4 {
+      msgs.push(ChatMessage::user(format!("u{i}")));
+      let call = ToolCall::new(format!("id{i}"), "bash".to_string(), "{}".to_string());
+      let mut asst = ChatMessage::assistant(format!("thinking then call {i}"));
+      asst.tool_calls = Some(vec![call.clone()]);
+      msgs.push(asst);
+      msgs.push(ChatMessage::tool(call.id.clone(), "bash".to_string(), "out".to_string()));
+    }
+    let small = truncate_messages(msgs.clone(), 6); // ~24 chars: fits ~1 round
+    // First kept message after system must not be a Tool result with a
+    // missing caller: it is User or Assistant.
+    assert!(matches!(small[1].role, Role::User | Role::Assistant));
+    // If a tool round starts, its result is included.
+    let has_call = small.iter().any(|m| m.tool_calls.is_some());
+    let has_result = small.iter().any(|m| m.role == Role::Tool);
+    assert_eq!(has_call, has_result, "tool round is atomic");
+  }
+
+  #[test]
   fn draft_below_done_is_work() {
     let dir = std::env::temp_dir().join("slopfile-test-draft");
     std::fs::create_dir_all(&dir).unwrap();

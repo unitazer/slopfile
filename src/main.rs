@@ -275,11 +275,16 @@ async fn run_generation_turn(
     }
   }
 
-  let max_tokens = pf
+  // Long sessions: drop the OLDEST turns from the request (never the file)
+  // so the prompt fits the context window. Keeps the system message and
+  // always cuts at a clean turn boundary.
+  let context_budget = pf
     .config
     .max_context_tokens
-    .unwrap_or(cfg.max_context_tokens)
-    / 4;
+    .unwrap_or(cfg.max_context_tokens);
+  messages = truncate_messages(messages, context_budget);
+
+  let max_tokens = context_budget / 4;
   let tools = pf.config.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(true);
   let tool_defs = tools.then(tools::definitions);
 
@@ -515,6 +520,70 @@ impl<'a> StreamWriter<'a> {
   }
 }
 
+// ── Conversation truncation ─────────────────────────────────────────────
+
+/// Rough char-per-token estimate for budget checks (English ≈ 4 chars/tok).
+const CHARS_PER_TOKEN: usize = 4;
+
+fn msg_chars(m: &ChatMessage) -> usize {
+  m.content.as_ref().map_or(0, |c| c.len())
+    + m.reasoning_content.as_ref().map_or(0, |c| c.len())
+    + m
+      .tool_calls
+      .as_ref()
+      .map_or(0, |t| t.iter().map(|c| c.arguments.len() + 16).sum())
+    + m.name.as_ref().map_or(0, |n| n.len())
+}
+
+/// Drop the OLDEST messages (after the system prompt) until the estimated
+/// prompt size fits `max_tokens`. Keeps the NEWEST turns. The first kept
+/// message is a `User` or `Assistant` turn start — never a `Tool` result,
+/// which would orphan its tool-call id. If even the newest turn doesn't
+/// fit, the newest messages are kept anyway (a partial context beats an
+/// empty one).
+pub fn truncate_messages(messages: Vec<ChatMessage>, max_tokens: u32) -> Vec<ChatMessage> {
+  if messages.is_empty() {
+    return messages;
+  }
+  let budget = (max_tokens as usize).saturating_mul(CHARS_PER_TOKEN);
+  let total: usize = messages.iter().map(msg_chars).sum();
+  if total <= budget || messages.len() <= 2 {
+    return messages;
+  }
+  // Largest prefix (1-based index) that fits within the budget.
+  let sys_len = msg_chars(&messages[0]);
+  let mut keep_through = messages.len() - 1;
+  let mut sum = sys_len + messages.iter().skip(1).map(msg_chars).sum::<usize>();
+  for (i, m) in messages.iter().enumerate().skip(1) {
+    sum -= msg_chars(m);
+    if sum <= budget {
+      keep_through = i;
+      break;
+    }
+  }
+  let mut keep_from = keep_through;
+  // Walk forward to a clean turn start but never past the last message:
+  // dropping a trailing partial turn is better than orphaning tool rounds.
+  while keep_from + 1 < messages.len() && !is_turn_start(&messages[keep_from]) {
+    keep_from += 1;
+  }
+  if keep_from > 1 {
+    let mut out = Vec::with_capacity(messages.len() - keep_from + 1);
+    out.push(messages[0].clone());
+    out.extend(messages[keep_from..].iter().cloned());
+    return out;
+  }
+  messages
+}
+
+/// A message is a valid turn start after truncation: `User` always, or a
+/// `Tool` result when its calling assistant AND the assistant's own full
+/// round are included (handled by the caller's forward scan). `Assistant`
+/// is always safe (its tool result, if any, follows after).
+fn is_turn_start(m: &ChatMessage) -> bool {
+  matches!(m.role, Role::User | Role::Assistant)
+}
+
 // ── Tool execution ──────────────────────────────────────────────────────
 
 /// Execute each tool call and append its block at the end of the file
@@ -636,13 +705,24 @@ fn render_questions_block(
 // ── Questions resolution ────────────────────────────────────────────────
 
 /// Can the pending questions be resolved right now? In ask mode: the user
-/// must have written answers below `> `. In yolo mode: always (defaults or
-/// the first option).
+/// must have written answers below `> ` or typed `/skip`. In yolo mode:
+/// always (defaults or the first option).
 fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
   if cfg.confirmations == "yolo" {
     return true;
   }
-  user_answers_from_tail(&pf.tail).is_some()
+  user_answers_from_tail(&pf.tail).is_some() || has_skip(&pf.tail)
+}
+
+/// True if the tail contains a `/skip` line (answer questions with
+/// defaults / nothing, don't wait for the user). Matches both `/skip` and
+/// `> /skip` (the user types on the `>` answer line).
+fn has_skip(tail: &str) -> bool {
+  tail.lines().any(|l| {
+    let l = l.trim_start();
+    let l = l.strip_prefix('>').unwrap_or(l).trim_start();
+    l == "/skip"
+  })
 }
 
 /// Cheap heuristic used only for `block_answered` — superseded by
@@ -702,11 +782,18 @@ fn resolve_questions(
       .unwrap_or(out.len());
     let block_text = &out[header_ix..end_ix];
 
-    // Answers: user text below `>`, else defaults/first (yolo).
+    // Answers: user text below `>`, else `/skip` (default/default=empty),
+    // else defaults/first (yolo).
+    let skipping = has_skip(block_text);
     let raw = user_answers_from_tail(block_text);
-    let answers = match &raw {
-      Some(t) => parse_answers(block, &t).map_err(|e| e)?,
-      None => {
+    let answers = match (&raw, skipping) {
+      (_, true) => block
+        .questions
+        .iter()
+        .map(|q| (q.id, q.default.clone().unwrap_or_default()))
+        .collect::<Vec<_>>(),
+      (Some(t), false) => parse_answers(block, t).map_err(|e| e)?,
+      (None, false) => {
         // yolo: default or first option per question.
         block
           .questions
@@ -745,6 +832,17 @@ fn resolve_questions(
 
     let mut updated = out.clone();
     updated.replace_range(header_ix..end_ix.min(updated.len()), &tool_out);
+    // Drop stray /skip lines (below the block / typed on their own line);
+    // they are commands, not user messages.
+    let had_trailing_nl = updated.ends_with('\n');
+    updated = updated
+      .lines()
+      .filter(|l| !has_skip(l))
+      .collect::<Vec<_>>()
+      .join("\n");
+    if had_trailing_nl && !updated.ends_with('\n') {
+      updated.push('\n');
+    }
     out = updated;
 
     if cfg.confirmations == "yolo" && raw.is_some() {
