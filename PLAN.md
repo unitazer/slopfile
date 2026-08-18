@@ -13,7 +13,8 @@
 - [x] Spike llama-server: reasoning_content / tool_calls / image_url parts (curl)
 - [x] Headless turn loop + dangling-tail resume (live smoke-tested: draft → promote → stream → tool → @done)
 - [x] 7 tools + question tool round-trip + QUESTIONS rendering
-- [ ] QUESTION block answer resolution (ask vs yolo) end-to-end test
+- [x] QUESTION block answer resolution (ask mode) end-to-end: block rendered → user answered `1,2,2` → resolved to tool block → daemon continued → final answer → @done
+- [ ] yolo confirmations path live test
 - [ ] nvim plugin `:Send` `:Resume` `:Abort` + autoread live reload
 - [ ] compose `slopfile` service + host run
 - [ ] Polish: abort, truncation, yolo, /skip
@@ -37,6 +38,12 @@
   max_context_tokens).
 - Error throttle: a session that errors is skipped for 5 s (was hammering the
   API every 250 ms on a bad file).
+- The daemon status line (`<!-- slopfile:live ... -->`) is daemon-owned and
+  MUST NOT enter LLM history. It did (last line parsed as trailing Assistant
+  after a closed tool round → has_work() false → daemon silently stalled after
+  a QUESTION block was resolved). `parse_file()` now truncates history before
+  the status line; regression test
+  `status_line_after_closed_tool_block_is_not_history`.
 
 ## What we are building
 

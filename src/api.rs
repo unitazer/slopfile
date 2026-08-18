@@ -111,13 +111,14 @@ impl LlamaClient {
     }
 
     /// POST /v1/chat/completions, stream deltas to `on_event`, then emit
-    /// `StreamEvent::Done(StreamResult)`.
+    /// `StreamEvent::Done(StreamResult)`. Returning `false` from `on_event`
+    /// stops the stream early (`StreamResult::aborted` is set).
     pub async fn chat_stream(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[ToolDefinition]>,
         max_new_tokens: u32,
-        on_event: impl FnMut(StreamEvent),
+        on_event: impl FnMut(StreamEvent) -> bool,
     ) -> Result<StreamResult, ApiError> {
         let body = serde_json::json!({
             "model": self.model,
@@ -160,7 +161,7 @@ impl LlamaClient {
     ) -> Result<StreamResult, ApiError>
     where
         S: futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
-        F: FnMut(StreamEvent),
+        F: FnMut(StreamEvent) -> bool,
     {
         let mut result = StreamResult::default();
         let mut acc = ToolCallAccumulator::default();
@@ -174,6 +175,7 @@ impl LlamaClient {
             if let Some(timings) = &chunk.timings {
                 result.timings = Some(timings.clone());
             }
+            let mut cont = true;
             for choice in &chunk.choices {
                 if let Some(fr) = &choice.finish_reason {
                     result.finish_reason = Some(fr.clone());
@@ -181,18 +183,31 @@ impl LlamaClient {
                 let d = &choice.delta;
                 if let Some(text) = &d.content {
                     result.content.push_str(text);
-                    on_event(StreamEvent::Text(text.clone()));
+                    cont &= on_event(StreamEvent::Text(text.clone()));
+                }
+                if !cont {
+                    break;
                 }
                 if let Some(r) = &d.reasoning_content {
                     result.reasoning.push_str(r);
-                    on_event(StreamEvent::Reasoning(r.clone()));
+                    cont &= on_event(StreamEvent::Reasoning(r.clone()));
+                }
+                if !cont {
+                    break;
                 }
                 if let Some(tools) = &d.tool_calls {
                     for t in tools {
                         acc.accumulate(t);
-                        on_event(StreamEvent::ToolCallFragment(t.clone()));
+                        cont &= on_event(StreamEvent::ToolCallFragment(t.clone()));
+                        if !cont {
+                            break;
+                        }
                     }
                 }
+            }
+            if !cont {
+                result.aborted = true;
+                break;
             }
         }
 
@@ -250,7 +265,10 @@ mod tests {
         ];
         let mut events = Vec::new();
         let result = client
-            .consume_stream(fake_bytes_stream(sse), 4096, |e| events.push(e))
+            .consume_stream(fake_bytes_stream(sse), 4096, |e| {
+                events.push(e);
+                true
+            })
             .await
             .expect("stream");
 
@@ -275,12 +293,37 @@ mod tests {
             "data: [DONE]\n\n",
         ];
         let result = client
-            .consume_stream(fake_bytes_stream(sse), 4096, |_| {})
+            .consume_stream(fake_bytes_stream(sse), 4096, |_| true)
             .await
             .expect("stream");
         assert_eq!(result.content, "Hi there");
         assert_eq!(result.reasoning, "Let me think.");
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn returning_false_from_callback_aborts_the_stream() {
+        let client = LlamaClient::new("http://localhost:9", "test");
+        let sse = vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" two\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" three\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let result = client
+            .consume_stream(fake_bytes_stream(sse), 4096, move |e| {
+                if let StreamEvent::Text(t) = &e {
+                    seen2.lock().unwrap().push(t.clone());
+                }
+                seen2.lock().unwrap().len() < 2
+            })
+            .await
+            .expect("stream");
+        assert!(result.aborted, "stream was aborted mid-flight");
+        assert_eq!(result.content, "one two");
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]

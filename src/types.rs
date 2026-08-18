@@ -303,6 +303,8 @@ pub struct StreamResult {
   pub finish_reason: Option<String>,
   pub usage: Option<Usage>,
   pub timings: Option<Timings>,
+  /// Set when the consumer asked the stream to stop early (abort).
+  pub aborted: bool,
 }
 
 /// Union of everything a turn encounter can be, used by the agent loop to

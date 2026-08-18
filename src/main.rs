@@ -117,6 +117,15 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
     }
 
     let text = read_file(path)?;
+
+    // Abort marker present while idle: nothing is running, just drop the
+    // marker line and refresh the status. (During a stream the marker is
+    // handled inside StreamWriter; this path covers the in-between state.)
+    if text.contains(transcript::ABORT_MARKER) {
+      strip_abort_marker(path, &text)?;
+      return Ok(());
+    }
+
     let pf = transcript::parse_file(&text);
     if !has_work(&pf, &text, cfg) {
       return Ok(());
@@ -259,10 +268,41 @@ async fn run_generation_turn(
   info!("→ {path:?}: generating (messages={})", messages.len());
   let result = client
     .chat_stream(&messages, tool_defs.as_deref(), max_tokens, |ev| {
-      active.handle(&ev);
+      active.handle(&ev)
     })
     .await
     .map_err(|e| format!("chat_stream: {e}"))?;
+
+  if result.aborted {
+    // User aborted mid-stream: close the turn and stop; no tools, no @done
+    // ride-along continuation.
+    active.finish_section();
+    let text_now = read_file(path)?;
+    let (body, live) = strip_live_line(&text_now);
+    let mut out = String::new();
+    for l in body.split('\n') {
+      if l.trim_start().starts_with(transcript::ABORT_MARKER) {
+        continue;
+      }
+      out.push_str(l);
+      out.push('\n');
+    }
+    out.truncate(out.len().saturating_sub(1));
+    if !out.ends_with('\n') {
+      out.push('\n');
+    }
+    if !out.trim_end().ends_with(DONE_MARKER) {
+      out.push_str(&format!("{DONE_MARKER}\n"));
+    }
+    if let Some(live) = live {
+      out.push('\n');
+      out.push_str(&live);
+    }
+    write_file(path, out)?;
+    write_status(path, pf, "idle")?;
+    info!("✗ {path:?}: aborted");
+    return Ok(TurnOutcome::Done);
+  }
 
   active.finish_section();
 
@@ -306,6 +346,7 @@ struct StreamWriter<'a> {
   live: Option<String>,
   wrote_header: bool,
   in_reasoning: bool,
+  aborted: bool,
 }
 
 impl<'a> StreamWriter<'a> {
@@ -316,6 +357,7 @@ impl<'a> StreamWriter<'a> {
       live,
       wrote_header: false,
       in_reasoning: false,
+      aborted: false,
     }
   }
 
@@ -336,8 +378,21 @@ impl<'a> StreamWriter<'a> {
     }
   }
 
-  fn handle(&mut self, ev: &types::StreamEvent) {
+  /// Handle one stream event. Returns `false` when the turn should stop
+  /// (an abort marker appeared in the file while streaming).
+  fn handle(&mut self, ev: &types::StreamEvent) -> bool {
     use types::StreamEvent as E;
+    if self.aborted {
+      return false;
+    }
+    // The file is rewritten wholesale on every flush, so an abort marker
+    // the user appended would be destroyed before we ever see it — check
+    // the disk first.
+    if self.marker_present() {
+      self.aborted = true;
+      self.flush_marker_strip();
+      return false;
+    }
     match ev {
       E::Text(t) => {
         self.ensure_header();
@@ -346,7 +401,7 @@ impl<'a> StreamWriter<'a> {
           self.out.push_str("<!-- /thinking -->\n");
         }
         self.out.push_str(t);
-        self.flush();
+        self.flush_marker_strip();
       }
       E::Reasoning(r) => {
         self.ensure_header();
@@ -355,11 +410,38 @@ impl<'a> StreamWriter<'a> {
           self.out.push_str("<!-- thinking -->\n");
         }
         self.out.push_str(r);
-        self.flush();
+        self.flush_marker_strip();
       }
       E::ToolCallFragment(_) => { /* tool block written after completion */ }
       E::Done(_) => {}
     }
+    !self.aborted
+  }
+
+  /// True while no abort marker is in the file (continue streaming).
+  fn marker_present(&self) -> bool {
+    let Ok(disk) = std::fs::read_to_string(self.path) else {
+      return true;
+    };
+    // Substring, not line-start: the marker may be glued to the status line
+    // (the daemon writes it without a trailing newline).
+    disk.contains(transcript::ABORT_MARKER)
+  }
+
+  /// Flush, dropping any abort marker line from the disk content (it is
+  /// daemon-owned control state, not user text).
+  fn flush_marker_strip(&mut self) {
+    if self.marker_present() {
+      self.aborted = true;
+      let mut kept = Vec::new();
+      for l in self.out.split('\n') {
+        if !l.contains(transcript::ABORT_MARKER) {
+          kept.push(l);
+        }
+      }
+      self.out = kept.join("\n");
+    }
+    self.flush();
   }
 
   fn finish_section(&self) {
@@ -377,14 +459,33 @@ impl<'a> StreamWriter<'a> {
       out.push_str("\n");
       out.push_str(live);
     }
-    let _ = std::fs::write(self.path, out);
+    let mut clean = String::new();
+    for l in out.split('\n') {
+      if l.contains(transcript::ABORT_MARKER) {
+        continue;
+      }
+      clean.push_str(l);
+      clean.push('\n');
+    }
+    clean.truncate(clean.len().saturating_sub(1));
+    let _ = std::fs::write(self.path, clean);
   }
 
   fn flush(&mut self) {
-    let mut out = self.out.clone();
+    // Daemon-owned control lines (e.g. abort marker) never reach the file.
+    let mut out = String::new();
+    for l in self.out.split('\n') {
+      if l.contains(transcript::ABORT_MARKER) {
+        continue;
+      }
+      out.push_str(l);
+      out.push('\n');
+    }
+    out.truncate(out.len().saturating_sub(1));
     if let Some(live) = &self.live {
       out.push('\n');
       out.push_str(live);
+      out.push('\n');
     }
     if let Err(e) = std::fs::write(self.path, out) {
       warn!("stream write failed: {e}");
@@ -691,6 +792,26 @@ fn draft_tail_after_done(text: &str) -> Option<String> {
 
 // ── Misc helpers ────────────────────────────────────────────────────────
 
+/// Remove the abort marker line from the file (control state, not user
+/// text) and leave everything else untouched.
+fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
+  let (body, live) = strip_live_line(text);
+  let mut out = String::new();
+  for l in body.split('\n') {
+    if l.trim_start().starts_with(transcript::ABORT_MARKER) {
+      continue;
+    }
+    out.push_str(l);
+    out.push('\n');
+  }
+  out.truncate(out.len().saturating_sub(1));
+  if let Some(live) = live {
+    out.push('\n');
+    out.push_str(&live);
+  }
+  write_file(path, out)
+}
+
 fn read_file(path: &Path) -> Result<String, String> {
   std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
 }
@@ -750,3 +871,6 @@ fn block_text_has_answers(_s: &str) -> bool {
 
 #[allow(dead_code)]
 fn _unused(_x: () ) {}
+
+#[cfg(test)]
+mod main_tests;

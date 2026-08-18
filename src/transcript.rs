@@ -17,6 +17,7 @@ pub const DONE_MARKER: &str = "<!-- @done -->";
 pub const THINK_START: &str = "<!-- thinking -->";
 pub const THINK_END: &str = "<!-- /thinking -->";
 pub const STATUS_PREFIX: &str = "slopfile:live";
+pub const ABORT_MARKER: &str = "<!-- slopfile:abort -->";
 pub const HEADER_FENCE: &str = "```toml";
 
 // ── Parsed output ───────────────────────────────────────────────────────
