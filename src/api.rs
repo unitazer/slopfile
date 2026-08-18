@@ -207,6 +207,10 @@ impl LlamaClient {
             }
             if !cont {
                 result.aborted = true;
+                // Explicitly cancel on the server while the slot is still
+                // busy: dropping the response alone may leave the server
+                // decoding the abandoned completion.
+                self.cancel_generation().await;
                 break;
             }
         }
@@ -220,6 +224,30 @@ impl LlamaClient {
     pub async fn health(&self) -> bool {
         let url = format!("{}/health", self.base);
         self.client.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
+    }
+
+    /// Best-effort server-side cancel of the in-flight generation (`POST
+    /// /abort`, the endpoint the llama.cpp WebUI stop button uses).
+    ///
+    /// If we merely drop the response, llama-server may keep decoding the
+    /// whole abandoned completion — occupancy is only noticed between
+    /// batches (`is_connection_closed` is not wired into the generation
+    /// loop on many builds), which pins CPU/GPU for minutes on slow
+    /// hardware and blocks the slot for the next turn. An explicit cancel
+    /// makes the stop immediate and reliable. 404 on builds without the
+    /// endpoint is harmless.
+    pub async fn cancel_generation(&self) {
+        let url = format!("{}/abort", self.base);
+        match self
+            .client
+            .post(&url)
+            .timeout(std::time::Duration::from_millis(2000))
+            .send()
+            .await
+        {
+            Ok(_) => tracing::debug!("cancel_generation: {url} → ok"),
+            Err(e) => tracing::warn!("cancel_generation: {url}: {e}"),
+        }
     }
 }
 

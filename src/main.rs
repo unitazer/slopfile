@@ -77,6 +77,12 @@ fn load_app_config() -> AppConfig {
   if let Ok(v) = std::env::var("SLOPFILE_WORKDIR") {
     cfg.workdir = v;
   }
+  if let Ok(v) = std::env::var("SLOPFILE_ABORT_RESTART") {
+    cfg.abort_restart_server = v != "0" && !v.eq_ignore_ascii_case("false");
+  }
+  if let Ok(v) = std::env::var("SLOPFILE_LLAMA_CONTAINER") {
+    cfg.llama_container = v;
+  }
   cfg
 }
 
@@ -382,7 +388,26 @@ async fn run_generation_turn(
     }
     write_file(path, out)?;
     write_status(path, pf, "idle")?;
-    info!("✗ {path:?}: aborted");
+    // The abandoned completion keeps decoding on the server (llama.cpp has
+    // no cancel endpoint; disconnect is only noticed late, if ever) — pin
+    // a core and occupying the slot for minutes. Restart the inference
+    // container so the hardware is freed now.
+    if cfg.abort_restart_server {
+      // Blocking socket I/O; keep it off the async runtime so concurrent
+      // sessions' streams are not stalled by the restart roundtrip.
+      let container = cfg.llama_container.clone();
+      let res = tokio::task::spawn_blocking(move || {
+        restart_llama_server("/var/run/docker.sock", &container)
+      })
+      .await;
+      match res {
+        Ok(Ok(())) => info!("✗ {path:?}: aborted (llama-server restarted)"),
+        Ok(Err(e)) => warn!("{path:?}: aborted but couldn't restart llama-server: {e}"),
+        Err(e) => warn!("{path:?}: aborted, llama restart task failed: {e}"),
+      }
+    } else {
+      info!("✗ {path:?}: aborted");
+    }
     return Ok(TurnOutcome::Done);
   }
 
@@ -1130,6 +1155,43 @@ fn draft_tail_after_done(text: &str) -> Option<String> {
 }
 
 // ── Misc helpers ────────────────────────────────────────────────────────
+
+/// Restart the llama-server container through the docker socket (raw HTTP,
+/// no docker CLI needed). Kills an abandoned generation instantly: llama.cpp
+/// has no cancel endpoint and disconnect detection is not wired into the
+/// generation loop, so an aborted stream would otherwise keep decoding
+/// (bounded only by max_tokens) and pin the CPU for minutes.
+///
+/// Requires the docker socket mounted into this container
+/// (`/var/run/docker.sock`, see docker-pi/docker-compose.yml) and the
+/// container user in the host's docker group.
+fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
+  use std::io::{Read, Write};
+  use std::os::unix::net::UnixStream;
+
+  let mut stream = UnixStream::connect(socket).map_err(|e| format!("cannot open {socket}: {e}"))?;
+  stream.set_read_timeout(Some(std::time::Duration::from_secs(20))).map_err(|e| e.to_string())?;
+  let req = format!(
+    "POST /containers/{container}/restart HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+  );
+  stream
+    .write_all(req.as_bytes())
+    .map_err(|e| format!("docker socket write: {e}"))?;
+  let mut buf = [0u8; 1024];
+  let n = stream.read(&mut buf).map_err(|e| format!("docker socket read: {e}"))?;
+  let head = String::from_utf8_lossy(&buf[..n]);
+  // 204 = restart accepted; the container comes back on its own (compose
+  // restart: unless-stopped).
+  if head.starts_with("HTTP/1.1 204") || head.starts_with("HTTP/1.1 200") {
+    Ok(())
+  } else {
+    Err(format!(
+      "docker restart {} failed: {}",
+      container,
+      head.lines().next().unwrap_or("empty response")
+    ))
+  }
+}
 
 /// Remove the abort marker line from the file (control state, not user
 /// text) and leave everything else untouched.

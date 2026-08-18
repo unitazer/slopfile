@@ -337,6 +337,18 @@ pub struct AppConfig {
   pub tool_timeout_ms: u64,
   #[serde(default = "default_max_context")]
   pub max_context_tokens: u32,
+  /// When a user abort interrupts a live stream, restart this llama-server
+  /// container via the docker socket. llama.cpp has no cancel endpoint and
+  /// does not reliably stop generation on client disconnect, so the
+  /// abandoned completion would otherwise keep burning CPU/GPU (bounded
+  /// only by its max_tokens). Restarting frees the hardware instantly and
+  /// clears the slot for the next turn.
+  #[serde(default = "default_abort_restart_server")]
+  pub abort_restart_server: bool,
+  /// Docker container name of the inference server (compose service
+  /// `llama-server` → `clanker-llama`).
+  #[serde(default = "default_llama_container")]
+  pub llama_container: String,
 }
 
 fn default_confirmations() -> String {
@@ -363,6 +375,12 @@ fn default_tool_timeout_ms() -> u64 {
 fn default_max_context() -> u32 {
   96_000
 }
+fn default_abort_restart_server() -> bool {
+  true
+}
+fn default_llama_container() -> String {
+  "clanker-llama".to_string()
+}
 
 impl Default for AppConfig {
   fn default() -> Self {
@@ -375,6 +393,8 @@ impl Default for AppConfig {
       model: default_model(),
       tool_timeout_ms: default_tool_timeout_ms(),
       max_context_tokens: default_max_context(),
+      abort_restart_server: default_abort_restart_server(),
+      llama_container: default_llama_container(),
     }
   }
 }

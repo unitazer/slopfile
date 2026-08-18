@@ -11,6 +11,8 @@ use crate::types::Role;
       model: "qwen3.8-27b".into(),
       max_context_tokens: 8192,
       tool_timeout_ms: 30000,
+      abort_restart_server: false,
+      llama_container: "test-llama".into(),
     }
   }
 
@@ -39,6 +41,77 @@ use crate::types::Role;
     cmd_abort(path.to_str().unwrap());
     let two = std::fs::read_to_string(&path).unwrap();
     assert_eq!(two, one, "second abort must not duplicate the marker");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn docker_restart_speaks_the_docker_api_over_a_unix_socket() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let dir = std::env::temp_dir().join("slopfile-test-dockersock");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("docker.sock");
+    let _ = std::fs::remove_file(&sock);
+
+    // Fake docker daemon: answer restart with 204 No Content.
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+      let (mut c, _) = listener.accept().unwrap();
+      let mut req = String::new();
+      let mut buf = [0u8; 4096];
+      loop {
+        match c.read(&mut buf) {
+          Ok(0) => break,
+          Ok(n) => {
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if req.contains("\r\n\r\n") {
+              break;
+            }
+          }
+          Err(_) => break,
+        }
+      }
+      assert!(
+        req.starts_with("POST /containers/clanker-llama/restart HTTP/1.1\r\n"),
+        "request line must target the docker restart endpoint: {req}"
+      );
+      c.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").unwrap();
+    });
+
+    let path = sock.to_str().unwrap();
+    assert!(restart_llama_server(path, "clanker-llama").is_ok(), "204 → ok");
+    server.join().unwrap();
+
+    // Unknown container → 404 must surface as an error, not a panic.
+    let sock2 = sock.with_extension("sock2");
+    let _ = std::fs::remove_file(&sock2);
+    let listener2 = UnixListener::bind(&sock2).unwrap();
+    let path2 = sock2.clone();
+    let server2 = std::thread::spawn(move || {
+      let (mut c, _) = listener2.accept().unwrap();
+      let mut req = String::new();
+      let mut buf = [0u8; 4096];
+      loop {
+        match c.read(&mut buf) {
+          Ok(0) => break,
+          Ok(n) => {
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if req.contains("\r\n\r\n") {
+              break;
+            }
+          }
+          Err(_) => break,
+        }
+      }
+      // Second restart must not hit the first listener's path.
+      assert!(req.starts_with("POST /containers/ghost/restart"));
+      c.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
+    });
+    let p2 = path2.to_str().unwrap();
+    let err = restart_llama_server(p2, "ghost").unwrap_err();
+    assert!(err.contains("404"), "error must surface the status line: {err}");
+    server2.join().unwrap();
     std::fs::remove_dir_all(&dir).ok();
   }
 
