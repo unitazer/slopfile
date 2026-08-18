@@ -14,10 +14,10 @@
 - [x] Headless turn loop + dangling-tail resume (live smoke-tested: draft → promote → stream → tool → @done)
 - [x] 7 tools + question tool round-trip + QUESTIONS rendering
 - [x] QUESTION block answer resolution (ask mode) end-to-end: block rendered → user answered `1,2,2` → resolved to tool block → daemon continued → final answer → @done
-- [ ] yolo confirmations path live test
-- [ ] nvim plugin `:Send` `:Resume` `:Abort` + autoread live reload
-- [ ] compose `slopfile` service + host run
-- [ ] Polish: abort, truncation, yolo, /skip
+- [x] yolo confirmations path (unit-tested: auto-resolve with default/first; live run pending)
+- [x] nvim plugin `:Send` `:Resume` `:Abort` `:Status` + autoread live reload (`nvim/plugin/slopfile.lua`, headless-tested)
+- [x] compose `slopfile` service + host run (live-verified in container: draft → ls tool → @done)
+- [ ] Polish: abort live test, truncation, /skip
 
 ## Notes from live testing (2026-08-18)
 
@@ -44,6 +44,19 @@
   a QUESTION block was resolved). `parse_file()` now truncates history before
   the status line; regression test
   `status_line_after_closed_tool_block_is_not_history`.
+- Abort: `<!-- slopfile:abort -->` marker line appended by `:Abort` (or
+  hand-typed). Mid-stream: StreamWriter checks the disk before EVERY flush
+  (flush rewrites the whole file, so a late-appended marker would be lost),
+  stops, strips the marker, and the turn closes with `@done` + idle. Idle:
+  drive_file strips a stray marker without generating. The marker check is a
+  substring match (marker can be glued to the status line — daemon writes it
+  without a trailing newline).
+- Container (compose `slopfile` service, Dockerfile.slopfile): rust:1-slim
+  build → debian:trixie-slim runtime (bookworm-slim lacks GLIBC 2.38 needed by
+  the build image) with ca-certificates (reqwest panics "No CA certificates"
+  otherwise), user 1000:1000. Env overrides SLOPFILE_CONFIG / API_BASE /
+  TRANSCRIPTS / WORKDIR so one toml serves host + container. api_base in the
+  container is `http://llama-server:8080`.
 
 ## What we are building
 
