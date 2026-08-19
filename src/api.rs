@@ -227,6 +227,9 @@ impl LlamaClient {
                         }
                     }
                     if !cont {
+                        if std::env::var("SLOP_DEBUG").is_ok() {
+                            eprintln!("DEBUG ABORT-SOURCE: on_event (chunk) returned false");
+                        }
                         result.aborted = true;
                         // Explicitly cancel on the server while the slot is still
                         // busy: dropping the response alone may leave the server
@@ -289,7 +292,22 @@ fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             }
             _ => true,
         })
-        .cloned()
+        // llama.cpp rejects assistant messages that carry neither `content`
+        // nor `tool_calls` (a reasoning-only message — e.g. a turn that only
+        // emitted thinking and no reply — is invalid as input). Fold the
+        // reasoning into `content` so such a turn stays on the wire without
+        // 400-ing the whole request.
+        .map(|m| {
+            if m.role == Role::Assistant && m.content.is_none() && m.tool_calls.is_none()
+                && let Some(r) = m.reasoning_content.as_deref().filter(|r| !r.is_empty())
+            {
+                let mut m2 = m.clone();
+                m2.content = Some(r.to_string());
+                m2.reasoning_content = None;
+                return m2;
+            }
+            m.clone()
+        })
         .collect()
 }
 
@@ -462,6 +480,11 @@ mod tests {
         reasoning_only.reasoning_content = Some("Let me think...".to_string());
         let kept = sanitize_messages(&[reasoning_only]);
         assert_eq!(kept.len(), 1, "reasoning-only assistant reply must not be dropped");
+        // llama.cpp rejects assistant messages with neither `content` nor
+        // `tool_calls`, so reasoning-only turns are folded into content.
+        let m = &kept[0];
+        assert_eq!(m.content.as_deref(), Some("Let me think..."));
+        assert!(m.reasoning_content.is_none(), "folded reasoning must not repeat");
 
         let mut empty_reasoning = ChatMessage::assistant("");
         empty_reasoning.content = None;

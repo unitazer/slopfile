@@ -284,6 +284,32 @@ Let me read a file.
   }
 
   #[test]
+  fn file_has_abort_drives_keep_going_unnverted() {
+    // Regression: the watchdog in chat_stream aborts when `keep_going`
+    // returns false, but it was wired as `|| file_has_abort(path)` — which
+    // returns TRUE when a marker IS present, so every marker-free run aborted
+    // within a watchdog tick. keep_going must be the negation of
+    // file_has_abort: continue while there is NO abort marker.
+    let dir = std::env::temp_dir().join("slopfile-test-keepgoing-wiring");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.md");
+    std::fs::write(&path, "### You\nhi\n").unwrap();
+
+    assert!(!file_has_abort(&path), "marker-free file must keep going");
+    let keep_going = || !file_has_abort(&path);
+    assert!(keep_going(), "no marker -> keep_going() true (continue)");
+
+    let mut f = std::fs::read_to_string(&path).unwrap();
+    f.push_str(transcript::ABORT_MARKER);
+    f.push('\n');
+    std::fs::write(&path, f).unwrap();
+
+    assert!(file_has_abort(&path), "marker present -> has abort");
+    assert!(!keep_going(), "marker present -> keep_going() false (abort)");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
   fn skip_resolves_with_defaults() {
     let dir = std::env::temp_dir().join("slopfile-test-skip");
     std::fs::create_dir_all(&dir).unwrap();
@@ -432,9 +458,12 @@ Let me read a file.
     assert!(tpl.contains("model = \"qwen3.8-27b\""), "default model: {tpl}");
     assert!(tpl.contains("tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\"]"));
     assert!(tpl.contains("# Session\n"), "session heading: {tpl}");
-    // pi-derived system prompt.
-    assert!(tpl.contains("You are an expert coding assistant operating inside slopfile"));
-    assert!(tpl.contains("This session is a Markdown transcript file"));
+    // Default system prompt describes the model's real interface, never the
+    // transcript's markup.
+    assert!(tpl.contains("You are an expert software engineering assistant"));
+    assert!(!tpl.contains("This session is a Markdown transcript file"));
+    assert!(!tpl.contains("<!-- @done -->"));
+    assert!(!tpl.contains("### Assistant"));
     assert!(tpl.contains("- read: Read files as numbered lines"));
     assert!(tpl.contains("Use read to examine files before editing"));
     assert!(tpl.contains("Current working directory: /tmp"));
@@ -444,7 +473,7 @@ Let me read a file.
     assert_eq!(pf.history.len(), 1, "system message only");
     assert_eq!(pf.history[0].role, Role::System);
     let sp = pf.history[0].content.as_deref().unwrap();
-    assert!(sp.contains("expert coding assistant"));
+    assert!(sp.contains("expert software engineering assistant"));
     assert!(!sp.contains("# Session"), "heading stripped from prompt");
   }
 

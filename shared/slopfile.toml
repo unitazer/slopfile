@@ -1,7 +1,11 @@
 confirmations = "ask"
 api_base = "http://127.0.0.1:8080"
-workdir = "/home/unitazer/things/clanker/slopfile/workspace"
-transcripts_dir = "/home/unitazer/things/clanker/slopfile/shared/transcripts"
+# Container-visible paths (docker-compose mounts ../workspace -> /workspace
+# and ../shared -> /shared). The daemon overrides these with the
+# SLOPFILE_* env vars; the host CLI (`init`) reads them to emit the system
+# prompt, so they must match what the model's tools actually see.
+workdir = "/workspace"
+transcripts_dir = "/shared/transcripts"
 sweep_interval_ms = 250
 model = "qwen3.8-27b"
 tool_timeout_ms = 30000

@@ -359,7 +359,7 @@ async fn run_generation_turn(
       tool_defs.as_deref(),
       max_tokens,
       |ev| active.handle(&ev),
-      || file_has_abort(path),
+      || !file_has_abort(path),
     )
     .await
     .map_err(|e| format!("chat_stream: {e}"))?;
@@ -699,9 +699,11 @@ async fn cmd_tokens(path: &str, cfg: &AppConfig) {
 
 /// Tokenize the concatenated message contents against the model tokenizer.
 /// llama.cpp exposes `/tokenize` on the server root and mirrors it under
-/// `/v1/`; try both.
+/// `/v1/`. Router mode requires the `model` in the body, so try with it
+/// first, then fall back to a no-model body for single-model servers.
 async fn request_token_count(
   api_base: &str,
+  model: &str,
   messages: &[ChatMessage],
 ) -> Result<usize, String> {
   let mut content = String::new();
@@ -726,13 +728,13 @@ async fn request_token_count(
   }
   let client = reqwest::Client::new();
   let mut last_err = String::new();
-  for url in [format!("{api_base}/tokenize"), format!("{api_base}/v1/tokenize")] {
-    let resp = match client
-      .post(&url)
-      .json(&serde_json::json!({"content": content}))
-      .send()
-      .await
-    {
+  for (url, body) in [
+    (format!("{api_base}/tokenize"), serde_json::json!({"content": content.clone(), "model": model})),
+    (format!("{api_base}/tokenize"), serde_json::json!({"content": content.clone()})),
+    (format!("{api_base}/v1/tokenize"), serde_json::json!({"content": content.clone(), "model": model})),
+    (format!("{api_base}/v1/tokenize"), serde_json::json!({"content": content.clone()})),
+  ] {
+    let resp = match client.post(&url).json(&body).send().await {
       Ok(r) => r,
       Err(e) => {
         last_err = format!("{url}: {e}");
@@ -768,17 +770,15 @@ pub fn session_template(cfg: &AppConfig) -> String {
   out
 }
 
-/// The default system prompt, adapted from pi's `default_system_prompt`
-/// (pi_agent_rust/src/app.rs) to slopfile's tool set and file-as-UI format.
+/// The default system prompt. The model converses over a standard chat
+/// message protocol (prose + tool calls); it never sees the transcript's
+/// markup (headings, `@done`, tool/result blocks are handled by the harness),
+/// so the prompt describes only the interface it actually uses.
 fn system_prompt_default(cfg: &AppConfig) -> String {
   format!(
-    "You are an expert coding assistant operating inside slopfile, a file-as-UI coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+    "You are an expert software engineering assistant. You help the user by reading files, running commands, editing code, and writing files, and you reply to them in plain text.
 
-This session is a Markdown transcript file:
-- Your replies are streamed under `### Assistant` headings.
-- Tool calls and results appear as `<!-- tool:NAME ARGS -->` / `<!-- result:NAME ok=... -->` blocks.
-- A completed turn ends with `<!-- @done -->`; anything below the last `@done` is the next turn's draft.
-- When you need the user to make a choice, call the `question` tool instead of guessing.
+You act by calling tools. Your text replies and tool calls are relayed to the user automatically, one step at a time; continue based on each tool result. When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing.
 
 Available tools:
 - read: Read files as numbered lines
@@ -791,11 +791,10 @@ Available tools:
 
 Guidelines:
 - Prefer grep/find/ls tools over bash for file exploration
-- Use read to examine files before editing. You must use this tool instead of cat or sed.
+- Use read to examine files before editing. Use this tool instead of cat or sed.
 - Use edit for precise changes (old text must match exactly)
 - Use write only for new files or complete rewrites
-- When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did
-- Be concise in your responses
+- Be concise in your replies; don't echo back full file contents unless asked
 - Show file paths clearly when working with files
 
 Current working directory: {}",
@@ -819,11 +818,35 @@ async fn build_request_messages(
   cfg: &AppConfig,
 ) -> Result<(Vec<ChatMessage>, usize, usize), String> {
   let mut messages = pf.history.clone();
-  if transcript::find_done_marker(text).is_some()
-    && let Some(section) = section_below_done(text)
-  {
-    for m in transcript::tail_sections(&section) {
-      messages.push(m);
+  if transcript::find_done_marker(text).is_some() {
+    // Everything below the last `@done` is a fresh draft region: user
+    // sections, QUESTIONS, or a dangling partial assistant ending the file.
+    let (body, _live) = strip_live_line(text);
+    let toks = lex(&body);
+    let done = toks.iter().rfind(|t| t.kind == TokKind::Done).expect("checked above");
+    let start = done.offset + lex::DONE_MARKER.len();
+    // The dangling partial assistant is resumed via the `[resume]` hint
+    // below — never resent here. Cut the tail at its heading so only
+    // genuine drafts above it reach `tail_sections` (the cut partial would
+    // otherwise become a reasoning-only assistant message the server
+    // rejects with 400).
+    let end = match &pf.dangling {
+      Some(d) => d.resume_offset.min(body.len()),
+      None => body.len(),
+    };
+    let tail = if end > start { &body[start..end] } else { "" };
+    let section = lex(tail)
+      .into_iter()
+      .filter(|t| !t.kind.is_daemon_owned())
+      .map(|t| t.text)
+      .collect::<Vec<_>>()
+      .join("\n")
+      .trim()
+      .to_string();
+    if !section.is_empty() && !section.starts_with(questions::BLOCK_HEADER) {
+      for m in transcript::tail_sections(&section) {
+        messages.push(m);
+      }
     }
   }
   if let Some(d) = &pf.dangling
@@ -839,7 +862,7 @@ async fn build_request_messages(
   if before == 0 {
     return Ok((messages, 0, 0));
   }
-  let counts = request_token_counts(&cfg.api_base, &messages).await?;
+  let counts = request_token_counts(&cfg.api_base, pf.config.model.as_deref().unwrap_or(&cfg.model), &messages).await?;
   let truncated = truncate_messages(messages, &counts, context_budget);
   let dropped = before - truncated.len();
   let keep_from = before - (truncated.len() - 1);
@@ -850,11 +873,12 @@ async fn build_request_messages(
 /// Tokenize each message against the model tokenizer, one per message.
 async fn request_token_counts(
   api_base: &str,
+  model: &str,
   messages: &[ChatMessage],
 ) -> Result<Vec<usize>, String> {
   let mut counts = Vec::with_capacity(messages.len());
   for m in messages {
-    counts.push(request_token_count(api_base, std::slice::from_ref(m)).await?);
+    counts.push(request_token_count(api_base, model, std::slice::from_ref(m)).await?);
   }
   Ok(counts)
 }

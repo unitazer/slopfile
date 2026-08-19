@@ -307,7 +307,7 @@ fn default_api_base() -> String {
   "http://llama-server:8080".to_string()
 }
 fn default_workdir() -> String {
-  "/home/unitazer/things/clanker".to_string()
+  "/workspace".to_string()
 }
 fn default_transcripts_dir() -> String {
   "/shared/transcripts".to_string()
