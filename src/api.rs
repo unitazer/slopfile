@@ -274,10 +274,14 @@ fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{pin::Pin, task::{Context, Poll}, time::Duration};
+
+use futures_core::Stream;
+
+use super::*;
     use crate::types::Usage;
 
-    fn fake_bytes_stream(chunks: Vec<&'static str>) -> impl futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> {
+    fn fake_bytes_stream(chunks: Vec<&'static str>) -> impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> {
         let items = chunks
             .into_iter()
             .map(|s| Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(s)))
@@ -287,7 +291,7 @@ mod tests {
 
     struct SlowBytesStream {
         items: std::vec::IntoIter<Result<bytes::Bytes, reqwest::Error>>,
-        delay: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        delay: Option<Pin<Box<tokio::time::Sleep>>>,
     }
 
     impl SlowBytesStream {
@@ -301,23 +305,23 @@ mod tests {
         }
     }
 
-    impl futures_core::Stream for SlowBytesStream {
+    impl Stream for SlowBytesStream {
         type Item = Result<bytes::Bytes, reqwest::Error>;
         fn poll_next(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Self::Item>> {
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
             let this = &mut *self;
             if let Some(delay) = this.delay.as_mut() {
                 futures_core::ready!(delay.as_mut().poll(cx));
                 this.delay = None;
             }
             let Some(item) = this.items.next() else {
-                return std::task::Poll::Ready(None);
+                return Poll::Ready(None);
             };
             this.delay =
-                Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1000))));
-            std::task::Poll::Ready(Some(item))
+                Some(Box::pin(tokio::time::sleep(Duration::from_millis(1000))));
+            Poll::Ready(Some(item))
         }
     }
 
@@ -415,7 +419,7 @@ mod tests {
                     if stop.get() {
                         return false;
                     }
-                    if t0.elapsed() >= std::time::Duration::from_millis(300) {
+                    if t0.elapsed() >= Duration::from_millis(300) {
                         stop.set(true);
                     }
                     !stop.get()

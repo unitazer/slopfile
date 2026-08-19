@@ -1,9 +1,11 @@
 
 use std::collections::VecDeque;
+use std::fs::{create_dir_all, read_to_string};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde_json::{Value, json};
+use tokio::process::Command;
 
 use crate::types::{FunctionDefinition, ToolDefinition, ToolResult};
 
@@ -171,7 +173,7 @@ fn read(workdir: &Path, args: &Value) -> ToolResult {
     Ok(p) => p,
     Err(e) => return ToolResult::err(e),
   };
-  let content = match std::fs::read_to_string(&path) {
+  let content = match read_to_string(&path) {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("read: cannot read {path_str}: {e}")),
   };
@@ -201,7 +203,7 @@ fn write(workdir: &Path, args: &Value) -> ToolResult {
     Err(e) => return ToolResult::err(e),
   };
   if let Some(parent) = path.parent()
-    && let Err(e) = std::fs::create_dir_all(parent)
+    && let Err(e) = create_dir_all(parent)
   {
     return ToolResult::err(format!("write: cannot create {path_str}: {e}"));
   }
@@ -228,7 +230,7 @@ fn edit(workdir: &Path, args: &Value) -> ToolResult {
     Ok(p) => p,
     Err(e) => return ToolResult::err(e),
   };
-  let content = match std::fs::read_to_string(&path) {
+  let content = match read_to_string(&path) {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("edit: cannot read {path_str}: {e}")),
   };
@@ -258,7 +260,7 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
     Ok(p) => p,
     Err(e) => return ToolResult::err(e),
   };
-  let mut child = match tokio::process::Command::new("sh")
+  let mut child = match Command::new("sh")
     .arg("-c")
     .arg(command)
     .current_dir(&cwd)
@@ -339,7 +341,7 @@ fn grep(workdir: &Path, args: &Value) -> ToolResult {
   let mut out = String::new();
   let mut hits = 0usize;
   'walk: for (rel, abs) in &files {
-    let Ok(content) = std::fs::read_to_string(abs) else {
+    let Ok(content) = read_to_string(abs) else {
       continue;
     };
     for (idx, line) in content.lines().enumerate() {

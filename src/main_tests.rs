@@ -1,4 +1,6 @@
-  use super::*;
+  use std::{env::temp_dir, fs::read_to_string, thread::spawn};
+
+use super::*;
 use crate::types::Role;
 
 fn yolo_cfg() -> AppConfig {
@@ -30,16 +32,16 @@ fn yolo_cfg() -> AppConfig {
 
   #[test]
   fn cli_abort_appends_marker_and_is_idempotent() {
-    let dir = std::env::temp_dir().join("slopfile-test-cliabort");
+    let dir = temp_dir().join("slopfile-test-cliabort");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     std::fs::write(&path, "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n").unwrap();
     cmd_abort(path.to_str().unwrap());
-    let one = std::fs::read_to_string(&path).unwrap();
+    let one = read_to_string(&path).unwrap();
     assert!(one.ends_with("<!-- slopfile:abort -->\n"), "marker appended at end");
     assert_eq!(one.matches(transcript::ABORT_MARKER).count(), 1);
     cmd_abort(path.to_str().unwrap());
-    let two = std::fs::read_to_string(&path).unwrap();
+    let two = read_to_string(&path).unwrap();
     assert_eq!(two, one, "second abort must not duplicate the marker");
     std::fs::remove_dir_all(&dir).ok();
   }
@@ -49,13 +51,13 @@ fn yolo_cfg() -> AppConfig {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join("slopfile-test-dockersock");
+    let dir = temp_dir().join("slopfile-test-dockersock");
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("docker.sock");
     let _ = std::fs::remove_file(&sock);
 
     let listener = UnixListener::bind(&sock).unwrap();
-    let server = std::thread::spawn(move || {
+    let server = spawn(move || {
       let (mut c, _) = listener.accept().unwrap();
       let mut req = String::new();
       let mut buf = [0u8; 4096];
@@ -86,7 +88,7 @@ fn yolo_cfg() -> AppConfig {
     let _ = std::fs::remove_file(&sock2);
     let listener2 = UnixListener::bind(&sock2).unwrap();
     let path2 = sock2.clone();
-    let server2 = std::thread::spawn(move || {
+    let server2 = spawn(move || {
       let (mut c, _) = listener2.accept().unwrap();
       let mut req = String::new();
       let mut buf = [0u8; 4096];
@@ -114,19 +116,19 @@ fn yolo_cfg() -> AppConfig {
 
   #[test]
   fn yolo_resolves_questions_with_first_option() {
-    let dir = std::env::temp_dir().join("slopfile-test-yolo");
+    let dir = temp_dir().join("slopfile-test-yolo");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     std::fs::write(&path, sample_with_question_block()).unwrap();
 
-    let text = std::fs::read_to_string(&path).unwrap();
+    let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
     assert!(!pf.pending_questions.is_empty());
     let cfg = yolo_cfg();
     assert!(questions_resolvable(&pf, &cfg), "yolo is always resolvable");
     resolve_questions(&path, &text, &pf, &cfg).unwrap();
 
-    let after = std::fs::read_to_string(&path).unwrap();
+    let after = read_to_string(&path).unwrap();
     assert!(!after.contains("QUESTIONS"), "block removed");
     assert!(!after.contains("<!-- q:"), "stashes removed");
     assert!(!after.contains("<!-- call:"), "call stash removed");
@@ -143,12 +145,12 @@ fn yolo_cfg() -> AppConfig {
 
   #[test]
   fn ask_mode_is_not_resolvable_without_answers() {
-    let dir = std::env::temp_dir().join("slopfile-test-ask");
+    let dir = temp_dir().join("slopfile-test-ask");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     std::fs::write(&path, sample_with_question_block()).unwrap();
 
-    let text = std::fs::read_to_string(&path).unwrap();
+    let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
     let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
     assert!(!questions_resolvable(&pf, &cfg));
@@ -158,7 +160,7 @@ fn yolo_cfg() -> AppConfig {
 
   #[test]
   fn ask_mode_unanswered_leading_block_stalls_later_answered_block() {
-    let dir = std::env::temp_dir().join("slopfile-test-ask-order");
+    let dir = temp_dir().join("slopfile-test-ask-order");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
 
@@ -178,7 +180,7 @@ fn yolo_cfg() -> AppConfig {
     );
 
     resolve_questions(&path, &text, &pf, &cfg).unwrap();
-    let after = std::fs::read_to_string(&path).unwrap();
+    let after = read_to_string(&path).unwrap();
     assert!(after.contains("QUESTIONS"), "block A stays pending");
     assert!(after.contains("\nblue\n"), "block B answer not consumed");
     assert!(!after.contains("<!-- tool:question"), "no block resolved");
@@ -187,7 +189,7 @@ fn yolo_cfg() -> AppConfig {
 
   #[test]
   fn abort_marker_is_stripped_but_rest_preserved() {
-    let dir = std::env::temp_dir().join("slopfile-test-abort");
+    let dir = temp_dir().join("slopfile-test-abort");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     let src = format!(
@@ -196,7 +198,7 @@ fn yolo_cfg() -> AppConfig {
     );
     std::fs::write(&path, src.clone()).unwrap();
     strip_abort_marker(&path, &src).unwrap();
-    let after = std::fs::read_to_string(&path).unwrap();
+    let after = read_to_string(&path).unwrap();
     assert!(!after.contains("slopfile:abort"));
     assert!(after.contains("### You"));
     assert!(after.contains("QUESTIONS"), "user block untouched");
@@ -232,7 +234,7 @@ Let me read a file.
 
   #[test]
   fn stream_writer_stops_and_strips_when_marker_appears_mid_stream() {
-    let dir = std::env::temp_dir().join("slopfile-test-streamabort");
+    let dir = temp_dir().join("slopfile-test-streamabort");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     std::fs::write(
@@ -243,18 +245,18 @@ Let me read a file.
 
     let mut w = StreamWriter::new(
       &path,
-      &std::fs::read_to_string(&path).unwrap(),
+      &read_to_string(&path).unwrap(),
       Some("<!-- slopfile:live {\"phase\":\"generating\"} -->".into()),
     );
     assert!(w.handle(&types::StreamEvent::Text("hello ".into())));
     {
-      let mut f = std::fs::read_to_string(&path).unwrap();
+      let mut f = read_to_string(&path).unwrap();
       f.push_str(transcript::ABORT_MARKER);
       f.push('\n');
       std::fs::write(&path, f).unwrap();
     }
     assert!(!w.handle(&types::StreamEvent::Text("world".into())));
-    let after = std::fs::read_to_string(&path).unwrap();
+    let after = read_to_string(&path).unwrap();
     assert!(after.contains("hello"), "text up to abort is kept");
     assert!(!after.contains("world"), "post-abort text dropped");
     assert!(!after.contains("slopfile:abort"), "marker stripped");
@@ -268,7 +270,7 @@ Let me read a file.
 
   #[test]
   fn file_has_abort_drives_keep_going_unnverted() {
-    let dir = std::env::temp_dir().join("slopfile-test-keepgoing-wiring");
+    let dir = temp_dir().join("slopfile-test-keepgoing-wiring");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     std::fs::write(&path, "### You\nhi\n").unwrap();
@@ -277,7 +279,7 @@ Let me read a file.
     let keep_going = || !file_has_abort(&path);
     assert!(keep_going(), "no marker -> keep_going() true (continue)");
 
-    let mut f = std::fs::read_to_string(&path).unwrap();
+    let mut f = read_to_string(&path).unwrap();
     f.push_str(transcript::ABORT_MARKER);
     f.push('\n');
     std::fs::write(&path, f).unwrap();
@@ -289,21 +291,21 @@ Let me read a file.
 
   #[test]
   fn skip_resolves_with_defaults() {
-    let dir = std::env::temp_dir().join("slopfile-test-skip");
+    let dir = temp_dir().join("slopfile-test-skip");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     let mut src = sample_with_question_block();
     src = src.replace("> \n", "> /skip\n");
     std::fs::write(&path, &src).unwrap();
 
-    let text = std::fs::read_to_string(&path).unwrap();
+    let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
     assert!(!pf.pending_questions.is_empty());
     let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
     assert!(questions_resolvable(&pf, &cfg), "/skip resolves in ask mode");
     resolve_questions(&path, &text, &pf, &cfg).unwrap();
 
-    let after = std::fs::read_to_string(&path).unwrap();
+    let after = read_to_string(&path).unwrap();
     assert!(after.contains("<!-- tool:question"), "resolved to tool block");
     assert!(!after.contains("/skip"), "command line removed");
     assert!(!after.contains("QUESTIONS"), "block removed");
@@ -353,11 +355,11 @@ Let me read a file.
 
   #[test]
   fn draft_below_done_is_work() {
-    let dir = std::env::temp_dir().join("slopfile-test-draft");
+    let dir = temp_dir().join("slopfile-test-draft");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     std::fs::write(&path, format!("{}\n<!-- @done -->\nkeep running daemons\n", sample_with_question_block())).unwrap();
-    let text = std::fs::read_to_string(&path).unwrap();
+    let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
     assert!(has_work(&pf, &text, &yolo_cfg()));
     assert_eq!(draft_tail_after_done(&text).map(|s| s.trim().to_string()), Some("keep running daemons".into()));
@@ -392,7 +394,7 @@ Let me read a file.
 
   #[test]
   fn promote_draft_skips_daemon_owned_note() {
-    let dir = std::env::temp_dir().join("slopfile-test-promote-note");
+    let dir = temp_dir().join("slopfile-test-promote-note");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     let text = format!(
@@ -401,7 +403,7 @@ Let me read a file.
     std::fs::write(&path, &text).unwrap();
     let _pf = transcript::parse_file(&text);
     promote_draft(&path, &text).expect("promote");
-    let after = std::fs::read_to_string(&path).unwrap();
+    let after = read_to_string(&path).unwrap();
     let note_ix = after.find(CONTEXT_FULL_NOTE).expect("note kept");
     let you_ix = after.find("### You\nnext message").expect("section right before draft");
     let done_ix = after.find("<!-- @done -->").expect("done marker");
@@ -441,7 +443,7 @@ Let me read a file.
 
   #[test]
   fn init_refuses_nonempty_and_initializes_empty() {
-    let dir = std::env::temp_dir().join("slopfile-test-init");
+    let dir = temp_dir().join("slopfile-test-init");
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = yolo_cfg();
 

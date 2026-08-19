@@ -1,6 +1,6 @@
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Question {
@@ -72,7 +72,7 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
         })
         .collect();
 
-    let stash_by_id: std::collections::HashMap<u32, (String, Option<Question>)> = stashes
+    let stash_by_id: HashMap<u32, (String, Option<Question>)> = stashes
         .into_iter()
         .map(|(id, json)| {
             let q = serde_json::from_str::<serde_json::Value>(&json)

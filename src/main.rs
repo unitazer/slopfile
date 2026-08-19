@@ -13,11 +13,16 @@ use lex::{lex, lex_line, ABORTED_MARKER, DONE_MARKER, TokKind};
 use questions::parse_answers;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::env::var;
+use std::fs::read_to_string;
+use std::fs::write;
 use std::path::{Path, PathBuf};
+use std::process::exit;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, };
 use tracing::{error, info, warn};
 use transcript::{strip_live_line, ParsedFile};
 use types::{AppConfig, ChatMessage, Role, ToolCall};
@@ -48,24 +53,24 @@ enum Command {
 const APP_CONFIG_PATH: &str = "/home/unitazer/things/clanker/slopfile/shared/slopfile.toml";
 
 fn load_app_config() -> AppConfig {
-  let path = std::env::var("SLOPFILE_CONFIG").unwrap_or_else(|_| APP_CONFIG_PATH.to_string());
+  let path = var("SLOPFILE_CONFIG").unwrap_or_else(|_| APP_CONFIG_PATH.to_string());
   let mut cfg = AppConfig::load_from_file(&path).unwrap_or_else(|e| {
     warn!("could not load app config ({e}); using defaults");
     AppConfig::default()
   });
-  if let Ok(v) = std::env::var("SLOPFILE_API_BASE") {
+  if let Ok(v) = var("SLOPFILE_API_BASE") {
     cfg.api_base = v;
   }
-  if let Ok(v) = std::env::var("SLOPFILE_TRANSCRIPTS") {
+  if let Ok(v) = var("SLOPFILE_TRANSCRIPTS") {
     cfg.transcripts_dir = v;
   }
-  if let Ok(v) = std::env::var("SLOPFILE_WORKDIR") {
+  if let Ok(v) = var("SLOPFILE_WORKDIR") {
     cfg.workdir = v;
   }
-  if let Ok(v) = std::env::var("SLOPFILE_ABORT_RESTART") {
+  if let Ok(v) = var("SLOPFILE_ABORT_RESTART") {
     cfg.abort_restart_server = v != "0" && !v.eq_ignore_ascii_case("false");
   }
-  if let Ok(v) = std::env::var("SLOPFILE_LLAMA_CONTAINER") {
+  if let Ok(v) = var("SLOPFILE_LLAMA_CONTAINER") {
     cfg.llama_container = v;
   }
   cfg
@@ -462,7 +467,7 @@ impl<'a> StreamWriter<'a> {
   }
 
   fn marker_present(&self) -> bool {
-    let Ok(disk) = std::fs::read_to_string(self.path) else {
+    let Ok(disk) = read_to_string(self.path) else {
       return true;
     };
     transcript::abort_marker_present(&disk)
@@ -493,7 +498,7 @@ impl<'a> StreamWriter<'a> {
       out.push_str(live);
     }
     let clean = without_abort_lines(&out);
-    let _ = std::fs::write(self.path, clean);
+    let _ = write(self.path, clean);
   }
 
   fn flush(&mut self) {
@@ -503,7 +508,7 @@ impl<'a> StreamWriter<'a> {
       out.push_str(live);
       out.push('\n');
     }
-    if let Err(e) = std::fs::write(self.path, out) {
+    if let Err(e) = write(self.path, out) {
       warn!("stream write failed: {e}");
     }
   }
@@ -514,22 +519,22 @@ pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit t
 
 fn cmd_init(path: &str, cfg: &AppConfig) {
   match init_template_for(path, cfg) {
-    Ok(content) => match std::fs::write(path, content) {
+    Ok(content) => match write(path, content) {
       Ok(()) => println!("initialized {path}"),
       Err(e) => {
         eprintln!("slopfile init: cannot write {path}: {e}");
-        std::process::exit(1);
+        exit(1);
       }
     },
     Err(e) => {
       eprintln!("slopfile init: {e}");
-      std::process::exit(1);
+      exit(1);
     }
   }
 }
 
 fn init_template_for(path: &str, cfg: &AppConfig) -> Result<String, String> {
-  if let Ok(existing) = std::fs::read_to_string(path)
+  if let Ok(existing) = read_to_string(path)
     && !existing.trim().is_empty()
   {
     return Err(format!("{path} exists and is not empty; refusing to overwrite"));
@@ -538,11 +543,11 @@ fn init_template_for(path: &str, cfg: &AppConfig) -> Result<String, String> {
 }
 
 fn cmd_abort(path: &str) {
-  let content = match std::fs::read_to_string(path) {
+  let content = match read_to_string(path) {
     Ok(c) => c,
     Err(e) => {
       eprintln!("slopfile abort: cannot read {path}: {e}");
-      std::process::exit(1);
+      exit(1);
     }
   };
   if transcript::abort_marker_present(&content) {
@@ -555,19 +560,19 @@ fn cmd_abort(path: &str) {
   }
   out.push_str(transcript::ABORT_MARKER);
   out.push('\n');
-  if let Err(e) = std::fs::write(path, out) {
+  if let Err(e) = write(path, out) {
     eprintln!("slopfile abort: cannot write {path}: {e}");
-    std::process::exit(1);
+    exit(1);
   }
   println!("abort requested on {path}; the daemon stops the turn on its next sweep");
 }
 
 async fn cmd_tokens(path: &str, cfg: &AppConfig) {
-  let text = match std::fs::read_to_string(path) {
+  let text = match read_to_string(path) {
     Ok(t) => t,
     Err(e) => {
       eprintln!("slopfile tokens: cannot read {path}: {e}");
-      std::process::exit(1);
+      exit(1);
     }
   };
   let pf = transcript::parse_file(&text);
@@ -575,7 +580,7 @@ async fn cmd_tokens(path: &str, cfg: &AppConfig) {
     Ok(v) => v,
     Err(e) => {
       eprintln!("slopfile tokens: {e}");
-      std::process::exit(1);
+      exit(1);
     }
   };
   let context_budget = pf
@@ -1110,7 +1115,7 @@ fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
   use std::os::unix::net::UnixStream;
 
   let mut stream = UnixStream::connect(socket).map_err(|e| format!("cannot open {socket}: {e}"))?;
-  stream.set_read_timeout(Some(std::time::Duration::from_secs(20))).map_err(|e| e.to_string())?;
+  stream.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
   let req = format!(
     "POST /containers/{container}/restart HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
   );
@@ -1132,7 +1137,7 @@ fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
 }
 
 fn file_has_abort(path: &Path) -> bool {
-  let Ok(disk) = std::fs::read_to_string(path) else {
+  let Ok(disk) = read_to_string(path) else {
     return true;
   };
   transcript::abort_marker_present(&disk)
@@ -1162,11 +1167,11 @@ fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
 }
 
 fn read_file(path: &Path) -> Result<String, String> {
-  std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
+  read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
 }
 
 fn write_file(path: &Path, content: String) -> Result<(), String> {
-  std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
+  write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn write_status(path: &Path, pf: &ParsedFile, phase: &str) -> Result<(), String> {
