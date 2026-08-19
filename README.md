@@ -180,6 +180,19 @@ Then `workdir` in the compose env matches the `workspace/` bind mount.
 ### Start
 
 ```bash
+cd slopfile           # repo root
+./start.sh            # boot the stack + open nvim (plugin loaded) on the latest session
+```
+
+`start.sh` is idempotent — it errors out if the docker daemon is down, uses
+`docker compose up -d` (harmless if containers are already running, and waits
+for llama-server to be healthy), builds the host `slopfile` binary if missing,
+and opens nvim with the plugin loaded on the most recent transcript (creating
+one via `slopfile init` if none exist).
+
+Or manually:
+
+```bash
 cd slopfile/docker
 ./run.sh up           # build slopfile, pull llama-server, start both
 ./run.sh logs slopfile   # follow the daemon logs
