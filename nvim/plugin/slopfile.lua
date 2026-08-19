@@ -1,7 +1,7 @@
 
 local M = {}
 
-local ABORT_MARKER = "<!-- slopfile:abort
+local ABORT_MARKER = "<!-- slopfile:abort -->"
 
 local function is_session_buf(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr or 0)
