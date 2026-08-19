@@ -1,6 +1,3 @@
-# slopfile daemon container.
-# Build: docker build -f docker/Dockerfile.slopfile -t clanker-slopfile .
-# Run via the `slopfile` service in docker/docker-compose.yml.
 
 FROM rust:1-slim AS build
 WORKDIR /build

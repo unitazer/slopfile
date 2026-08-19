@@ -1,4 +1,3 @@
-//! llama-server OpenAI-compatible client (streaming chat + health ping).
 
 use crate::sse::{stream_chunks, SseError};
 use crate::types::{
@@ -41,8 +40,6 @@ impl From<SseError> for ApiError {
     }
 }
 
-/// Accumulates tool-call deltas streamed in fragments, by index, joining
-/// `arguments` fragments byte-exactly.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallAccumulator {
     calls: Vec<SseToolCallDelta>,
@@ -80,7 +77,6 @@ impl ToolCallAccumulator {
         }
     }
 
-    /// Finalize into complete ToolCalls (only those with a name).
     pub fn assemble(&self) -> Vec<ToolCall> {
         self.calls
             .iter()
@@ -109,10 +105,6 @@ impl LlamaClient {
         }
     }
 
-    /// Warm-load a model before streaming so the first request doesn't pay a
-    /// cold reload. Best effort: a single-model llama-server (no router mode)
-    /// has no load endpoint and must not fail the turn — any error is
-    /// ignored and the router auto-loads on first use anyway.
     pub async fn ensure_model_loaded(&self, model: &str) {
         let body = serde_json::json!({ "model": model });
         for path in ["models/load", "v1/models/load"] {
@@ -125,12 +117,6 @@ impl LlamaClient {
         }
     }
 
-    /// POST /v1/chat/completions, stream deltas to `on_event`, then emit
-    /// `StreamEvent::Done(StreamResult)`. Returning `false` from `on_event`
-    /// stops the stream early (`StreamResult::aborted` is set). `keep_going`
-    /// is polled while the stream is idle (no SSE events); returning `false`
-    /// aborts the stream the same way. `model` routes the request — in a
-    /// llama.cpp router-mode server it selects which model to run.
     pub async fn chat_stream(
         &self,
         model: &str,
@@ -171,10 +157,6 @@ impl LlamaClient {
         self.consume_stream(resp.bytes_stream(), on_event, keep_going).await
     }
 
-    /// Internal: consume an SSE byte stream (also used by tests with a fake
-    /// stream). While the stream is idle, `keep_going` is polled every
-    /// ~200ms; if it returns `false` the stream is aborted (server-side
-    /// generation cancelled) even when no SSE events arrive.
     pub async fn consume_stream<S>(
         &self,
         raw: S,
@@ -231,9 +213,6 @@ impl LlamaClient {
                             eprintln!("DEBUG ABORT-SOURCE: on_event (chunk) returned false");
                         }
                         result.aborted = true;
-                        // Explicitly cancel on the server while the slot is still
-                        // busy: dropping the response alone may leave the server
-                        // decoding the abandoned completion.
                         self.cancel_generation().await;
                         break;
                     }
@@ -253,16 +232,6 @@ impl LlamaClient {
         Ok(result)
     }
 
-    /// Best-effort server-side cancel of the in-flight generation (`POST
-    /// /abort`, the endpoint the llama.cpp WebUI stop button uses).
-    ///
-    /// If we merely drop the response, llama-server may keep decoding the
-    /// whole abandoned completion — occupancy is only noticed between
-    /// batches (`is_connection_closed` is not wired into the generation
-    /// loop on many builds), which pins CPU/GPU for minutes on slow
-    /// hardware and blocks the slot for the next turn. An explicit cancel
-    /// makes the stop immediate and reliable. 404 on builds without the
-    /// endpoint is harmless.
     pub async fn cancel_generation(&self) {
         let url = format!("{}/abort", self.base);
         match self
@@ -278,9 +247,6 @@ impl LlamaClient {
     }
 }
 
-/// Drop wire-invalid messages: assistant messages with neither `content`,
-/// `tool_calls` nor (non-empty) `reasoning_content` (e.g. reasoning-only
-/// leftovers from a dangling turn) are rejected by llama-server with 400.
 fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
@@ -292,11 +258,6 @@ fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             }
             _ => true,
         })
-        // llama.cpp rejects assistant messages that carry neither `content`
-        // nor `tool_calls` (a reasoning-only message — e.g. a turn that only
-        // emitted thinking and no reply — is invalid as input). Fold the
-        // reasoning into `content` so such a turn stays on the wire without
-        // 400-ing the whole request.
         .map(|m| {
             if m.role == Role::Assistant && m.content.is_none() && m.tool_calls.is_none()
                 && let Some(r) = m.reasoning_content.as_deref().filter(|r| !r.is_empty())
@@ -324,9 +285,6 @@ mod tests {
         futures_util::stream::iter(items)
     }
 
-    /// A byte stream that delivers one chunk immediately and then one chunk
-    /// per second (used to test the abort watchdog: while the stream stalls,
-    /// the watchdog must still run).
     struct SlowBytesStream {
         items: std::vec::IntoIter<Result<bytes::Bytes, reqwest::Error>>,
         delay: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
@@ -480,8 +438,6 @@ mod tests {
         reasoning_only.reasoning_content = Some("Let me think...".to_string());
         let kept = sanitize_messages(&[reasoning_only]);
         assert_eq!(kept.len(), 1, "reasoning-only assistant reply must not be dropped");
-        // llama.cpp rejects assistant messages with neither `content` nor
-        // `tool_calls`, so reasoning-only turns are folded into content.
         let m = &kept[0];
         assert_eq!(m.content.as_deref(), Some("Let me think..."));
         assert!(m.reasoning_content.is_none(), "folded reasoning must not repeat");

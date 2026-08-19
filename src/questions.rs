@@ -1,7 +1,3 @@
-//! QUESTIONS blocks: rendered in the session tail when the model calls the
-//! `question` tool. The user answers below the `>` marker; the daemon parses
-//! the answers (1-based indices into the answers array, or verbatim text,
-//! comma-separated) and turns them into a normal tool result for the model.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -17,13 +13,11 @@ pub struct Question {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuestionsBlock {
     pub questions: Vec<Question>,
-    /// Raw JSON stash comments (`<!-- q:N {...} -->`) in question order.
     pub raw_json: Vec<String>,
 }
 
 pub const BLOCK_HEADER: &str = "QUESTIONS";
 
-/// Render the QUESTIONS block (markdown table + answer instructions).
 pub fn render_block(qs: &[Question]) -> String {
     let mut out = String::new();
     out.push_str(BLOCK_HEADER);
@@ -49,13 +43,10 @@ pub fn render_block(qs: &[Question]) -> String {
     out
 }
 
-/// Find and parse a QUESTIONS block anywhere in `text`.
 pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
     let start = text.find(BLOCK_HEADER)?;
     let rest = &text[start..];
 
-    // The block ends at the next `QUESTIONS` header (if any), so a later
-    // block's stashes/rows never leak into this one.
     let mut block_end = rest.len();
     let mut offset = 0;
     for line in rest.split_inclusive('\n').skip(1) {
@@ -70,8 +61,6 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
     let mut questions: Vec<Question> = Vec::new();
     let mut raw_json: Vec<String> = Vec::new();
 
-    // Stash comments appear after the header, one per question:
-    // `<!-- q:1 {...} -->`. Build a lookup by id.
     let stashes: Vec<(u32, String)> = block_text
         .lines()
         .filter_map(|line| {
@@ -132,8 +121,6 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
         };
         let answers = cells
             .get(2)
-            // Options are rendered `a # b # c` (the `#` separator keeps
-            // answers that contain commas intact).
             .map(|c| c.split('#').map(|s| s.trim().to_string()).collect())
             .unwrap_or_default();
 
@@ -174,11 +161,6 @@ fn parse_table_row(line: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Parse the user's answer text below the `>` marker.
-///
-/// Tokens are comma- and newline-separated. A token that parses as a
-/// 1-based integer selects `answers[k-1]`; anything else is used verbatim
-/// (trimmed). Every question in the block must be answered, else `Err`.
 pub fn parse_answers(block: &QuestionsBlock, answer_text: &str) -> Result<Vec<(u32, String)>, String> {
     let mut tokens: VecDeque<String> = answer_text
         .split([',', '\n'])
@@ -202,8 +184,6 @@ pub fn parse_answers(block: &QuestionsBlock, answer_text: &str) -> Result<Vec<(u
 }
 
 fn resolve_token(token: &str, q: &Question) -> String {
-    // A token may itself be comma-separated (e.g. multi-select) — not
-    // supported per-question; treat the token as one answer.
     if let Ok(k) = token.parse::<usize>()
         && (1..=q.answers.len()).contains(&k)
     {

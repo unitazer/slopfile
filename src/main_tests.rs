@@ -54,7 +54,6 @@ fn yolo_cfg() -> AppConfig {
     let sock = dir.join("docker.sock");
     let _ = std::fs::remove_file(&sock);
 
-    // Fake docker daemon: answer restart with 204 No Content.
     let listener = UnixListener::bind(&sock).unwrap();
     let server = std::thread::spawn(move || {
       let (mut c, _) = listener.accept().unwrap();
@@ -83,7 +82,6 @@ fn yolo_cfg() -> AppConfig {
     assert!(restart_llama_server(path, "clanker-llama").is_ok(), "204 → ok");
     server.join().unwrap();
 
-    // Unknown container → 404 must surface as an error, not a panic.
     let sock2 = sock.with_extension("sock2");
     let _ = std::fs::remove_file(&sock2);
     let listener2 = UnixListener::bind(&sock2).unwrap();
@@ -104,7 +102,6 @@ fn yolo_cfg() -> AppConfig {
           Err(_) => break,
         }
       }
-      // Second restart must not hit the first listener's path.
       assert!(req.starts_with("POST /containers/ghost/restart"));
       c.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
     });
@@ -165,8 +162,6 @@ fn yolo_cfg() -> AppConfig {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
 
-    // Block A: id 1, empty answer line (still awaiting the user).
-    // Block B: id 2, answered with `> blue`.
     let block_a = "QUESTIONS\n| # | Question | Options |\n| 1 | red or blue | red, blue |\nANSWER: (numbers or text, comma separated)\n>\n";
     let block_b = "QUESTIONS\n| # | Question | Options |\n| 2 | how long? | 3, 5, 10 |\nANSWER: (numbers or text, comma separated)\n> \nblue\n";
     let text = format!(
@@ -182,7 +177,6 @@ fn yolo_cfg() -> AppConfig {
       "leading unanswered block must gate resolvability"
     );
 
-    // Must not resolve the later answered block out of order nor livelock.
     resolve_questions(&path, &text, &pf, &cfg).unwrap();
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(after.contains("QUESTIONS"), "block A stays pending");
@@ -211,10 +205,6 @@ fn yolo_cfg() -> AppConfig {
 
   #[test]
   fn prose_mentioning_abort_marker_is_not_an_abort() {
-    // A tool result / file content that happens to mention the marker inside
-    // a line (e.g. PLAN.md notes about the abort feature) must never trigger
-    // the abort path — this deadlocked a live session by making drive_file
-    // return early on every sweep.
     let prose = "\
 ```toml
 model = \"qwen3.8-27b\"
@@ -233,11 +223,9 @@ Let me read a file.
 ";
     assert!(!transcript::abort_marker_present(prose), "prose mention must not abort");
     assert!(transcript::abort_marker_present("hi\n<!-- slopfile:abort -->\n"));
-    // Glued to the status line (daemon writes it without a trailing newline).
     assert!(transcript::abort_marker_present(
       "<!-- slopfile:live {\"phase\":\"generating\"} --><!-- slopfile:abort -->\n"
     ));
-    // drive_file must proceed (has_work true) despite the prose mention.
     let pf = transcript::parse_file(prose);
     assert!(has_work(&pf, prose, &yolo_cfg()), "prose mention must not stall the file");
   }
@@ -258,23 +246,18 @@ Let me read a file.
       &std::fs::read_to_string(&path).unwrap(),
       Some("<!-- slopfile:live {\"phase\":\"generating\"} -->".into()),
     );
-    // Normal event: stream stuff in.
     assert!(w.handle(&types::StreamEvent::Text("hello ".into())));
-    // Simulate the user appending an abort marker while streaming.
     {
       let mut f = std::fs::read_to_string(&path).unwrap();
       f.push_str(transcript::ABORT_MARKER);
       f.push('\n');
       std::fs::write(&path, f).unwrap();
     }
-    // Next event: must stop (false) and the marker must not survive a flush.
     assert!(!w.handle(&types::StreamEvent::Text("world".into())));
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(after.contains("hello"), "text up to abort is kept");
     assert!(!after.contains("world"), "post-abort text dropped");
     assert!(!after.contains("slopfile:abort"), "marker stripped");
-    // Stale live status is rewritten by the caller (run_generation_turn
-    // write_status idle); StreamWriter only guarantees it stays last.
     assert!(
       after
         .trim_end()
@@ -285,11 +268,6 @@ Let me read a file.
 
   #[test]
   fn file_has_abort_drives_keep_going_unnverted() {
-    // Regression: the watchdog in chat_stream aborts when `keep_going`
-    // returns false, but it was wired as `|| file_has_abort(path)` — which
-    // returns TRUE when a marker IS present, so every marker-free run aborted
-    // within a watchdog tick. keep_going must be the negation of
-    // file_has_abort: continue while there is NO abort marker.
     let dir = std::env::temp_dir().join("slopfile-test-keepgoing-wiring");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
@@ -315,7 +293,6 @@ Let me read a file.
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     let mut src = sample_with_question_block();
-    // User answers with /skip on the answer line.
     src = src.replace("> \n", "> /skip\n");
     std::fs::write(&path, &src).unwrap();
 
@@ -342,7 +319,6 @@ Let me read a file.
       msgs.push(ChatMessage::user(format!("user turn number {i} with some body text")));
       msgs.push(ChatMessage::assistant(format!("assistant answer number {i} with some body text")));
     }
-    // Tiny budget: only the newest turns survive.
     let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
     let small = truncate_messages(msgs.clone(), &counts, 12);
     assert_eq!(small[0].role, Role::System);
@@ -350,10 +326,8 @@ Let me read a file.
       msgs.len(), small.len());
     let last = small.last().unwrap();
     assert_eq!(last.content.as_deref(), Some("assistant answer number 8 with some body text"));
-    // Never starts mid-turn.
     assert!(matches!(small[1].role, Role::User | Role::Assistant));
 
-    // Big budget: everything kept.
     let big = truncate_messages(msgs.clone(), &counts, 1_000_000);
     assert_eq!(big.len(), msgs.len());
   }
@@ -370,11 +344,8 @@ Let me read a file.
       msgs.push(ChatMessage::tool(call.id.clone(), "bash".to_string(), "out".to_string()));
     }
     let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
-    let small = truncate_messages(msgs.clone(), &counts, 6); // tiny budget: ~1 round
-    // First kept message after system must not be a Tool result with a
-    // missing caller: it is User or Assistant.
+    let small = truncate_messages(msgs.clone(), &counts, 6);
     assert!(matches!(small[1].role, Role::User | Role::Assistant));
-    // If a tool round starts, its result is included.
     let has_call = small.iter().any(|m| m.tool_calls.is_some());
     let has_result = small.iter().any(|m| m.role == Role::Tool);
     assert_eq!(has_call, has_result, "tool round is atomic");
@@ -398,20 +369,17 @@ Let me read a file.
     let base = "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\npartial reply here\n<!-- @done -->\n";
     let note = format!("{CONTEXT_FULL_NOTE}\n");
 
-    // Note-only tail: no draft, no section, no work.
     let note_only = format!("{base}{note}");
     let text = &note_only;
     let pf = transcript::parse_file(text);
     assert!(draft_tail_after_done(text).is_none(), "note is not a draft");
     assert!(section_below_done(text).is_none(), "note is not a section");
     assert!(!has_work(&pf, text, &yolo_cfg()), "note-only tail must be idle");
-    // The note never enters history.
     assert!(!pf
       .history
       .iter()
       .any(|m| m.content.as_deref().is_some_and(|c| c.contains("context-full"))));
 
-    // Note + a real draft: the draft is work, the note is not part of it.
     let note_and_draft = format!("{base}{note}\ncontinue the work\n");
     let text = &note_and_draft;
     let pf = transcript::parse_file(text);
@@ -434,13 +402,10 @@ Let me read a file.
     let _pf = transcript::parse_file(&text);
     promote_draft(&path, &text).expect("promote");
     let after = std::fs::read_to_string(&path).unwrap();
-    // The note stays above the promoted section, never inside it.
     let note_ix = after.find(CONTEXT_FULL_NOTE).expect("note kept");
     let you_ix = after.find("### You\nnext message").expect("section right before draft");
     let done_ix = after.find("<!-- @done -->").expect("done marker");
     assert!(done_ix < note_ix && note_ix < you_ix, "layout: {after}");
-    // Re-parsing: the draft is now a `### You` section below @done (tail),
-    // parsed as a user message; the note is not part of it.
     let section = section_below_done(&after).expect("promoted section");
     let msgs = transcript::tail_sections(&section);
     assert!(msgs
@@ -458,8 +423,6 @@ Let me read a file.
     assert!(tpl.contains("model = \"qwen3.8-27b\""), "default model: {tpl}");
     assert!(tpl.contains("tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\"]"));
     assert!(tpl.contains("# Session\n"), "session heading: {tpl}");
-    // Default system prompt describes the model's real interface, never the
-    // transcript's markup.
     assert!(tpl.contains("You are an expert software engineering assistant"));
     assert!(!tpl.contains("This session is a Markdown transcript file"));
     assert!(!tpl.contains("<!-- @done -->"));
@@ -467,7 +430,6 @@ Let me read a file.
     assert!(tpl.contains("- read: Read files as numbered lines"));
     assert!(tpl.contains("Use read to examine files before editing"));
     assert!(tpl.contains("Current working directory: /tmp"));
-    // Empty first-user slot; the file itself parses back as system-only.
     assert!(tpl.ends_with("### You\n"));
     let pf = transcript::parse_file(&tpl);
     assert_eq!(pf.history.len(), 1, "system message only");

@@ -1,13 +1,10 @@
 #!/bin/bash
-# Convenience wrapper for the slopfile + llama-server stack.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 case "${1:-}" in
   up)
     shift
-    # Export the docker group gid so the slopfile container can talk to the
-    # docker socket (abort → restart llama-server).
     export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 998)
     exec docker compose up -d "$@"
     ;;
@@ -25,8 +22,6 @@ case "${1:-}" in
     ;;
   deploy)
     shift
-    # Build a release slopfile binary and drop it into the running container
-    # (faster than rebuilding the image), then restart so it takes effect.
     echo "building slopfile (release)…"
     (cd .. && cargo build --release)
     bin=../target/release/slopfile

@@ -1,7 +1,3 @@
-//! slopfile daemon: watches the transcripts dir, drives each session `.md`
-//! through generation turns against llama-server, streaming deltas into the
-//! file. The file is the entire UI — the daemon only ever writes below the
-//! last `@done` marker (or replaces daemon-owned partial output).
 
 mod api;
 mod lex;
@@ -38,38 +34,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-  /// Write the default session template (header + system prompt) into a new
-  /// or empty .md file. Refuses to touch a non-empty file.
   Init {
-    /// Path of the session file to initialize
     path: String,
   },
-  /// Interrupt the agent on a session file: append the abort marker; the
-  /// daemon stops the current stream, closes the turn with @done and goes
-  /// idle.
   Abort {
-    /// Path of the session file to abort
     path: String,
   },
-  /// Estimate the token footprint of the request the daemon would send for
-  /// a session file (history + tail sections + dangling resume, after
-  /// context-window truncation). Read-only; never modifies the file.
   Tokens {
-    /// Path of the session file to measure
     path: String,
   },
 }
 
-/// Host path; the container variant sets `SLOPFILE_CONFIG` to
-/// `/shared/slopfile.toml`.
 const APP_CONFIG_PATH: &str = "/home/unitazer/things/clanker/slopfile/shared/slopfile.toml";
 
-/// Load app config, then apply env overrides so the same file works on the
-/// host and inside the compose network:
-///   SLOPFILE_CONFIG      path to the toml (default APP_CONFIG_PATH)
-///   SLOPFILE_API_BASE    e.g. http://llama-server:8080 (container)
-///   SLOPFILE_TRANSCRIPTS transcripts dir
-///   SLOPFILE_WORKDIR     tool working directory
 fn load_app_config() -> AppConfig {
   let path = std::env::var("SLOPFILE_CONFIG").unwrap_or_else(|_| APP_CONFIG_PATH.to_string());
   let mut cfg = AppConfig::load_from_file(&path).unwrap_or_else(|e| {
@@ -127,8 +104,6 @@ async fn main() {
   std::fs::create_dir_all(&app_cfg.transcripts_dir).ok();
 
   let busy: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
-  // Error throttle: skip a file for 5 s after an error so a broken file
-  // doesn't hammer the API every sweep.
   let throttled: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
   loop {
@@ -175,10 +150,7 @@ fn scan_transcripts(dir: &str) -> Result<Vec<PathBuf>, String> {
   Ok(out)
 }
 
-// ── Per-file driving ────────────────────────────────────────────────────
 
-/// Drive one session file until it is quiescent (either the turn completed
-/// with `@done`, or the daemon is waiting on the user).
 async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
   let mut turns = 0;
   loop {
@@ -190,9 +162,6 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
 
     let text = read_file(path)?;
 
-    // A fresh empty file is a brand-new session: lay down the default
-    // template (header + system prompt). Re-check the disk so we never
-    // clobber text the user typed between the two reads.
     if text.trim().is_empty() {
       if read_file(path)?.trim().is_empty() {
         write_file(path, session_template(cfg))?;
@@ -201,9 +170,6 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
       return Ok(());
     }
 
-    // Abort marker present while idle: nothing is running, just drop the
-    // marker line and refresh the status. (During a stream the marker is
-    // handled inside StreamWriter; this path covers the in-between state.)
     if transcript::abort_marker_present(&text) {
       strip_abort_marker(path, &text)?;
       return Ok(());
@@ -214,18 +180,15 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
       return Ok(());
     }
 
-    // 1) Resolve pending QUESTION blocks (answered by the user, or yolo).
     if !pf.pending_questions.is_empty() {
       if questions_resolvable(&pf, cfg) {
         resolve_questions(path, &text, &pf, cfg)?;
         continue;
       }
-      // Waiting for the user to answer.
       write_status(path, &pf, "waiting_answer")?;
       return Ok(());
     }
 
-    // 2) Promote drafted tail text into a `### You` history section.
     if let Some(draft) = draft_tail_after_done(&text)
       && !draft.trim().is_empty()
     {
@@ -233,7 +196,6 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
       continue;
     }
 
-    // 3) Generation turn: cut dangling partial output, stream a response.
     let outcome = run_generation_turn(path, &text, &pf, cfg, client).await?;
     match outcome {
       TurnOutcome::Done => return Ok(()),
@@ -247,8 +209,6 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
     return true;
   }
   if !pf.pending_questions.is_empty() {
-    // Answered questions = work (resolve into history); unanswered ones =
-    // waiting on the user (no daemon work).
     return questions_resolvable(pf, cfg);
   }
   if let Some(draft) = draft_tail_after_done(text)
@@ -256,14 +216,11 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
   {
     return true;
   }
-  // A `### You` / other section below the last @done (user wrote their own
-  // header, or promotion happened) still needs work.
   if let Some(section) = section_below_done(text)
     && !section.trim().is_empty()
   {
     return true;
   }
-  // Fresh file with a first user turn and no `@done` yet.
   if transcript::find_done_marker(text).is_none() {
     return pf
       .history
@@ -273,8 +230,6 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
   false
 }
 
-/// Raw user text below the last `@done` marker (status line and daemon-owned
-/// comment lines stripped).
 fn section_below_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
   let done_ix = transcript::turn_end_tail_start(&body)?;
@@ -301,12 +256,6 @@ enum TurnOutcome {
   AwaitsNextTurn,
 }
 
-/// Stream one assistant response into the file. May end with:
-/// - plain text → `@done` closing marker (Done)
-/// - tool calls → executed, blocks written (AwaitsNextTurn so the loop
-///   continues with the tool results in history)
-/// - `question` → QUESTIONS block rendered in tail (AwaitsNextTurn; next
-///   loop pass sees pending questions and waits).
 async fn run_generation_turn(
   path: &Path,
   text: &str,
@@ -314,22 +263,12 @@ async fn run_generation_turn(
   cfg: &AppConfig,
   client: &LlamaClient,
 ) -> Result<TurnOutcome, String> {
-  // Cut daemon-owned partial output (dangling) so we stream a fresh
-  // response: everything up to the end of the dangling `### Assistant`
-  // heading stays (the heading is the resume point), the partial text below
-  // it is dropped and re-asked. StreamWriter rewrites the WHOLE file on
-  // every flush, so user-owned history and drafts above the heading are
-  // preserved verbatim.
   let (body, live) = strip_live_line(text);
   let base_text = match &pf.dangling {
     Some(d) => body[..d.resume_offset.min(body.len())].to_string(),
     None => body.clone(),
   };
 
-// Messages: history + replayed dangling output as assistant context + any
-  // in-flight below-`@done` sections (drafts promoted to `### You`). The
-  // below-`@done` region is appended EXACTLY ONCE here — `parse_file` history
-  // already stops at the last `@done`.
   let (messages, _dropped, _) = build_request_messages(text, pf, cfg).await?;
 
   let context_budget = pf
@@ -340,14 +279,9 @@ async fn run_generation_turn(
   let tools = pf.config.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(true);
   let tool_defs = tools.then(tools::definitions);
 
-  // Route the request to the per-session model from the file header, falling
-  // back to the app default. In a router-mode llama-server this selects the
-  // GGUF to load; warm it so the first stream isn't a cold reload.
   let model = pf.config.model.as_deref().unwrap_or(&cfg.model);
   client.ensure_model_loaded(model).await;
 
-  // First write: `### Assistant` header (+ thinking open if the first delta
-  // is reasoning — we handle markers in the event closure).
   let mut active = StreamWriter::new(path, &base_text, live.map(|(_, t)| t));
 
   info!("→ {path:?}: generating (model={model}, messages={})", messages.len());
@@ -364,9 +298,6 @@ async fn run_generation_turn(
     .map_err(|e| format!("chat_stream: {e}"))?;
 
   if result.aborted {
-    // User aborted mid-stream: close the turn and stop; no tools, no @done
-    // ride-along continuation. Seal it with the dedicated ABORTED marker so
-    // the file can never masquerade as a normally-completed turn.
     active.finish_section();
     let text_now = read_file(path)?;
     let (body, live) = strip_live_line(&text_now);
@@ -383,13 +314,7 @@ async fn run_generation_turn(
     }
     write_file(path, out)?;
     write_status(path, pf, "idle")?;
-    // The abandoned completion keeps decoding on the server (llama.cpp has
-    // no cancel endpoint; disconnect is only noticed late, if ever) — pin
-    // a core and occupying the slot for minutes. Restart the inference
-    // container so the hardware is freed now.
     if cfg.abort_restart_server {
-      // Blocking socket I/O; keep it off the async runtime so concurrent
-      // sessions' streams are not stalled by the restart roundtrip.
       let container = cfg.llama_container.clone();
       let res = tokio::task::spawn_blocking(move || {
         restart_llama_server("/var/run/docker.sock", &container)
@@ -409,10 +334,6 @@ async fn run_generation_turn(
   active.finish_section();
 
   if result.finish_reason.as_deref() == Some("length") {
-    // The model hit the token cap mid-turn. Close the turn and stop: the
-    // partial output stays, a note tells the user to trim old turns, and the
-    // daemon goes idle. Any partially-streamed tool calls are NOT executed
-    // (their argument JSON may be truncated).
     let text_now = read_file(path)?;
     let (body, live) = strip_live_line(&text_now);
     let mut out = body;
@@ -442,20 +363,11 @@ async fn run_generation_turn(
     return Ok(TurnOutcome::AwaitsNextTurn);
   }
 
-  // Interrupted stream: the request returned no terminal finish_reason (the
-  // connection dropped, a slot aborted, or the daemon was restarted
-  // mid-turn). The reply is incomplete — sealing it with `@done` would make
-  // the turn look finished, so `:Send`/`:Resume` would never re-drive it.
-  // Instead leave the last `### Assistant` section dangling: the next sweep
-  // sees it as a resume point and continues exactly where it stopped.
   if result.finish_reason.as_deref().is_none() {
-    // The partial section was already flushed by `active.finish_section()`
-    // above (and would be re-flushed on resume); just leave it dangling.
     info!("⚠ {path:?}: turn interrupted mid-stream (no finish_reason); left dangling for resume");
     return Ok(TurnOutcome::Done);
   }
 
-  // Plain-text completion: close the turn with `@done`.
   let final_text = read_file(path)?;
   let (body, live) = strip_live_line(&final_text);
   let mut out = body;
@@ -473,11 +385,7 @@ async fn run_generation_turn(
   Ok(TurnOutcome::Done)
 }
 
-// ── Streaming writes ────────────────────────────────────────────────────
 
-/// Append-only writer that streams model deltas into the file, keeping the
-/// status line at the very bottom and wrapping reasoning in thinking
-/// markers.
 struct StreamWriter<'a> {
   path: &'a Path,
   out: String,
@@ -500,9 +408,6 @@ impl<'a> StreamWriter<'a> {
   }
 
   fn ensure_header(&mut self) {
-    // On resume the dangling cut already leaves the `### Assistant` header
-    // in place; don't write a second one. Only a heading at the very end of
-    // the buffer counts — a heading in the middle is streamed content.
     let tail = self.out.trim_end();
     if tail == "### Assistant" || tail.ends_with("\n### Assistant") {
       self.wrote_header = true;
@@ -521,16 +426,11 @@ impl<'a> StreamWriter<'a> {
     }
   }
 
-  /// Handle one stream event. Returns `false` when the turn should stop
-  /// (an abort marker appeared in the file while streaming).
   fn handle(&mut self, ev: &types::StreamEvent) -> bool {
     use types::StreamEvent as E;
     if self.aborted {
       return false;
     }
-    // The file is rewritten wholesale on every flush, so an abort marker
-    // the user appended would be destroyed before we ever see it — check
-    // the disk first.
     if self.marker_present() {
       self.aborted = true;
       self.flush_marker_strip();
@@ -555,15 +455,12 @@ impl<'a> StreamWriter<'a> {
         self.out.push_str(r);
         self.flush_marker_strip();
       }
-      E::ToolCallFragment(_) => { /* tool block written after completion */ }
+      E::ToolCallFragment(_) => { }
       E::Done(_) => {}
     }
     !self.aborted
   }
 
-  /// True while no abort marker is in the file (continue streaming). The
-  /// marker must be its own line (or glued to the status line) — prose that
-  /// merely mentions the marker must not stop the stream.
   fn marker_present(&self) -> bool {
     let Ok(disk) = std::fs::read_to_string(self.path) else {
       return true;
@@ -571,8 +468,6 @@ impl<'a> StreamWriter<'a> {
     transcript::abort_marker_present(&disk)
   }
 
-  /// Flush, dropping any abort marker line from the disk content (it is
-  /// daemon-owned control state, not user text).
   fn flush_marker_strip(&mut self) {
     if self.marker_present() {
       self.aborted = true;
@@ -582,14 +477,9 @@ impl<'a> StreamWriter<'a> {
   }
 
   fn finish_section(&self) {
-    // Ensure the file ends with the section footer even if flushed already;
-    // this is a no-op if the last flush already carried everything.
     let (body, _) = strip_live_line(&self.out);
     let mut out = body;
     if self.in_reasoning {
-      // The last streamed reasoning delta may end mid-line (interrupted
-      // turn): put the closing marker on its own line so the lexer/parser
-      // always see it as a ThinkingEnd token.
       if !out.ends_with('\n') {
         out.push('\n');
       }
@@ -607,7 +497,6 @@ impl<'a> StreamWriter<'a> {
   }
 
   fn flush(&mut self) {
-    // Daemon-owned control lines (e.g. abort marker) never reach the file.
     let mut out = without_abort_lines(&self.out);
     if let Some(live) = &self.live {
       out.push('\n');
@@ -620,16 +509,9 @@ impl<'a> StreamWriter<'a> {
   }
 }
 
-// ── Session init ────────────────────────────────────────────────────────
 
-/// Daemon-owned comment lines never reach the LLM and are never treated as
-/// user drafts. Written below `@done` when the model hits the token cap
-/// mid-response; the user trims old turns and writes the next message below
-/// it.
 pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit the token cap mid-response; trim the useless old turns above, then write your next message below this note -->";
 
-/// `slopfile init <path>`: write the default template into a new or empty
-/// file. Refuses to overwrite anything with content.
 fn cmd_init(path: &str, cfg: &AppConfig) {
   match init_template_for(path, cfg) {
     Ok(content) => match std::fs::write(path, content) {
@@ -646,7 +528,6 @@ fn cmd_init(path: &str, cfg: &AppConfig) {
   }
 }
 
-/// Resolve what `init` would write. Err when the file exists with content.
 fn init_template_for(path: &str, cfg: &AppConfig) -> Result<String, String> {
   if let Ok(existing) = std::fs::read_to_string(path)
     && !existing.trim().is_empty()
@@ -656,8 +537,6 @@ fn init_template_for(path: &str, cfg: &AppConfig) -> Result<String, String> {
   Ok(session_template(cfg))
 }
 
-/// `slopfile abort <path>`: append the abort marker to a session file. The
-/// daemon notices it on the next sweep and stops the running stream.
 fn cmd_abort(path: &str) {
   let content = match std::fs::read_to_string(path) {
     Ok(c) => c,
@@ -683,9 +562,6 @@ fn cmd_abort(path: &str) {
   println!("abort requested on {path}; the daemon stops the turn on its next sweep");
 }
 
-/// Measure the real token footprint of the request the daemon would send for
-/// a session file, using the model's actual tokenizer (llama-server
-/// `/tokenize`). Read-only; never modifies the file.
 async fn cmd_tokens(path: &str, cfg: &AppConfig) {
   let text = match std::fs::read_to_string(path) {
     Ok(t) => t,
@@ -716,10 +592,6 @@ async fn cmd_tokens(path: &str, cfg: &AppConfig) {
   println!("  input headroom: {headroom}");
 }
 
-/// Tokenize the concatenated message contents against the model tokenizer.
-/// llama.cpp exposes `/tokenize` on the server root and mirrors it under
-/// `/v1/`. Router mode requires the `model` in the body, so try with it
-/// first, then fall back to a no-model body for single-model servers.
 async fn request_token_count(
   api_base: &str,
   model: &str,
@@ -774,8 +646,6 @@ async fn request_token_count(
   Err(format!("cannot reach model tokenizer: {last_err}"))
 }
 
-/// The default session file: header (default settings) + system prompt
-/// (adapted from pi) + an empty `### You` section for the first message.
 pub fn session_template(cfg: &AppConfig) -> String {
   let mut out = String::new();
   out.push_str("```toml\n");
@@ -789,10 +659,6 @@ pub fn session_template(cfg: &AppConfig) -> String {
   out
 }
 
-/// The default system prompt. The model converses over a standard chat
-/// message protocol (prose + tool calls); it never sees the transcript's
-/// markup (headings, `@done`, tool/result blocks are handled by the harness),
-/// so the prompt describes only the interface it actually uses.
 fn system_prompt_default(cfg: &AppConfig) -> String {
   format!(
     "You are an expert software engineering assistant. You help the user by reading files, running commands, editing code, and writing files, and you reply to them in plain text.
@@ -821,17 +687,7 @@ Current working directory: {}",
   )
 }
 
-// ── Conversation truncation ─────────────────────────────────────────────
 
-/// Assemble the exact request the daemon would send for this session:
-/// history + below-`@done` tail sections + a replayed dangling-output
-/// assistant turn,
-/// then drop the OLDEST turns (never from the file) so the request fits the
-/// context window. Bounded by the model's real tokenizer. Keeps the system
-/// message and cuts at a clean turn boundary.
-///
-/// Returns the final messages, how many old turns were dropped, and the
-/// token count of the final request.
 async fn build_request_messages(
   text: &str,
   pf: &ParsedFile,
@@ -839,17 +695,10 @@ async fn build_request_messages(
 ) -> Result<(Vec<ChatMessage>, usize, usize), String> {
   let mut messages = pf.history.clone();
   if transcript::find_done_marker(text).is_some() {
-    // Everything below the last `@done` is a fresh draft region: user
-    // sections, QUESTIONS, or a dangling partial assistant ending the file.
     let (body, _live) = strip_live_line(text);
     let toks = lex(&body);
     let done = toks.iter().rfind(|t| t.kind.is_turn_end()).expect("checked above");
     let start = done.offset + done.text.len();
-    // The dangling partial assistant is replayed verbatim below as the
-    // model's own prior turn — never resent here. Cut the tail at its
-    // heading so only genuine drafts above it reach `tail_sections` (the cut
-    // partial would otherwise become a reasoning-only assistant message the
-    // server rejects with 400).
     let end = match &pf.dangling {
       Some(d) => d.resume_offset.min(body.len()),
       None => body.len(),
@@ -872,8 +721,6 @@ async fn build_request_messages(
   if let Some(d) = &pf.dangling
     && !d.partial_text.trim().is_empty()
   {
-    // Replay the partial output as a genuine assistant turn so the model
-    // continues it naturally — never labelling it "interrupted".
     messages.extend(transcript::assistant_section_messages(&d.partial_text));
   }
   let context_budget = pf.config.max_context_tokens.unwrap_or(cfg.max_context_tokens);
@@ -889,7 +736,6 @@ async fn build_request_messages(
   Ok((truncated, dropped, sent_tokens))
 }
 
-/// Tokenize each message against the model tokenizer, one per message.
 async fn request_token_counts(
   api_base: &str,
   model: &str,
@@ -913,12 +759,6 @@ fn msg_chars(m: &ChatMessage) -> usize {
     + m.name.as_ref().map_or(0, |n| n.len())
 }
 
-/// Drop the OLDEST messages (after the system prompt) until the estimated
-/// prompt size fits `max_tokens`, using per-message token counts from the
-/// model's real tokenizer. Keeps the NEWEST turns. The first kept message
-/// is a `User` or `Assistant` turn start — never a `Tool` result, which
-/// would orphan its tool-call id. If even the newest turn doesn't fit, the
-/// newest messages are kept anyway (a partial context beats an empty one).
 pub fn truncate_messages(
   messages: Vec<ChatMessage>,
   token_counts: &[usize],
@@ -932,7 +772,6 @@ pub fn truncate_messages(
   if total <= budget || messages.len() <= 2 {
     return messages;
   }
-  // Largest prefix (1-based index) that fits within the budget.
   let sys_tokens = token_counts[0];
   let mut keep_through = messages.len() - 1;
   let mut sum = sys_tokens + token_counts[1..].iter().sum::<usize>();
@@ -944,14 +783,9 @@ pub fn truncate_messages(
     }
   }
   let mut keep_from = keep_through;
-  // Walk forward to a clean turn start but never past the last message:
-  // dropping a trailing partial turn is better than orphaning tool rounds.
   while keep_from + 1 < messages.len() && !is_turn_start(&messages[keep_from]) {
     keep_from += 1;
   }
-  // Even the newest message alone exceeds the budget: the forward walk can
-  // not advance past the end, so an orphaned Tool tail would be kept with
-  // no caller. Unwind backward to the last turn start instead.
   if keep_from + 1 == messages.len() && !is_turn_start(&messages[keep_from]) {
     while keep_from > 0 && !is_turn_start(&messages[keep_from]) {
       keep_from -= 1;
@@ -966,18 +800,11 @@ pub fn truncate_messages(
   messages
 }
 
-/// A message is a valid turn start after truncation: `User` always, or a
-/// `Tool` result when its calling assistant AND the assistant's own full
-/// round are included (handled by the caller's forward scan). `Assistant`
-/// is always safe (its tool result, if any, follows after).
 fn is_turn_start(m: &ChatMessage) -> bool {
   matches!(m.role, Role::User | Role::Assistant)
 }
 
-// ── Tool execution ──────────────────────────────────────────────────────
 
-/// Execute each tool call and append its block at the end of the file
-/// (below the last `@done`, preserving the status line at the bottom).
 async fn write_tool_blocks(
   path: &Path,
   calls: &[ToolCall],
@@ -990,7 +817,6 @@ async fn write_tool_blocks(
   let mut block = String::new();
   for call in calls {
     let started = std::time::Instant::now();
-    // Per-session header override, else the app-wide timeout.
     let timeout = pf.config.tool_timeout_ms.unwrap_or(cfg.tool_timeout_ms);
     let result = tools::run(
       &call.name,
@@ -1021,9 +847,6 @@ async fn write_tool_blocks(
   write_file(path, out)
 }
 
-/// Render a `QUESTIONS` block in the tail from a `question` tool call,
-/// stashing the tool-call JSON so the answer can be resolved into a normal
-/// tool result later.
 fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String> {
   let call = calls
     .iter()
@@ -1073,8 +896,6 @@ fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String>
     out.push('\n');
   }
   out.push_str(&questions::render_block(&qs));
-  // Stash each question's original JSON as a comment (recoverable from the
-  // file alone).
   for (q, json) in qs.iter().zip(stash.iter()) {
     out.push_str(&format!("<!-- q:{} {} -->\n", q.id, json));
   }
@@ -1090,18 +911,7 @@ fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String>
   Ok(())
 }
 
-// ── Questions resolution ────────────────────────────────────────────────
 
-/// Can the pending questions be resolved right now? In ask mode: the user
-/// must have written answers below `> ` or typed `/skip`. In yolo mode:
-/// always (defaults or the first option).
-///
-/// Only the FIRST pending block gates progress: `resolve_questions` works
-/// first-to-last and re-reads the leftmost `QUESTIONS` header each pass.
-/// Scoping resolvability to that same leftmost block keeps the two in sync —
-/// if a later block were answered while an earlier one sat unanswered,
-/// `resolve_questions` would skip the leading block (never consuming it) and
-/// the caller would livelock re-entering the identical file.
 fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
   if cfg.confirmations == "yolo" {
     return true;
@@ -1112,8 +922,6 @@ fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
   }
 }
 
-/// The text of the leftmost QUESTIONS block in `tail`: from the `QUESTIONS`
-/// header through the end of its `<!-- call: ... -->` line.
 fn questions_block_region(tail: &str) -> Option<&str> {
   let header_ix = tail.find(questions::BLOCK_HEADER)?;
   let end_ix = tail[header_ix..]
@@ -1126,17 +934,12 @@ fn questions_block_region(tail: &str) -> Option<&str> {
   Some(&tail[header_ix..end_ix])
 }
 
-/// True if the tail contains a `/skip` line (answer questions with
-/// defaults / nothing, don't wait for the user). Matches both `/skip` and
-/// `> /skip` (the user types on the `>` answer line).
 fn has_skip(tail: &str) -> bool {
   lex(tail).into_iter().any(|t| {
     t.kind == TokKind::Skip || (t.kind == TokKind::Answer && t.payload == "/skip")
   })
 }
 
-/// Extract the raw answer text the user typed below the `>` marker of a
-/// QUESTIONS block in `tail`.
 fn user_answers_from_tail(tail: &str) -> Option<String> {
   lex(tail)
     .into_iter()
@@ -1144,8 +947,6 @@ fn user_answers_from_tail(tail: &str) -> Option<String> {
     .map(|t| t.payload.to_string())
 }
 
-/// Replace an answered QUESTIONS block with a normal tool block so the next
-/// generation turn sees it as plain history.
 fn resolve_questions(
   path: &Path,
   text: &str,
@@ -1159,9 +960,6 @@ fn resolve_questions(
     let Some(header_ix) = out.find(questions::BLOCK_HEADER) else {
       continue;
     };
-    // The block runs until after the `<!-- q:... -->` stash comments and the
-    // `<!-- call:... -->` line, so none of the block survives as stray
-    // assistant text after resolution.
     let rest = &out[header_ix..];
     let end_ix = rest
       .find("<!-- call:")
@@ -1175,10 +973,6 @@ fn resolve_questions(
       .unwrap_or(out.len());
     let block_text = &out[header_ix..end_ix];
 
-    // Answers: user text below `>`, else `/skip` (default/default=empty),
-    // else defaults/first (yolo). In ask mode an unanswered block stays
-    // pending — an answer or /skip elsewhere in the tail (another block)
-    // must never auto-answer THIS block.
     let skipping = has_skip(block_text);
     let raw = user_answers_from_tail(block_text);
     let answers = match (&raw, skipping) {
@@ -1188,7 +982,6 @@ fn resolve_questions(
         .map(|q| (q.id, q.default.clone().unwrap_or_default()))
         .collect::<Vec<_>>(),
       (Some(t), false) => parse_answers(block, t)?,
-      // yolo: default or first option per question.
       (None, false) if cfg.confirmations == "yolo" => block
         .questions
         .iter()
@@ -1201,14 +994,9 @@ fn resolve_questions(
           (q.id, ans)
         })
         .collect::<Vec<_>>(),
-      // ask: not answered, not skipped — keep waiting for the user. A
-      // leading unanswered block stalls later blocks (they resolve in file
-      // order), so stop: this pass has already flushed any earlier resolved
-      // blocks via `out`, and the caller re-checks the leftmost block.
       (None, false) => break,
     };
 
-    // Re-read the stash comment for the full tool call.
     let call_json = out
       .lines()
       .find_map(|l| {
@@ -1241,16 +1029,11 @@ fn resolve_questions(
   Ok(())
 }
 
-// ── Draft promotion ─────────────────────────────────────────────────────
 
-/// Insert a `### You` header before drafted tail text (below the last
-/// `@done` marker) so it becomes history. Daemon-owned comment lines
-/// (e.g. the context-full note) are skipped and stay above the section.
 fn promote_draft(path: &Path, text: &str) -> Result<(), String> {
   let (body, live) = strip_live_line(text);
   let done_ix = transcript::turn_end_tail_start(&body).unwrap_or(0);
 
-  // Byte length of the leading blank + daemon-owned comment lines.
   let rest = &body[done_ix..];
   let skip = rest
     .lines()
@@ -1259,7 +1042,6 @@ fn promote_draft(path: &Path, text: &str) -> Result<(), String> {
     .sum::<usize>()
     .min(rest.len());
 
-  // Insert `### You\n` right after the skipped lines.
   let marker_end = done_ix + skip;
   let mut out = String::new();
   out.push_str(&body[..marker_end]);
@@ -1275,20 +1057,12 @@ fn promote_draft(path: &Path, text: &str) -> Result<(), String> {
   write_file(path, out)
 }
 
-/// Tail text below the last `@done` that is NOT a questions block, NOT an
-/// existing section header (`### You` / `### Assistant`), and NOT a
-/// daemon-owned comment — i.e. user draft to promote. Returns None when
-/// there is no draft.
 fn draft_tail_after_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
   let done = lex(&body).into_iter().find(|t| t.kind.is_turn_end())?;
   let tail = &body[done.offset + done.text.len()..];
   let toks = lex(tail);
   let user_toks: Vec<_> = toks.iter().filter(|t| !t.kind.is_daemon_owned()).collect();
-  // Already stays in history: the tail starts with an EXACT `### You` or
-  // `### Assistant` section heading (daemon promoted, or an in-flight turn).
-  // Any other heading (`#`, `##`, `####` ...) is ordinary draft text and
-  // must be promoted — otherwise such drafts are silently never sent.
   if user_toks
     .iter()
     .find(|t| !t.text.trim().is_empty())
@@ -1308,16 +1082,12 @@ fn draft_tail_after_done(text: &str) -> Option<String> {
   if user_tail.is_empty() {
     return None;
   }
-  // If the tail is ONLY the QUESTIONS block (and its stash comments), it is
-  // not a draft — questions are handled separately.
   if user_tail.starts_with(questions::BLOCK_HEADER) {
     return None;
   }
   Some(user_tail.to_string())
 }
 
-/// Remove `/skip` lines (on their own line or on a `>` answer line): they
-/// are commands, not user messages.
 fn drop_skip_lines(text: &str) -> String {
   let had_nl = text.ends_with('\n');
   let mut out = lex(text)
@@ -1334,17 +1104,7 @@ fn drop_skip_lines(text: &str) -> String {
   out
 }
 
-// ── Misc helpers ────────────────────────────────────────────────────────
 
-/// Restart the llama-server container through the docker socket (raw HTTP,
-/// no docker CLI needed). Kills an abandoned generation instantly: llama.cpp
-/// has no cancel endpoint and disconnect detection is not wired into the
-/// generation loop, so an aborted stream would otherwise keep decoding
-/// (bounded only by max_tokens) and pin the CPU for minutes.
-///
-/// Requires the docker socket mounted into this container
-/// (`/var/run/docker.sock`, see docker/docker-compose.yml) and the
-/// container user in the host's docker group.
 fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
   use std::io::{Read, Write};
   use std::os::unix::net::UnixStream;
@@ -1360,8 +1120,6 @@ fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
   let mut buf = [0u8; 1024];
   let n = stream.read(&mut buf).map_err(|e| format!("docker socket read: {e}"))?;
   let head = String::from_utf8_lossy(&buf[..n]);
-  // 204 = restart accepted; the container comes back on its own (compose
-  // restart: unless-stopped).
   if head.starts_with("HTTP/1.1 204") || head.starts_with("HTTP/1.1 200") {
     Ok(())
   } else {
@@ -1373,8 +1131,6 @@ fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
   }
 }
 
-/// True while the file on disk currently holds an abort marker. Polled
-/// between SSE deltas; if the file can't be read, abort conservatively.
 fn file_has_abort(path: &Path) -> bool {
   let Ok(disk) = std::fs::read_to_string(path) else {
     return true;
@@ -1382,9 +1138,6 @@ fn file_has_abort(path: &Path) -> bool {
   transcript::abort_marker_present(&disk)
 }
 
-/// Drop every abort-marker line from `text` (daemon-owned control state,
-/// not user content). The single helper behind all abort-line stripping
-/// (StreamWriter flushes, the idle abort path, `slopfile abort` cleanup).
 fn without_abort_lines(text: &str) -> String {
   let mut out = String::new();
   for l in text.split('\n') {
@@ -1398,8 +1151,6 @@ fn without_abort_lines(text: &str) -> String {
   out
 }
 
-/// Remove the abort marker line from the file (control state, not user
-/// text) and leave everything else untouched.
 fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
   let (body, live) = strip_live_line(text);
   let mut out = without_abort_lines(&body);

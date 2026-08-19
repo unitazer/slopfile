@@ -33,16 +33,9 @@ services:
       dockerfile: docker/Dockerfile.slopfile
     container_name: clanker-slopfile
     user: "1000:1000"
-    # Allow the daemon to `docker restart clanker-llama` when an abort
-    # interrupts a live stream (llama.cpp cannot cancel a running
-    # generation any other way). group_add uses the host docker group's
-    # gid so the unprivileged user can talk to the socket.
     group_add:
       - "${DOCKER_GID:-998}"
     volumes:
-      # The model sees only the workspace (its tool-call root) and the shared
-      # runtime volume. The slopfile repo/source is deliberately NOT mounted
-      # here, so the agent can't reach it.
       - ../workspace:/workspace
       - ../shared:/shared
       - /var/run/docker.sock:/var/run/docker.sock

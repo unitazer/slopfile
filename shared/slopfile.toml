@@ -1,16 +1,9 @@
 confirmations = "ask"
 api_base = "http://127.0.0.1:8080"
-# Container-visible paths (docker-compose mounts ../workspace -> /workspace
-# and ../shared -> /shared). The daemon overrides these with the
-# SLOPFILE_* env vars; the host CLI (`init`) reads them to emit the system
-# prompt, so they must match what the model's tools actually see.
 workdir = "/workspace"
 transcripts_dir = "/shared/transcripts"
 sweep_interval_ms = 250
 model = "qwen3.8-27b"
 tool_timeout_ms = 30000
-# Restart the llama-server container when an abort interrupts a live
-# stream. llama.cpp cannot cancel an in-flight generation, so this is the
-# only way to stop the orphaned completion from pinning the CPU.
 abort_restart_server = true
 llama_container = "clanker-llama"

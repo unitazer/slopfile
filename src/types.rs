@@ -1,13 +1,7 @@
-//! Shared types: OpenAI-compatible wire messages, tool definitions, SSE deltas.
-//!
-//! These types are the contract between modules (`api`, `agent`, `transcript`,
-//! `tools`). Keep them lean and OpenAI-shaped (that's what llama-server speaks
-//! and what LLMs expect).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// ── Roles ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,22 +12,12 @@ pub enum Role {
   Tool,
 }
 
-// ── Tool calls ──────────────────────────────────────────────────────────
 
-/// A tool call issued by the assistant.
-///
-/// Kept in OpenAI wire shape: `{"id", "type", "function": {"name",
-/// "arguments"}}`. The struct fields stay flat internally; custom
-/// (De)serialize maps to the nested shape llama-server expects.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
-  /// Server-assigned id, e.g. "2p4IMWaD5dEwtO0iFX36MTxBj5cYNF1".
   pub id: String,
-  /// Wire-required discriminator; always "function".
   pub type_: String,
   pub name: String,
-  /// Raw JSON string of the arguments object (never pre-parsed to Value
-  /// because re-serializing must round-trip byte-exactly).
   pub arguments: String,
 }
 
@@ -107,20 +91,16 @@ pub struct FunctionDefinition {
   pub parameters: Value,
 }
 
-// ── Chat messages ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
   pub role: Role,
-  /// Text content.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub content: Option<String>,
-  /// Assistant messages only: reasoning content (thinking).
   #[serde(skip_serializing_if = "Option::is_none")]
   pub reasoning_content: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub tool_calls: Option<Vec<ToolCall>>,
-  /// Tool messages only: which tool call this answers.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub tool_call_id: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,9 +157,7 @@ impl ChatMessage {
   }
 }
 
-// ── SSE delta stream ────────────────────────────────────────────────────
 
-/// One streamed chunk from `/v1/chat/completions`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SseChunk {
   #[serde(default)]
@@ -200,7 +178,6 @@ pub struct SseChoice {
 pub struct SseDelta {
   #[serde(default)]
   pub content: Option<String>,
-  /// Qwen3 extended-thinking channel (llama-server exposes it).
   #[serde(default)]
   pub reasoning_content: Option<String>,
   #[serde(default)]
@@ -224,7 +201,7 @@ pub struct SseFunctionDelta {
   #[serde(default)]
   pub name: Option<String>,
   #[serde(default)]
-  pub arguments: Option<String>, // incremental fragments
+  pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
@@ -235,7 +212,6 @@ pub struct Usage {
   pub completion_tokens: u32,
 }
 
-// ── Aggregated stream result (what the agent loop consumes) ─────────────
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamResult {
@@ -244,34 +220,24 @@ pub struct StreamResult {
   pub tool_calls: Vec<ToolCall>,
   pub finish_reason: Option<String>,
   pub usage: Option<Usage>,
-  /// Set when the consumer asked the stream to stop early (abort).
   pub aborted: bool,
 }
 
-/// Union of everything a turn encounter can be, used by the agent loop to
-/// decide next steps (more text vs. execute tool vs. done).
-///
-/// `ToolCallFragment`/`Done` payloads are emitted as a preview while the
-/// full data is also returned from `chat_stream`; the loop reads the
-/// returned copy, so the preview payloads are intentionally untouched.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
   Text(String),
   Reasoning(String),
-  /// Preview-only: the agent loop reads the returned `StreamResult`
-  /// instead, so the payload is intentionally never consumed here.
   #[allow(dead_code)]
   ToolCallFragment(SseToolCallDelta),
   #[allow(dead_code)]
   Done(StreamResult),
 }
 
-// ── App config (docker/shared/slopfile.toml) ─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
   #[serde(default = "default_confirmations")]
-  pub confirmations: String, // "ask" | "yolo"
+  pub confirmations: String,
   #[serde(default = "default_api_base")]
   pub api_base: String,
   #[serde(default = "default_workdir")]
@@ -286,16 +252,8 @@ pub struct AppConfig {
   pub tool_timeout_ms: u64,
   #[serde(default = "default_max_context")]
   pub max_context_tokens: u32,
-  /// When a user abort interrupts a live stream, restart this llama-server
-  /// container via the docker socket. llama.cpp has no cancel endpoint and
-  /// does not reliably stop generation on client disconnect, so the
-  /// abandoned completion would otherwise keep burning CPU/GPU (bounded
-  /// only by its max_tokens). Restarting frees the hardware instantly and
-  /// clears the slot for the next turn.
   #[serde(default = "default_abort_restart_server")]
   pub abort_restart_server: bool,
-  /// Docker container name of the inference server (compose service
-  /// `llama-server` → `clanker-llama`).
   #[serde(default = "default_llama_container")]
   pub llama_container: String,
 }
@@ -357,20 +315,13 @@ impl AppConfig {
   }
 }
 
-// ── Per-session header config (first ```toml fence in the file) ─────────
 
-/// Mirrors AppConfig fields; `None` = fall back to AppConfig. This is what
-/// lives in the file header and overrides app settings per session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionConfig {
   #[serde(default)]
   pub model: Option<String>,
-  /// "auto" | "on" | "off". Informational only: llama-server decides
-  /// whether to emit reasoning; parsing it keeps the header faithful.
   #[serde(default)]
   pub thinking: Option<String>,
-  /// Per-session tool-call timeout; overrides the app-wide
-  /// `AppConfig::tool_timeout_ms` when set.
   #[serde(default)]
   pub tool_timeout_ms: Option<u64>,
   #[serde(default)]
@@ -379,15 +330,11 @@ pub struct SessionConfig {
   pub max_context_tokens: Option<u32>,
 }
 
-// ── Tool results ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
   pub ok: bool,
-  /// Text given back to the model (stdout, file contents, error message…).
   pub output: String,
-  /// Extra diagnostics for the status line / user (not shown to the model
-  /// if it duplicates `output`).
   #[serde(default)]
   pub meta: Value,
 }
@@ -409,14 +356,9 @@ impl ToolResult {
   }
 }
 
-// ── Live status line (rewritten at daemon turn boundaries at file bottom) ─
 
-/// JSON payload of the `<!-- slopfile:live {...} -->` status line. Only
-/// `idle` and `waiting_answer` phases are currently emitted (the phase is
-/// set when the daemon releases the file); the streamed view is the file
-/// itself.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LiveStatus {
-  pub phase: String, // idle | waiting_answer
+  pub phase: String,
   pub model: String,
 }

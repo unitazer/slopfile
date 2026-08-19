@@ -1,8 +1,3 @@
-//! Minimal SSE (Server-Sent Events) parser over a byte stream.
-//!
-//! Consumes `data: {json}` lines from `futures_core::Stream<Item =
-//! Result<bytes::Bytes, reqwest::Error>>` and yields parsed
-//! `crate::types::SseChunk` values. `data: [DONE]` terminates the stream.
 
 use crate::types::SseChunk;
 use bytes::Bytes;
@@ -64,7 +59,6 @@ where
                     return Poll::Ready(Some(Ok(chunk)));
                 }
                 Ok(None) => {
-                    // Need more bytes.
                     match self.stream.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(bytes))) => {
                             if !bytes.is_empty() {
@@ -96,9 +90,6 @@ where
     }
 }
 
-/// Try to parse one event from the buffer. Returns `(chunk, done)` where
-/// `done` is true when `data: [DONE]` ended the stream. `Ok(None)` means the
-/// buffer holds no complete event (caller should fetch more bytes).
 fn take_next_event(buf: &mut Vec<u8>) -> Result<Option<(SseChunk, bool)>, SseError> {
     loop {
         let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
@@ -108,7 +99,6 @@ fn take_next_event(buf: &mut Vec<u8>) -> Result<Option<(SseChunk, bool)>, SseErr
         let line = String::from_utf8_lossy(&line_bytes);
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() || line.starts_with(':') || !line.starts_with("data:") {
-            // Empty keepalive, comment, or non-data field — skip.
             continue;
         }
         let payload = line[5..].trim_start();
@@ -132,7 +122,6 @@ fn take_next_event(buf: &mut Vec<u8>) -> Result<Option<(SseChunk, bool)>, SseErr
     }
 }
 
-/// Wrap any byte stream into an SSE chunk stream.
 pub fn stream_chunks<S>(stream: S) -> SseStream<S>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>>,

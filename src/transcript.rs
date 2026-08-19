@@ -1,16 +1,3 @@
-//! Transcript parsing: the session `.md` file is the entire UI, and its
-//! grammar is defined once in `lex.rs`. The parser here consumes the lexer's
-//! token stream — no text is re-scanned with string searches.
-//!
-//! Three regions:
-//! - HEADER: the FIRST ```` ```toml ```` fenced block in the file (session
-//!   settings; stripped from LLM context).
-//! - MIDDLE: system prompt (first text after header) + `### You` /
-//!   `### Assistant` history with thinking + tool blocks and `@done` anchors.
-//! - TAIL: everything below the last `@done` — user drafts and QUESTIONS
-//!   blocks; the daemon-owned status line is excluded.
-//!
-//! All parse paths are pure: they never mutate the file.
 
 use crate::lex::{lex, lex_line, Token, TokKind};
 use crate::questions::QuestionsBlock;
@@ -18,23 +5,14 @@ use crate::types::{ChatMessage, Role, SessionConfig, ToolCall};
 
 pub use crate::lex::ABORT_MARKER;
 
-/// True when `text` contains an abort request (an `Abort` token: the marker
-/// on its own line, or glued after the status line). Prose that merely
-/// mentions the marker is `Text` and can never match.
 pub fn abort_marker_present(text: &str) -> bool {
   lex(text).iter().any(|t| t.kind == TokKind::Abort)
 }
 
-/// True for a single line that IS the abort marker.
 pub fn is_abort_line(line: &str) -> bool {
   lex_line(line) == TokKind::Abort
 }
 
-/// Remove ALL daemon status lines: drop every `Live` token. Returns the
-/// body and, if any status line was removed, the LAST removed one as its
-/// original byte offset in `text` plus its text. The single source of truth
-/// for live-line handling — the daemon, the parser and the QoL commands
-/// all go through here.
 pub fn strip_live_line(text: &str) -> (String, Option<(usize, String)>) {
   let toks = lex(text);
   let mut last = None;
@@ -45,8 +23,6 @@ pub fn strip_live_line(text: &str) -> (String, Option<(usize, String)>) {
       continue;
     }
     body.push_str(tok.text);
-    // Keep each line's original ending so CRLF files stay CRLF after a
-    // daemon write (a naive `push('\n')` rejoin would normalize them).
     if tok.eol_len >= 2 {
       body.push_str("\r\n");
     } else {
@@ -70,16 +46,10 @@ pub fn strip_live_line(text: &str) -> (String, Option<(usize, String)>) {
   (body, last)
 }
 
-// ── Parsed output ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct DanglingTail {
-  /// Byte offset of the END of the dangling `### Assistant` heading line:
-  /// the file resumes streaming right after it (the heading itself stays
-  /// put; the partial text below it is dropped and re-asked).
   pub resume_offset: usize,
-  /// The partial text of the incomplete assistant turn (below the heading,
-  /// excluding daemon-owned status lines).
   pub partial_text: String,
 }
 
@@ -87,16 +57,12 @@ pub struct DanglingTail {
 pub struct ParsedFile {
   pub config: SessionConfig,
   pub history: Vec<ChatMessage>,
-  /// Everything below the last `@done` marker (user drafts, QUESTIONS
-  /// blocks). Excludes the daemon status line.
   pub tail: String,
   pub pending_questions: Vec<QuestionsBlock>,
   pub dangling: Option<DanglingTail>,
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Deterministic tool-call id from name+arguments (contract: first 16 hex).
 fn tool_call_id(name: &str, arguments: &str) -> String {
   fn fnv1a64(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -109,7 +75,6 @@ fn tool_call_id(name: &str, arguments: &str) -> String {
   format!("{:016x}", fnv1a64(&format!("{name}{arguments}")))
 }
 
-/// Parse the header config: the FIRST ```` ```toml ```` block only.
 pub fn header_config(text: &str) -> SessionConfig {
   let toks = lex(text);
   let Some(open) = toks.iter().find(|t| t.kind == TokKind::FenceOpen && t.payload == "toml") else {
@@ -129,15 +94,10 @@ pub fn header_config(text: &str) -> SessionConfig {
   toml::from_str(&body).unwrap_or_default()
 }
 
-/// Byte offset of the LAST turn-boundary marker line (`@done`, or the
-/// abort-completion marker). None if absent.
 pub fn find_done_marker(text: &str) -> Option<usize> {
   lex(text).iter().rfind(|t| t.kind.is_turn_end()).map(|t| t.offset)
 }
 
-/// Byte offset just past the LAST turn-boundary marker line's text (the
-/// `@done`-line onward), i.e. where the below-boundary tail begins. None
-/// when no turn has completed.
 pub fn turn_end_tail_start(text: &str) -> Option<usize> {
   lex(text)
     .iter()
@@ -145,9 +105,7 @@ pub fn turn_end_tail_start(text: &str) -> Option<usize> {
     .map(|t| t.offset + t.text.len())
 }
 
-// ── Message building ────────────────────────────────────────────────────
 
-/// Conversation-state machine over the token stream.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
   System,
@@ -156,11 +114,6 @@ enum Mode {
   ToolOutput,
 }
 
-/// Accumulate conversation messages from the tokens strictly above
-/// `stop_above` (token.line < stop_above). Mirrors the transcript grammar:
-/// section headings switch mode, thinking/tool/result markers are
-/// structural, everything else (including `@done` and code fences) is
-/// message text. Daemon-owned lines are never content.
 fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) -> Vec<ChatMessage> {
   let mut history = Vec::new();
   let mut mode = initial_mode;
@@ -169,10 +122,8 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
   let mut asst_reasoning = String::new();
   let mut in_thinking = false;
   let mut tool_calls: Vec<ToolCall> = Vec::new();
-  // (name, args_json, output_text)
   let mut tool_result: Option<(String, String, String)> = None;
 
-  // Finalize the current tool block (assistant + tool messages).
   fn emit_tool(
     history: &mut Vec<ChatMessage>,
     asst_text: &mut String,
@@ -184,8 +135,6 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
     let id = tool_call_id(&name, &args);
     let mut calls = std::mem::take(tool_calls);
     calls.push(ToolCall::new(id.clone(), name.clone(), args));
-    // Assistant message carrying the call (with whatever text/reasoning
-    // preceded it inside this section).
     history.push(ChatMessage {
       role: Role::Assistant,
       content: (!asst_text.trim().is_empty()).then(|| std::mem::take(asst_text)),
@@ -198,7 +147,6 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
     history.push(ChatMessage::tool(id, name, output));
   }
 
-  // Finalize the current assistant plain message (or with accumulated calls).
   fn emit_assistant(
     history: &mut Vec<ChatMessage>,
     asst_text: &mut String,
@@ -222,16 +170,11 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
   }
 
   for tok in tokens.iter().take_while(|t| t.line < stop_above) {
-    // Section transitions only on the EXACT level-3 headings. `## You`,
-    // `# Assistant`, `#### You` ... in user drafts and assistant prose are
-    // ordinary text and must never flip sections.
     let is_you = tok.kind == TokKind::Heading && tok.text.trim() == "### You";
     let is_asst = tok.kind == TokKind::Heading && tok.text.trim() == "### Assistant";
 
     match tok.kind {
-      // Daemon-owned control lines never reach messages.
       k if k.is_daemon_owned() => continue,
-      // Section transitions (only outside a tool block).
       TokKind::Heading if is_you && tool_result.is_none() => {
         if mode != Mode::System
           && (!asst_text.is_empty() || !asst_reasoning.is_empty() || !tool_calls.is_empty())
@@ -252,18 +195,12 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
         }
         mode = Mode::Asst;
       }
-      // Thinking markers toggle accumulation only inside assistant prose
-      // outside a tool block; pasted markers in user sections or inside a
-      // tool block are ordinary text.
       TokKind::ThinkingOpen if mode == Mode::Asst && tool_result.is_none() => {
         in_thinking = true;
       }
       TokKind::ThinkingEnd if mode == Mode::Asst && tool_result.is_none() => {
         in_thinking = false;
       }
-      // Tool round: open on `<!-- tool:`, close on `<!-- result:` for the
-      // SAME tool name. While a block is open all lines accumulate as the
-      // tool's output, including mismatched `<!-- result:... -->` lines.
       TokKind::Tool if tool_result.is_none() => {
         let (name, args) = tok.name_args();
         tool_result = Some((name.to_string(), args.to_string(), String::new()));
@@ -277,7 +214,6 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
         mode = Mode::Asst;
       }
       _ if tool_result.is_some() => {
-        // Inside an open tool block: raw output text.
         if let Some((_, _, out)) = tool_result.as_mut() {
           out.push_str(tok.text);
           out.push('\n');
@@ -303,13 +239,10 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
     }
   }
 
-  // Flush trailing state.
   if mode == Mode::You && !user_buf.trim().is_empty() {
     history.push(ChatMessage::user(user_buf.trim()));
   }
   if tool_result.is_some() {
-    // Unterminated tool block (resume point): emit as assistant tool call
-    // with the partial output as the result.
     emit_tool(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls, &mut tool_result);
   } else {
     emit_assistant(&mut history, &mut asst_text, &mut asst_reasoning, &mut tool_calls);
@@ -317,29 +250,19 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) ->
   history
 }
 
-/// Parse the below-`@done` region into conversation messages (drafts,
-/// in-flight turns, tool blocks). The daemon appends these to the history
-/// when building the next request so mid-turn state survives re-parses.
 pub fn tail_sections(tail: &str) -> Vec<ChatMessage> {
   build_history(&lex(tail), usize::MAX, Mode::System)
 }
 
-/// Parse a dangling partial `### Assistant` section (output interrupted
-/// mid-stream, no `@done`) into assistant messages. Replaying the partial as
-/// the model's own prior turn lets it continue exactly where it stopped —
-/// without labelling it "interrupted" or injecting any notice.
 pub fn assistant_section_messages(raw: &str) -> Vec<ChatMessage> {
   build_history(&lex(raw), usize::MAX, Mode::Asst)
 }
 
-// ── Main parse ──────────────────────────────────────────────────────────
 
 pub fn parse_file(text: &str) -> ParsedFile {
   let toks = lex(text);
   let n_lines = text.lines().count();
 
-  // ── Region boundaries (token positions) ──
-  // Header: first ```toml ... ``` block.
   let header_close_line = toks
     .iter()
     .find(|t| t.kind == TokKind::FenceOpen && t.payload == "toml")
@@ -352,7 +275,6 @@ pub fn parse_file(text: &str) -> ParsedFile {
     })
     .map(|close_line| close_line + 1);
 
-  // Section starts: only exact `### You` / `### Assistant` headings.
   let mut you_lines: Vec<usize> = Vec::new();
   let mut asst_lines: Vec<usize> = Vec::new();
   for tok in &toks {
@@ -369,14 +291,11 @@ pub fn parse_file(text: &str) -> ParsedFile {
     .or_else(|| asst_lines.first().copied())
     .unwrap_or(n_lines);
 
-  // ── System prompt ──
   let mut history: Vec<ChatMessage> = Vec::new();
   let system_raw_start = header_close_line.unwrap_or(0).min(first_section);
   if system_raw_start < first_section {
     let mut system_prompt = String::new();
     for tok in toks.iter().filter(|t| t.line >= system_raw_start && t.line < first_section) {
-      // Fence lines stay out; comment- and heading-style lines are not
-      // prompt text.
       if matches!(tok.kind, TokKind::FenceOpen | TokKind::FenceClose | TokKind::Heading) {
         continue;
       }
@@ -392,14 +311,6 @@ pub fn parse_file(text: &str) -> ParsedFile {
     }
   }
 
-  // ── History up to the last @done ──
-  //
-  // History stops right after the last `@done` line. Everything below it
-  // (drafts, in-flight turns, tool rounds) is the TAIL: the daemon appends
-  // it EXACTLY ONCE to the request via `tail_sections`, so it must not be
-  // duplicated here (a status line below `@done` used to pull the tail
-  // region into history as well, doubling every promoted draft and tool
-  // round in the prompt).
   let last_done_line = toks
     .iter()
     .rfind(|t| t.kind.is_turn_end())
@@ -412,13 +323,6 @@ pub fn parse_file(text: &str) -> ParsedFile {
   };
   history.extend(build_history(&toks, history_end, Mode::System));
 
-  // ── Dangling detection ──
-  //
-  // An assistant section is "dangling" (interrupted output) only when it
-  // has no `@done` below it, no `### You` after it, and its tool blocks
-  // are not all closed (`<!-- result:` for every `<!-- tool:`). A closed
-  // tool round is complete history — the daemon continues the turn without
-  // cutting it away.
   let dangling = asst_lines.last().and_then(|&last_asst| {
     let after_ix = toks
       .iter()
@@ -435,8 +339,6 @@ pub fn parse_file(text: &str) -> ParsedFile {
       .find(|t| t.line > last_asst && t.kind == TokKind::Live)
       .map(|t| t.offset)
       .unwrap_or(text.len());
-    // The section runs to the first daemon status line (or EOF): the live
-    // line is daemon-owned and must never leak into the replayed section.
     let section = &text[after_ix..section_end];
     let tools = toks
       .iter()
@@ -447,7 +349,6 @@ pub fn parse_file(text: &str) -> ParsedFile {
       .filter(|t| t.kind == TokKind::Result && t.line > last_asst)
       .count();
     if tools > results || (tools == 0 && !section.trim().is_empty()) {
-      // Heading token (the raw `### Assistant` line) sits at after_ix.
       let heading = toks.iter().find(|t| t.line == last_asst)?;
       Some(DanglingTail {
         resume_offset: heading.line_end(),
@@ -458,21 +359,17 @@ pub fn parse_file(text: &str) -> ParsedFile {
     }
   });
 
-  // ── Tail ──
   let tail = match last_done_line {
     Some(d) => {
       let start = toks
         .iter()
         .find(|t| t.line == d)
-        // `text` is the marker's own raw text, so this lands exactly after
-        // it for BOTH a short `@done` and a longer abort marker.
         .map(|t| t.offset + t.text.len())
         .unwrap_or(text.len());
       &text[start..]
     }
     None => text,
   };
-  // A trailing status line is daemon-owned: never part of the tail.
   let tail = match lex(tail).iter().last() {
     Some(t) if t.kind == TokKind::Live => &tail[..t.offset.saturating_sub(1)],
     _ => tail,
@@ -541,7 +438,6 @@ Here is the listing.
       Some(["read".to_string(), "bash".to_string()].as_slice())
     );
 
-    // A later ```toml fence in assistant text must NOT be parsed.
     let txt2 = format!(
       "{}\n### Assistant\n```toml\nmodel = \"hacked\"\n```\nThis is code.\n",
       sample()
@@ -588,7 +484,6 @@ Here is the listing.
 
     let tool_msg = pf.history.iter().find(|m| m.role == Role::Tool).expect("tool msg");
     assert!(tool_msg.content.as_deref().unwrap().contains("src/"));
-    // Tool message references the same id.
     assert_eq!(
       asst_with_call.tool_calls.as_ref().unwrap()[0].id,
       tool_msg.tool_call_id.as_deref().unwrap()
@@ -612,8 +507,6 @@ Here is the listing.
 
   #[test]
   fn dangling_partial_replays_as_assistant_messages() {
-    // The partial is replayed as the model's own prior turn, never wrapped
-    // in a hint that tells it the output was interrupted.
     let partial = "<!-- thinking -->\nlet me think about this\n<!-- /thinking -->\nContinue the work.\n";
     let msgs = assistant_section_messages(partial);
     assert_eq!(msgs.len(), 1);
@@ -647,7 +540,6 @@ Here is the listing.
     let pf = parse_file(&txt);
     assert!(!pf.tail.contains("slopfile:live"));
     assert!(!pf.tail.contains("{\"phase\":\"idle\"}"));
-    // The status line must never leak into history as an assistant turn.
     assert!(!pf
       .history
       .iter()
@@ -656,10 +548,6 @@ Here is the listing.
 
   #[test]
   fn aborted_marker_bounds_the_turn_like_done() {
-    // A turn the user aborted ends with the abort-completion marker instead
-    // of `@done`. It must bound history/tail exactly like `@done`, but stay
-    // VISIBLE in the file (it is not stripped), so the user can tell the
-    // reply was cut short.
     let txt = r#"```toml
 model = "qwen3.8-27b"
 ```
@@ -684,14 +572,10 @@ partial reply cut off mid
 "#;
 
     let pf = parse_file(txt);
-    // Sealed: no dangling resume, tail empty (no draft), and the aborted
-    // marker stays in the raw file text.
     assert!(pf.dangling.is_none(), "aborted turn must not be resumable");
     assert!(pf.tail.trim().is_empty(), "no tail below aborted turn");
     assert!(find_done_marker(txt).is_some(), "aborted marker bounds history");
     assert!(txt.contains("<!-- slopfile:aborted -->"), "marker stays visible");
-    // History stops at the aborted marker: the partial assistant reply is
-    // history, the marker itself never becomes message content.
     let last = pf.history.last().unwrap();
     assert_eq!(last.role, Role::Assistant);
     assert!(!pf
@@ -706,8 +590,6 @@ partial reply cut off mid
 
   #[test]
   fn status_line_after_closed_tool_block_is_not_history() {
-    // No @done: history ends with a closed tool round, then the daemon
-    // status line. The status line must NOT become a trailing Assistant.
     let txt = "\
 ```toml
 model = \"qwen3.8-27b\"
@@ -773,7 +655,6 @@ answers json
     let mut txt = sample();
     txt.push_str("### Assistant\n<!-- tool:bash {\"cmd\":\"sleep\"} -->\n");
     let pf = parse_file(&txt);
-    // The tool call is emitted even without a result marker.
     assert!(pf.history.iter().any(|m| m.tool_calls.is_some()));
   }
 
@@ -790,15 +671,11 @@ answers json
     let pf = parse_file(&txt);
     assert_eq!(pf.pending_questions.len(), 1);
     assert_eq!(pf.pending_questions[0].questions[0].question, "red or blue");
-    // The block stays in the tail text too.
     assert!(pf.tail.contains("QUESTIONS"));
   }
 
   #[test]
   fn markers_inside_closed_fence_are_not_structural() {
-    // A fence may not contain section headings / `@done` (those are
-    // structural boundaries), but tool markers inside a closed fence are
-    // plain text and must not open a tool block.
     let txt = "\
 ### Assistant
 ```md
@@ -930,8 +807,6 @@ done
 
   #[test]
   fn unclosed_fence_below_next_turn_is_not_retroactive() {
-    // An unclosed fence in one turn must not swallow the `@done` and the
-    // next turn's `### You` section.
     let txt = "\
 ### Assistant
 ```json

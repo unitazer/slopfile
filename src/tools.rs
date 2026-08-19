@@ -1,6 +1,3 @@
-//! The 7 file tools (read, write, edit, bash, grep, find, ls) plus the special
-//! `question` tool: OpenAI-style tool definitions plus the executor that the
-//! agent loop calls with raw JSON arguments.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -10,14 +7,10 @@ use serde_json::{Value, json};
 
 use crate::types::{FunctionDefinition, ToolDefinition, ToolResult};
 
-/// Anything above this many characters in bash output gets truncated with a
-/// "… [truncated N chars]" marker.
 const BASH_OUTPUT_CAP: usize = 30_000;
 const GREP_MATCH_CAP: usize = 500;
 const FIND_FILE_CAP: usize = 2_000;
 
-/// All tool definitions in the order the model sees (question is handled by
-/// the agent loop, but the model must know it exists).
 pub fn definitions() -> Vec<ToolDefinition> {
   vec![
     tool_def(
@@ -144,9 +137,6 @@ fn tool_def(name: &str, description: &str, parameters: Value) -> ToolDefinition 
   }
 }
 
-/// Execute one tool call. `arguments_json` is the raw JSON arguments object
-/// from the model. Paths resolve relative to `workdir` and can never escape
-/// it. `timeout_ms` bounds bash invocations.
 pub async fn run(
   name: &str,
   arguments_json: &str,
@@ -170,7 +160,6 @@ pub async fn run(
   }
 }
 
-// ── Individual tools ────────────────────────────────────────────────────
 
 fn read(workdir: &Path, args: &Value) -> ToolResult {
   let Some(path_str) = args.get("path").and_then(Value::as_str) else {
@@ -186,8 +175,6 @@ fn read(workdir: &Path, args: &Value) -> ToolResult {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("read: cannot read {path_str}: {e}")),
   };
-  // Refuse to expose session transcripts / daemon-owned files. Any slopfile
-  // runtime artifact (transcript, status line) carries this marker.
   if content.contains("<!-- slopfile") {
     return ToolResult::err("read: refusing to read a slopfile transcript or daemon-owned file");
   }
@@ -298,12 +285,8 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
   .await;
   match outcome {
     Err(_) => {
-      // Group id == child pid (process_group(0)); capture it BEFORE the kill
-      // — tokio reaps the child and `id()` returns None after `kill()`.
       let group_id = child.id();
       let _ = child.kill().await;
-      // `sh -c 'sleep 1000 &'` backgrounds children into the same process
-      // group; kill the whole group (negative pid), best effort.
       if let Some(id) = group_id {
         let _ = std::process::Command::new("kill")
           .args(["-9", &format!("-{id}")])
@@ -459,13 +442,7 @@ fn ls(workdir: &Path, args: &Value) -> ToolResult {
   ToolResult::ok(out)
 }
 
-// ── Path safety ─────────────────────────────────────────────────────────
 
-/// Resolve `p` (workdir-relative or absolute) to a canonical path, rejecting
-/// anything that ends up outside `workdir`. For paths that do not exist yet
-/// (e.g. a write target), the deepest existing ancestor is canonicalized and
-/// the missing tail is appended. Never panics; errors carry a readable
-/// message.
 fn resolve_in(workdir: &Path, p: &str) -> Result<PathBuf, String> {
   let base = std::fs::canonicalize(workdir).map_err(|e| format!("workdir does not exist: {e}"))?;
   let target = if Path::new(p).is_absolute() {
@@ -501,12 +478,7 @@ fn resolve_in(workdir: &Path, p: &str) -> Result<PathBuf, String> {
   }
 }
 
-// ── Filesystem walking ──────────────────────────────────────────────────
 
-/// Recursively list every regular file under `root`, returning `(rel, abs)`
-/// pairs where `rel` is the path relative to `workdir` (for display). Hidden
-/// directories (`.git`, …) and `target/` are skipped. Entries are visited in
-/// sorted order per directory, breadth-first, so output is deterministic.
 fn walk_files(workdir: &Path, root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
   let mut files = Vec::new();
   if root.is_file() {
@@ -577,7 +549,6 @@ fn truncate(s: &str) -> String {
   out
 }
 
-/// Read an async pipe to the end, lossy-converted to a String.
 async fn read_into(mut pipe: impl tokio::io::AsyncRead + Unpin) -> String {
   use tokio::io::AsyncReadExt;
   let mut buf = Vec::new();
@@ -585,7 +556,6 @@ async fn read_into(mut pipe: impl tokio::io::AsyncRead + Unpin) -> String {
   String::from_utf8_lossy(&buf).into_owned()
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -595,8 +565,6 @@ mod tests {
 
   use super::*;
 
-  /// Fresh empty scratch dir under the system temp dir, unique per tag.
-  /// No tempfile dependency: clean up by removing any previous run's dir.
   fn test_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("slopfile-tools-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -893,8 +861,6 @@ mod tests {
       .trim()
       .parse()
       .expect("pid is a number");
-    // The whole process group (incl. backgrounded grandchildren) must be
-    // gone: `kill -0` fails once the process no longer exists.
     for _ in 0..10 {
       let alive = std::process::Command::new("kill")
         .args(["-0", &bg_pid.to_string()])
