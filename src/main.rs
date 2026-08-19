@@ -13,7 +13,7 @@ mod types;
 
 use api::LlamaClient;
 use clap::{Parser, Subcommand};
-use lex::{lex, lex_line, DONE_MARKER, TokKind};
+use lex::{lex, lex_line, ABORTED_MARKER, DONE_MARKER, TokKind};
 use questions::parse_answers;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -277,9 +277,8 @@ fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
 /// comment lines stripped).
 fn section_below_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
-  let toks = lex(&body);
-  let done = toks.iter().rfind(|t| t.kind == TokKind::Done)?;
-  let tail = &body[done.offset + lex::DONE_MARKER.len()..];
+  let done_ix = transcript::turn_end_tail_start(&body)?;
+  let tail = &body[done_ix..];
   let user_tail = lex(tail)
     .into_iter()
     .filter(|t| !t.kind.is_daemon_owned())
@@ -327,10 +326,10 @@ async fn run_generation_turn(
     None => body.clone(),
   };
 
-  // Messages: history + resume hint for dangling output + any in-flight
-  // below-@done sections (drafts promoted to `### You`). The below-@done
-  // region is appended EXACTLY ONCE here — `parse_file` history already
-  // stops at the last `@done`.
+// Messages: history + replayed dangling output as assistant context + any
+  // in-flight below-`@done` sections (drafts promoted to `### You`). The
+  // below-`@done` region is appended EXACTLY ONCE here — `parse_file` history
+  // already stops at the last `@done`.
   let (messages, _dropped, _) = build_request_messages(text, pf, cfg).await?;
 
   let context_budget = pf
@@ -366,7 +365,8 @@ async fn run_generation_turn(
 
   if result.aborted {
     // User aborted mid-stream: close the turn and stop; no tools, no @done
-    // ride-along continuation.
+    // ride-along continuation. Seal it with the dedicated ABORTED marker so
+    // the file can never masquerade as a normally-completed turn.
     active.finish_section();
     let text_now = read_file(path)?;
     let (body, live) = strip_live_line(&text_now);
@@ -374,8 +374,8 @@ async fn run_generation_turn(
     if !out.ends_with('\n') {
       out.push('\n');
     }
-    if !out.trim_end().ends_with(DONE_MARKER) {
-      out.push_str(&format!("{DONE_MARKER}\n"));
+    if !out.trim_end().ends_with(ABORTED_MARKER) {
+      out.push_str(&format!("{ABORTED_MARKER}\n"));
     }
     if let Some((_, live)) = live {
       out.push('\n');
@@ -440,6 +440,19 @@ async fn run_generation_turn(
     write_tool_blocks(path, &result.tool_calls, cfg, pf).await?;
     info!("→ {path:?}: {} tool call(s) executed", result.tool_calls.len());
     return Ok(TurnOutcome::AwaitsNextTurn);
+  }
+
+  // Interrupted stream: the request returned no terminal finish_reason (the
+  // connection dropped, a slot aborted, or the daemon was restarted
+  // mid-turn). The reply is incomplete — sealing it with `@done` would make
+  // the turn look finished, so `:Send`/`:Resume` would never re-drive it.
+  // Instead leave the last `### Assistant` section dangling: the next sweep
+  // sees it as a resume point and continues exactly where it stopped.
+  if result.finish_reason.as_deref().is_none() {
+    // The partial section was already flushed by `active.finish_section()`
+    // above (and would be re-flushed on resume); just leave it dangling.
+    info!("⚠ {path:?}: turn interrupted mid-stream (no finish_reason); left dangling for resume");
+    return Ok(TurnOutcome::Done);
   }
 
   // Plain-text completion: close the turn with `@done`.
@@ -574,6 +587,12 @@ impl<'a> StreamWriter<'a> {
     let (body, _) = strip_live_line(&self.out);
     let mut out = body;
     if self.in_reasoning {
+      // The last streamed reasoning delta may end mid-line (interrupted
+      // turn): put the closing marker on its own line so the lexer/parser
+      // always see it as a ThinkingEnd token.
+      if !out.ends_with('\n') {
+        out.push('\n');
+      }
       out.push_str("<!-- /thinking -->\n");
     }
     if !out.ends_with('\n') {
@@ -805,7 +824,8 @@ Current working directory: {}",
 // ── Conversation truncation ─────────────────────────────────────────────
 
 /// Assemble the exact request the daemon would send for this session:
-/// history + below-`@done` tail sections + a dangling-output resume hint,
+/// history + below-`@done` tail sections + a replayed dangling-output
+/// assistant turn,
 /// then drop the OLDEST turns (never from the file) so the request fits the
 /// context window. Bounded by the model's real tokenizer. Keeps the system
 /// message and cuts at a clean turn boundary.
@@ -823,13 +843,13 @@ async fn build_request_messages(
     // sections, QUESTIONS, or a dangling partial assistant ending the file.
     let (body, _live) = strip_live_line(text);
     let toks = lex(&body);
-    let done = toks.iter().rfind(|t| t.kind == TokKind::Done).expect("checked above");
-    let start = done.offset + lex::DONE_MARKER.len();
-    // The dangling partial assistant is resumed via the `[resume]` hint
-    // below — never resent here. Cut the tail at its heading so only
-    // genuine drafts above it reach `tail_sections` (the cut partial would
-    // otherwise become a reasoning-only assistant message the server
-    // rejects with 400).
+    let done = toks.iter().rfind(|t| t.kind.is_turn_end()).expect("checked above");
+    let start = done.offset + done.text.len();
+    // The dangling partial assistant is replayed verbatim below as the
+    // model's own prior turn — never resent here. Cut the tail at its
+    // heading so only genuine drafts above it reach `tail_sections` (the cut
+    // partial would otherwise become a reasoning-only assistant message the
+    // server rejects with 400).
     let end = match &pf.dangling {
       Some(d) => d.resume_offset.min(body.len()),
       None => body.len(),
@@ -852,10 +872,9 @@ async fn build_request_messages(
   if let Some(d) = &pf.dangling
     && !d.partial_text.trim().is_empty()
   {
-    messages.push(ChatMessage::user(format!(
-      "[resume] previous assistant output was interrupted; continue exactly where it stopped:\n```\n{}\n```",
-      d.partial_text.trim_end()
-    )));
+    // Replay the partial output as a genuine assistant turn so the model
+    // continues it naturally — never labelling it "interrupted".
+    messages.extend(transcript::assistant_section_messages(&d.partial_text));
   }
   let context_budget = pf.config.max_context_tokens.unwrap_or(cfg.max_context_tokens);
   let before = messages.len();
@@ -1002,7 +1021,7 @@ async fn write_tool_blocks(
   write_file(path, out)
 }
 
-/// Render a `❓ QUESTIONS` block in the tail from a `question` tool call,
+/// Render a `QUESTIONS` block in the tail from a `question` tool call,
 /// stashing the tool-call JSON so the answer can be resolved into a normal
 /// tool result later.
 fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String> {
@@ -1078,7 +1097,7 @@ fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String>
 /// always (defaults or the first option).
 ///
 /// Only the FIRST pending block gates progress: `resolve_questions` works
-/// first-to-last and re-reads the leftmost `❓ QUESTIONS` header each pass.
+/// first-to-last and re-reads the leftmost `QUESTIONS` header each pass.
 /// Scoping resolvability to that same leftmost block keeps the two in sync —
 /// if a later block were answered while an earlier one sat unanswered,
 /// `resolve_questions` would skip the leading block (never consuming it) and
@@ -1093,7 +1112,7 @@ fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
   }
 }
 
-/// The text of the leftmost QUESTIONS block in `tail`: from the `❓ QUESTIONS`
+/// The text of the leftmost QUESTIONS block in `tail`: from the `QUESTIONS`
 /// header through the end of its `<!-- call: ... -->` line.
 fn questions_block_region(tail: &str) -> Option<&str> {
   let header_ix = tail.find(questions::BLOCK_HEADER)?;
@@ -1229,9 +1248,7 @@ fn resolve_questions(
 /// (e.g. the context-full note) are skipped and stay above the section.
 fn promote_draft(path: &Path, text: &str) -> Result<(), String> {
   let (body, live) = strip_live_line(text);
-  let done_ix = transcript::find_done_marker(&body)
-    .map(|ix| ix + DONE_MARKER.len())
-    .unwrap_or(0);
+  let done_ix = transcript::turn_end_tail_start(&body).unwrap_or(0);
 
   // Byte length of the leading blank + daemon-owned comment lines.
   let rest = &body[done_ix..];
@@ -1264,8 +1281,8 @@ fn promote_draft(path: &Path, text: &str) -> Result<(), String> {
 /// there is no draft.
 fn draft_tail_after_done(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
-  let done = lex(&body).into_iter().find(|t| t.kind == TokKind::Done)?;
-  let tail = &body[done.offset + lex::DONE_MARKER.len()..];
+  let done = lex(&body).into_iter().find(|t| t.kind.is_turn_end())?;
+  let tail = &body[done.offset + done.text.len()..];
   let toks = lex(tail);
   let user_toks: Vec<_> = toks.iter().filter(|t| !t.kind.is_daemon_owned()).collect();
   // Already stays in history: the tail starts with an EXACT `### You` or

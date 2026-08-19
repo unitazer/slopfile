@@ -21,7 +21,7 @@ pub struct QuestionsBlock {
     pub raw_json: Vec<String>,
 }
 
-pub const BLOCK_HEADER: &str = "❓ QUESTIONS";
+pub const BLOCK_HEADER: &str = "QUESTIONS";
 
 /// Render the QUESTIONS block (markdown table + answer instructions).
 pub fn render_block(qs: &[Question]) -> String {
@@ -36,7 +36,7 @@ pub fn render_block(qs: &[Question]) -> String {
             .iter()
             .map(|a| a.replace('|', "\\|"))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(" # ");
         out.push_str(&format!(
             "| {} | {} | {} |\n",
             q.id,
@@ -54,7 +54,7 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
     let start = text.find(BLOCK_HEADER)?;
     let rest = &text[start..];
 
-    // The block ends at the next `❓ QUESTIONS` header (if any), so a later
+    // The block ends at the next `QUESTIONS` header (if any), so a later
     // block's stashes/rows never leak into this one.
     let mut block_end = rest.len();
     let mut offset = 0;
@@ -132,7 +132,9 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
         };
         let answers = cells
             .get(2)
-            .map(|c| c.split(',').map(|s| s.trim().to_string()).collect())
+            // Options are rendered `a # b # c` (the `#` separator keeps
+            // answers that contain commas intact).
+            .map(|c| c.split('#').map(|s| s.trim().to_string()).collect())
             .unwrap_or_default();
 
         found_header_row = true;
@@ -241,9 +243,9 @@ mod tests {
     fn render_then_parse_round_trips() {
         let block = sample_block();
         let rendered = render_block(&block.questions);
-        assert!(rendered.contains("❓ QUESTIONS"));
-        assert!(rendered.contains("| 1 | red or blue | red, blue |"));
-        assert!(rendered.contains("| 2 | how long? | 3, 5, 10 |"));
+        assert!(rendered.contains("QUESTIONS"));
+        assert!(rendered.contains("| 1 | red or blue | red # blue |"));
+        assert!(rendered.contains("| 2 | how long? | 3 # 5 # 10 |"));
         assert!(rendered.ends_with("> \n"));
 
         let reparsed = parse_block(&rendered).expect("must parse");

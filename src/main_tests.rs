@@ -130,7 +130,7 @@ fn yolo_cfg() -> AppConfig {
     resolve_questions(&path, &text, &pf, &cfg).unwrap();
 
     let after = std::fs::read_to_string(&path).unwrap();
-    assert!(!after.contains("❓ QUESTIONS"), "block removed");
+    assert!(!after.contains("QUESTIONS"), "block removed");
     assert!(!after.contains("<!-- q:"), "stashes removed");
     assert!(!after.contains("<!-- call:"), "call stash removed");
     assert!(after.contains("<!-- tool:question"), "tool block present");
@@ -167,8 +167,8 @@ fn yolo_cfg() -> AppConfig {
 
     // Block A: id 1, empty answer line (still awaiting the user).
     // Block B: id 2, answered with `> blue`.
-    let block_a = "❓ QUESTIONS\n| # | Question | Options |\n| 1 | red or blue | red, blue |\nANSWER: (numbers or text, comma separated)\n>\n";
-    let block_b = "❓ QUESTIONS\n| # | Question | Options |\n| 2 | how long? | 3, 5, 10 |\nANSWER: (numbers or text, comma separated)\n> \nblue\n";
+    let block_a = "QUESTIONS\n| # | Question | Options |\n| 1 | red or blue | red, blue |\nANSWER: (numbers or text, comma separated)\n>\n";
+    let block_b = "QUESTIONS\n| # | Question | Options |\n| 2 | how long? | 3, 5, 10 |\nANSWER: (numbers or text, comma separated)\n> \nblue\n";
     let text = format!(
       "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\n<!-- @done -->\n\n{block_a}<!-- q:1 {{\"question\":\"red or blue?\",\"answers\":[\"red\",\"blue\"]}} -->\n<!-- call:question {{\"data\":[{{\"question\":\"red or blue?\",\"answers\":[\"red\",\"blue\"]}}]}} -->\n\n{block_b}<!-- q:2 {{\"question\":\"how long?\",\"answers\":[\"3\",\"5\",\"10\"]}} -->\n<!-- call:question {{\"data\":[{{\"question\":\"how long?\",\"answers\":[\"3\",\"5\",\"10\"]}}]}} -->\n"
     );
@@ -185,7 +185,7 @@ fn yolo_cfg() -> AppConfig {
     // Must not resolve the later answered block out of order nor livelock.
     resolve_questions(&path, &text, &pf, &cfg).unwrap();
     let after = std::fs::read_to_string(&path).unwrap();
-    assert!(after.contains("❓ QUESTIONS"), "block A stays pending");
+    assert!(after.contains("QUESTIONS"), "block A stays pending");
     assert!(after.contains("\nblue\n"), "block B answer not consumed");
     assert!(!after.contains("<!-- tool:question"), "no block resolved");
     std::fs::remove_dir_all(&dir).ok();
@@ -205,7 +205,7 @@ fn yolo_cfg() -> AppConfig {
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(!after.contains("slopfile:abort"));
     assert!(after.contains("### You"));
-    assert!(after.contains("❓ QUESTIONS"), "user block untouched");
+    assert!(after.contains("QUESTIONS"), "user block untouched");
     std::fs::remove_dir_all(&dir).ok();
   }
 
@@ -329,7 +329,7 @@ Let me read a file.
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(after.contains("<!-- tool:question"), "resolved to tool block");
     assert!(!after.contains("/skip"), "command line removed");
-    assert!(!after.contains("❓ QUESTIONS"), "block removed");
+    assert!(!after.contains("QUESTIONS"), "block removed");
     let pf2 = transcript::parse_file(&after);
     assert_eq!(pf2.history.last().map(|m| m.role), Some(Role::Tool));
     std::fs::remove_dir_all(&dir).ok();

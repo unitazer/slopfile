@@ -59,7 +59,7 @@ anything below the last <!-- @done --> is the TAIL: type your next request here
 - **Middle** — what the LLM actually sees: system prompt, `### You` turns,
   `### Assistant` output with inline tool blocks.
 - **Tail** — everything below the last `<!-- @done -->`: your drafts, pending
-  `❓ QUESTIONS` blocks, and a daemon-owned status line
+  `QUESTIONS` blocks, and a daemon-owned status line
   (`<!-- slopfile:live {...} -->`) at the very bottom.
 
 The request context sent to the model is **the middle region only** — header,
@@ -74,7 +74,7 @@ tail, comments, status line, and stashed tool JSON are stripped.
    blocks, then the next turn continues.
 4. On clean completion the daemon appends `<!-- @done -->`.
 5. If the model calls the `question` tool, the daemon stops and renders a
-   `❓ QUESTIONS` table in the tail. Answer below the `>` line (e.g. `2`, comma
+   `QUESTIONS` table in the tail. Answer below the `>` line (e.g. `2`, comma
    separated, or free text) and `:Send` again; or ` /skip` for
    defaults/empty. In `confirmations = "yolo"` mode they auto-resolve.
 

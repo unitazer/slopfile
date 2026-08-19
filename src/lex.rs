@@ -18,6 +18,11 @@
 pub const DONE_MARKER: &str = "<!-- @done -->";
 /// `<!-- slopfile:abort -->`: user abort request (control, never content).
 pub const ABORT_MARKER: &str = "<!-- slopfile:abort -->";
+/// `<!-- slopfile:aborted -->`: a turn the daemon sealed because the user
+/// aborted mid-stream. Like `@done` it bounds history, but unlike the abort
+/// REQUEST marker it stays in the file so the user can see the turn was cut
+/// short.
+pub const ABORTED_MARKER: &str = "<!-- slopfile:aborted -->";
 pub const THINK_START: &str = "<!-- thinking -->";
 pub const THINK_END: &str = "<!-- /thinking -->";
 /// Prefix of the daemon's context-full note.
@@ -53,6 +58,8 @@ pub enum TokKind {
   /// `<!-- slopfile:abort -->` as a standalone line, or glued after the
   /// status line.
   Abort,
+  /// `<!-- slopfile:aborted -->` — a turn the user aborted mid-stream.
+  Aborted,
   /// `<!-- slopfile:live {...} -->` — daemon status; never user content.
   Live,
   /// `<!-- slopfile:context-full: ... -->` — daemon note.
@@ -69,7 +76,7 @@ pub enum TokKind {
   Call,
   /// `<!-- q:ID {...} -->` — stashed question JSON.
   QuestionStash,
-  /// `❓ QUESTIONS` — start of a QUESTIONS block.
+  /// `QUESTIONS` — start of a QUESTIONS block.
   QuestionHeader,
   /// `> text` — the user's answer line below a QUESTIONS block.
   Answer,
@@ -81,9 +88,17 @@ pub enum TokKind {
 
 impl TokKind {
   /// Daemon-owned control lines: never user content, never LLM context.
-  /// (The status line, the abort marker, the context-full note.)
+  /// (The status line, the abort request+completion markers, the
+  /// context-full note.)
   pub fn is_daemon_owned(self) -> bool {
-    matches!(self, TokKind::Live | TokKind::Abort | TokKind::ContextFull)
+    matches!(self, TokKind::Live | TokKind::Abort | TokKind::Aborted | TokKind::ContextFull)
+  }
+
+  /// True when the token seals a turn as complete: an `@done` marker, or the
+  /// marker the daemon writes when the user aborts a stream mid-turn. Both
+  /// bound history / tail; only the aborted one is visible in the file.
+  pub fn is_turn_end(self) -> bool {
+    matches!(self, TokKind::Done | TokKind::Aborted)
   }
 }
 
@@ -183,7 +198,7 @@ pub fn lex_line(raw: &str) -> TokKind {
 /// exact `### You` / `### Assistant` section heading.
 fn fence_boundary(line: &str) -> bool {
   let t = line.trim();
-  t == DONE_MARKER || t == "### You" || t == "### Assistant"
+  t == DONE_MARKER || t == ABORTED_MARKER || t == "### You" || t == "### Assistant"
 }
 
 /// Length of the leading backtick run of `line` when the whole trimmed
@@ -221,6 +236,11 @@ fn classify(raw: &str) -> TokenKindWithPayload<'_> {
     {
       token(TokKind::Abort, "")
     }
+    // The daemon's abort-completion marker (distinct from the REQUEST
+    // marker above): never matches the abort rule because `aborted -->`
+    // does not end with `abort -->`, and it must not be mistaken for a
+    // pending request.
+    _ if t == ABORTED_MARKER => token(TokKind::Aborted, ""),
     // The daemon status line: `<!-- slopfile:live ` + payload + ` -->`.
     // Requires the trailing space: `<!-- slopfile:liveness ... -->` is
     // user text, never a status line.
@@ -257,7 +277,7 @@ fn classify(raw: &str) -> TokenKindWithPayload<'_> {
     }
     _ if t.starts_with('>') => token(TokKind::Answer, t[1..].trim()),
     _ if t.starts_with('#') => token(TokKind::Heading, t.trim_start_matches('#').trim()),
-    _ if t.starts_with("❓ QUESTIONS") => token(TokKind::QuestionHeader, ""),
+    _ if t.starts_with("QUESTIONS") => token(TokKind::QuestionHeader, ""),
     _ => token(TokKind::Text, ""),
   }
 }
@@ -298,7 +318,7 @@ plain text
 > 1, 2
 /skip
 > /skip
-❓ QUESTIONS
+QUESTIONS
 <!-- tool:bash {\"cmd\":\"ls\"} -->
 <!-- result:bash ok=3ms -->
 <!-- call:question {\"a\":1} -->
@@ -352,6 +372,24 @@ text with <!-- @done --> inside
     );
     assert_eq!(kinds("<!-- slopfile:abort\n"), vec![TokKind::Text]);
     assert_eq!(kinds("notes: <!-- slopfile:abort -->\n"), vec![TokKind::Text]);
+  }
+
+  #[test]
+  fn aborted_marker_is_a_distinct_turn_end() {
+    // The abort-completion marker is its own kind — never a pending abort
+    // request (its absence from a still-open turn must not re-trigger the
+    // abort path).
+    assert_eq!(kinds("<!-- slopfile:aborted -->\n"), vec![TokKind::Aborted]);
+    let toks = lex("a\n<!-- slopfile:aborted -->\nb\n");
+    assert!(toks.iter().any(|t| t.kind == TokKind::Aborted));
+    // Prose mention never counts.
+    assert_eq!(kinds("notes: <!-- slopfile:aborted -->\n"), vec![TokKind::Text]);
+    // Daemon-owned, and a turn boundary.
+    assert!(TokKind::Aborted.is_daemon_owned());
+    assert!(TokKind::Aborted.is_turn_end());
+    assert!(TokKind::Done.is_turn_end());
+    assert!(!TokKind::Abort.is_turn_end());
+    assert!(!TokKind::Text.is_turn_end());
   }
 
   #[test]
@@ -542,7 +580,7 @@ closed
 
   #[test]
   fn crlf_offsets_are_exact_and_never_panic() {
-    let text = "ab\r\n❓ QUESTIONS\r\ncd\r\nef";
+    let text = "ab\r\nQUESTIONS\r\ncd\r\nef";
     let toks = lex(text);
     assert_eq!(toks[0].offset, 0);
     assert_eq!(toks[0].eol_len, 2);

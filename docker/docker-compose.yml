@@ -22,7 +22,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1 || wget -qO- http://127.0.0.1:8080/health >/dev/null"]
       interval: 15s
-      timeout: 10s
+      timeout: 3s
       retries: 12
       start_period: 60s
     restart: unless-stopped

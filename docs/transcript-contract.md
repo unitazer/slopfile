@@ -34,7 +34,7 @@ more text
 ```
 
 Tail = everything below the last `<!-- @done -->` line. Contains user draft
-text, possible `❓ QUESTIONS` blocks, and the status line comment at the very
+text, possible `QUESTIONS` blocks, and the status line comment at the very
 bottom.
 
 ## Rules for the parser (transcript.rs)
@@ -124,7 +124,7 @@ text after the last @done / after dangling resume point).
 When the model calls the `question` tool, the daemon renders this into the TAIL:
 
 ```
-❓ QUESTIONS
+QUESTIONS
 | # | Question | Options |
 | 1 | red or blue | red, blue |
 | 2 | how long? | 3, 5, 10 |
@@ -149,7 +149,7 @@ pub struct Question { pub id: u32, pub question: String, pub answers: Vec<String
 pub struct QuestionsBlock { pub questions: Vec<Question>, pub raw_json: Vec<String> /* per-question stash */ }
 
 pub fn render_block(qs: &[Question]) -> String;      // markdown table + ANSWER + >
-pub fn parse_block(text: &str) -> Option<QuestionsBlock>; // find ❓ QUESTIONS…
+pub fn parse_block(text: &str) -> Option<QuestionsBlock>; // find QUESTIONS…
 pub fn parse_answers(block: &QuestionsBlock, tail_after_below_marker: &str) -> Result<Vec<(u32,String)>, String>;
 ```
 

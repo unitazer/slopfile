@@ -16,7 +16,7 @@ use crate::lex::{lex, lex_line, Token, TokKind};
 use crate::questions::QuestionsBlock;
 use crate::types::{ChatMessage, Role, SessionConfig, ToolCall};
 
-pub use crate::lex::{ABORT_MARKER, DONE_MARKER};
+pub use crate::lex::ABORT_MARKER;
 
 /// True when `text` contains an abort request (an `Abort` token: the marker
 /// on its own line, or glued after the status line). Prose that merely
@@ -129,9 +129,20 @@ pub fn header_config(text: &str) -> SessionConfig {
   toml::from_str(&body).unwrap_or_default()
 }
 
-/// Byte offset of the LAST `@done` marker line. None if absent.
+/// Byte offset of the LAST turn-boundary marker line (`@done`, or the
+/// abort-completion marker). None if absent.
 pub fn find_done_marker(text: &str) -> Option<usize> {
-  lex(text).iter().rfind(|t| t.kind == TokKind::Done).map(|t| t.offset)
+  lex(text).iter().rfind(|t| t.kind.is_turn_end()).map(|t| t.offset)
+}
+
+/// Byte offset just past the LAST turn-boundary marker line's text (the
+/// `@done`-line onward), i.e. where the below-boundary tail begins. None
+/// when no turn has completed.
+pub fn turn_end_tail_start(text: &str) -> Option<usize> {
+  lex(text)
+    .iter()
+    .rfind(|t| t.kind.is_turn_end())
+    .map(|t| t.offset + t.text.len())
 }
 
 // ── Message building ────────────────────────────────────────────────────
@@ -150,9 +161,9 @@ enum Mode {
 /// section headings switch mode, thinking/tool/result markers are
 /// structural, everything else (including `@done` and code fences) is
 /// message text. Daemon-owned lines are never content.
-fn build_history(tokens: &[Token<'_>], stop_above: usize) -> Vec<ChatMessage> {
+fn build_history(tokens: &[Token<'_>], stop_above: usize, initial_mode: Mode) -> Vec<ChatMessage> {
   let mut history = Vec::new();
-  let mut mode = Mode::System;
+  let mut mode = initial_mode;
   let mut user_buf = String::new();
   let mut asst_text = String::new();
   let mut asst_reasoning = String::new();
@@ -310,7 +321,15 @@ fn build_history(tokens: &[Token<'_>], stop_above: usize) -> Vec<ChatMessage> {
 /// in-flight turns, tool blocks). The daemon appends these to the history
 /// when building the next request so mid-turn state survives re-parses.
 pub fn tail_sections(tail: &str) -> Vec<ChatMessage> {
-  build_history(&lex(tail), usize::MAX)
+  build_history(&lex(tail), usize::MAX, Mode::System)
+}
+
+/// Parse a dangling partial `### Assistant` section (output interrupted
+/// mid-stream, no `@done`) into assistant messages. Replaying the partial as
+/// the model's own prior turn lets it continue exactly where it stopped —
+/// without labelling it "interrupted" or injecting any notice.
+pub fn assistant_section_messages(raw: &str) -> Vec<ChatMessage> {
+  build_history(&lex(raw), usize::MAX, Mode::Asst)
 }
 
 // ── Main parse ──────────────────────────────────────────────────────────
@@ -383,7 +402,7 @@ pub fn parse_file(text: &str) -> ParsedFile {
   // round in the prompt).
   let last_done_line = toks
     .iter()
-    .rfind(|t| t.kind == TokKind::Done)
+    .rfind(|t| t.kind.is_turn_end())
     .map(|t| t.line);
   let status_line = toks.iter().rfind(|t| t.kind == TokKind::Live).map(|t| t.line);
   let history_end = match (last_done_line, status_line) {
@@ -391,7 +410,7 @@ pub fn parse_file(text: &str) -> ParsedFile {
     (None, Some(s)) => s,
     (None, None) => n_lines,
   };
-  history.extend(build_history(&toks, history_end));
+  history.extend(build_history(&toks, history_end, Mode::System));
 
   // ── Dangling detection ──
   //
@@ -406,7 +425,7 @@ pub fn parse_file(text: &str) -> ParsedFile {
       .find(|t| t.line == last_asst)
       .map(|t| t.offset)
       .unwrap_or(0);
-    let has_done_after = toks.iter().any(|t| t.kind == TokKind::Done && t.line > last_asst);
+    let has_done_after = toks.iter().any(|t| t.kind.is_turn_end() && t.line > last_asst);
     let has_next_you = you_lines.last().is_some_and(|&y| y > last_asst);
     if has_done_after || has_next_you {
       return None;
@@ -417,7 +436,7 @@ pub fn parse_file(text: &str) -> ParsedFile {
       .map(|t| t.offset)
       .unwrap_or(text.len());
     // The section runs to the first daemon status line (or EOF): the live
-    // line is daemon-owned and must never leak into the resume hint.
+    // line is daemon-owned and must never leak into the replayed section.
     let section = &text[after_ix..section_end];
     let tools = toks
       .iter()
@@ -445,7 +464,9 @@ pub fn parse_file(text: &str) -> ParsedFile {
       let start = toks
         .iter()
         .find(|t| t.line == d)
-        .map(|t| t.offset + DONE_MARKER.len())
+        // `text` is the marker's own raw text, so this lands exactly after
+        // it for BOTH a short `@done` and a longer abort marker.
+        .map(|t| t.offset + t.text.len())
         .unwrap_or(text.len());
       &text[start..]
     }
@@ -590,6 +611,36 @@ Here is the listing.
   }
 
   #[test]
+  fn dangling_partial_replays_as_assistant_messages() {
+    // The partial is replayed as the model's own prior turn, never wrapped
+    // in a hint that tells it the output was interrupted.
+    let partial = "<!-- thinking -->\nlet me think about this\n<!-- /thinking -->\nContinue the work.\n";
+    let msgs = assistant_section_messages(partial);
+    assert_eq!(msgs.len(), 1);
+    let m = &msgs[0];
+    assert_eq!(m.role, Role::Assistant);
+    assert!(m
+      .content
+      .as_deref()
+      .is_some_and(|c| c.contains("Continue the work")));
+    assert!(m
+      .reasoning_content
+      .as_deref()
+      .is_some_and(|r| r.contains("let me think about this")));
+  }
+
+  #[test]
+  fn dangling_partial_prose_only_is_content() {
+    let msgs = assistant_section_messages("still working on it\n");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, Role::Assistant);
+    assert!(msgs[0]
+      .content
+      .as_deref()
+      .is_some_and(|c| c.starts_with("still working")));
+  }
+
+  #[test]
   fn status_line_excluded() {
     let mut txt = sample();
     txt.push_str("\n<!-- slopfile:live {\"phase\":\"idle\"} -->\n");
@@ -597,6 +648,56 @@ Here is the listing.
     assert!(!pf.tail.contains("slopfile:live"));
     assert!(!pf.tail.contains("{\"phase\":\"idle\"}"));
     // The status line must never leak into history as an assistant turn.
+    assert!(!pf
+      .history
+      .iter()
+      .any(|m| m.content.as_deref().is_some_and(|c| c.contains("slopfile:live"))));
+  }
+
+  #[test]
+  fn aborted_marker_bounds_the_turn_like_done() {
+    // A turn the user aborted ends with the abort-completion marker instead
+    // of `@done`. It must bound history/tail exactly like `@done`, but stay
+    // VISIBLE in the file (it is not stripped), so the user can tell the
+    // reply was cut short.
+    let txt = r#"```toml
+model = "qwen3.8-27b"
+```
+# Sm
+Sys.
+
+### You
+Question?
+
+### Assistant
+Let me check.
+<!-- thinking -->
+will ls
+<!-- /thinking -->
+<!-- tool:bash {"cmd":"ls"} -->
+src/
+<!-- result:bash ok=1ms -->
+partial reply cut off mid
+<!-- /thinking -->
+<!-- slopfile:aborted -->
+<!-- slopfile:live {"phase":"idle","model":"qwen3.8-27b"} -->
+"#;
+
+    let pf = parse_file(txt);
+    // Sealed: no dangling resume, tail empty (no draft), and the aborted
+    // marker stays in the raw file text.
+    assert!(pf.dangling.is_none(), "aborted turn must not be resumable");
+    assert!(pf.tail.trim().is_empty(), "no tail below aborted turn");
+    assert!(find_done_marker(txt).is_some(), "aborted marker bounds history");
+    assert!(txt.contains("<!-- slopfile:aborted -->"), "marker stays visible");
+    // History stops at the aborted marker: the partial assistant reply is
+    // history, the marker itself never becomes message content.
+    let last = pf.history.last().unwrap();
+    assert_eq!(last.role, Role::Assistant);
+    assert!(!pf
+      .history
+      .iter()
+      .any(|m| m.content.as_deref().is_some_and(|c| c.contains("slopfile:aborted"))));
     assert!(!pf
       .history
       .iter()
@@ -690,7 +791,7 @@ answers json
     assert_eq!(pf.pending_questions.len(), 1);
     assert_eq!(pf.pending_questions[0].questions[0].question, "red or blue");
     // The block stays in the tail text too.
-    assert!(pf.tail.contains("❓ QUESTIONS"));
+    assert!(pf.tail.contains("QUESTIONS"));
   }
 
   #[test]
@@ -856,7 +957,7 @@ Hello ❓ friend.\r
 ### Assistant\r
 Reply ❓ ok.\r
 <!-- @done -->\r
-❓ QUESTIONS\r
+QUESTIONS\r
 \r
 | # | Question | Options |\r
 | 1 | red or blue | red, blue |\r
@@ -877,7 +978,7 @@ ANSWER: (numbers or text, comma separated)\r
       .unwrap()
       .contains("Reply ❓ ok."));
     assert_eq!(pf.pending_questions.len(), 1);
-    assert!(pf.tail.trim_start().starts_with("❓ QUESTIONS"));
+    assert!(pf.tail.trim_start().starts_with("QUESTIONS"));
     assert!(pf.dangling.is_none());
   }
 
