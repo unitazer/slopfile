@@ -1,0 +1,17 @@
+# slopfile daemon container.
+# Build: docker build -f docker/Dockerfile.slopfile -t clanker-slopfile .
+# Run via the `slopfile` service in docker/docker-compose.yml.
+
+FROM rust:1-slim AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY docs ./docs
+RUN cargo build --release
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd -u 1000 -m slopfile
+COPY --from=build /build/target/release/slopfile /usr/local/bin/slopfile
+USER slopfile
+ENTRYPOINT ["/usr/local/bin/slopfile"]

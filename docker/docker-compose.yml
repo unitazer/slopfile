@@ -1,0 +1,58 @@
+services:
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: clanker-llama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ../shared/models:/models:ro
+    command: [
+      "--models-preset", "/models/presets.ini",
+      "--models-max", "2",
+      "--host", "0.0.0.0",
+      "--port", "8080"
+    ]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1 || wget -qO- http://127.0.0.1:8080/health >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+
+  slopfile:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.slopfile
+    container_name: clanker-slopfile
+    user: "1000:1000"
+    # Allow the daemon to `docker restart clanker-llama` when an abort
+    # interrupts a live stream (llama.cpp cannot cancel a running
+    # generation any other way). group_add uses the host docker group's
+    # gid so the unprivileged user can talk to the socket.
+    group_add:
+      - "${DOCKER_GID:-998}"
+    volumes:
+      # The model sees only the workspace (its tool-call root) and the shared
+      # runtime volume. The slopfile repo/source is deliberately NOT mounted
+      # here, so the agent can't reach it.
+      - ../workspace:/workspace
+      - ../shared:/shared
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      llama-server:
+        condition: service_healthy
+    environment:
+      SLOPFILE_CONFIG: /shared/slopfile.toml
+      SLOPFILE_API_BASE: http://llama-server:8080
+      SLOPFILE_TRANSCRIPTS: /shared/transcripts
+      SLOPFILE_WORKDIR: /workspace
+      RUST_LOG: slopfile=info,warn
+    restart: unless-stopped

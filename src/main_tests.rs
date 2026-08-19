@@ -317,7 +317,8 @@ Let me read a file.
       msgs.push(ChatMessage::assistant(format!("assistant answer number {i} with some body text")));
     }
     // Tiny budget: only the newest turns survive.
-    let small = truncate_messages(msgs.clone(), 12); // 12 tokens * 4 chars = 48 chars
+    let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
+    let small = truncate_messages(msgs.clone(), &counts, 12);
     assert_eq!(small[0].role, Role::System);
     assert!(small.len() < msgs.len(), "old turns dropped: {} -> {}",
       msgs.len(), small.len());
@@ -327,7 +328,7 @@ Let me read a file.
     assert!(matches!(small[1].role, Role::User | Role::Assistant));
 
     // Big budget: everything kept.
-    let big = truncate_messages(msgs.clone(), 1_000_000);
+    let big = truncate_messages(msgs.clone(), &counts, 1_000_000);
     assert_eq!(big.len(), msgs.len());
   }
 
@@ -342,7 +343,8 @@ Let me read a file.
       msgs.push(asst);
       msgs.push(ChatMessage::tool(call.id.clone(), "bash".to_string(), "out".to_string()));
     }
-    let small = truncate_messages(msgs.clone(), 6); // ~24 chars: fits ~1 round
+    let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
+    let small = truncate_messages(msgs.clone(), &counts, 6); // tiny budget: ~1 round
     // First kept message after system must not be a Tool result with a
     // missing caller: it is User or Assistant.
     assert!(matches!(small[1].role, Role::User | Role::Assistant));

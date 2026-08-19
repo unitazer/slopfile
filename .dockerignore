@@ -1,0 +1,6 @@
+# Build context root is the slopfile repo. Exclude the 18GB model weights and
+# per-machine state so `docker compose build` never ships them to the builder.
+shared/
+workspace/
+target/
+.git/

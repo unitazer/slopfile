@@ -7,6 +7,7 @@
 --   :Resume  — save + force a re-parse of dangling output / question block
 --   :Abort   — append the abort marker; daemon stops streaming, closes @done
 --   :Status  — re-render the live status line
+--   :Tokens  — report how many tokens the current session will consume
 --
 -- Autoread: a 1s timer reloads the buffer while the daemon streams (a pure
 -- CursorHold approach fails because every keystroke/move resets the idle
@@ -19,7 +20,13 @@
 -- `:source slopfile.nvim` from your config.
 --
 -- Config: g:slopfile_autoread (default 1) enables the poll + checktime;
--- g:slopfile_poll_ms (default 1000) sets the poll interval.
+-- g:slopfile_poll_ms (default 1000) sets the poll interval;
+-- g:slopfile_bin (default "slopfile") is the slopfile binary used by
+-- :Tokens (must be able to reach llama-server's /tokenize).
+--
+-- New in this build:
+--   :Tokens  — run `slopfile tokens <buffer>` against the model tokenizer
+--              and report how many tokens the current session will consume.
 
 local M = {}
 
@@ -148,7 +155,27 @@ function M.setup(opts)
   if opts.poll_ms ~= nil then
     vim.g.slopfile_poll_ms = opts.poll_ms
   end
+  if opts.bin ~= nil then
+    vim.g.slopfile_bin = opts.bin
+  end
   setup_autoread()
+end
+
+-- :Tokens — measure the current session's token footprint via the binary.
+function M.tokens()
+  checktime()
+  local path = vim.api.nvim_buf_get_name(0)
+  if path == "" then
+    vim.notify("slopfile: buffer has no file name", vim.log.levels.WARN)
+    return
+  end
+  local bin = vim.g.slopfile_bin or "slopfile"
+  local out = vim.fn.system({ bin, "tokens", path })
+  if vim.v.shell_error ~= 0 then
+    vim.notify("slopfile: " .. out:gsub("%s+$", ""), vim.log.levels.ERROR)
+    return
+  end
+  vim.notify(out:gsub("%s+$", ""), vim.log.levels.INFO)
 end
 
 -- Commands (no Pi prefix, per project convention).
@@ -157,6 +184,7 @@ vim.api.nvim_create_user_command("Send", M.send, {})
 vim.api.nvim_create_user_command("Resume", M.resume, {})
 vim.api.nvim_create_user_command("Abort", M.abort, {})
 vim.api.nvim_create_user_command("Status", M.status, {})
+vim.api.nvim_create_user_command("Tokens", M.tokens, {})
 
 -- Debug/testing handle; also makes the module requireable as 'slopfile'.
 vim.g.slopfile_plugin = M

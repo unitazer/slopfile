@@ -51,11 +51,18 @@ enum Command {
     /// Path of the session file to abort
     path: String,
   },
+  /// Estimate the token footprint of the request the daemon would send for
+  /// a session file (history + tail sections + dangling resume, after
+  /// context-window truncation). Read-only; never modifies the file.
+  Tokens {
+    /// Path of the session file to measure
+    path: String,
+  },
 }
 
 /// Host path; the container variant sets `SLOPFILE_CONFIG` to
 /// `/shared/slopfile.toml`.
-const APP_CONFIG_PATH: &str = "/home/unitazer/things/clanker/docker-pi/shared/slopfile.toml";
+const APP_CONFIG_PATH: &str = "/home/unitazer/things/clanker/slopfile/shared/slopfile.toml";
 
 /// Load app config, then apply env overrides so the same file works on the
 /// host and inside the compose network:
@@ -103,6 +110,9 @@ async fn main() {
   }
   if let Some(Command::Abort { path }) = cli.command {
     return cmd_abort(&path);
+  }
+  if let Some(Command::Tokens { path }) = cli.command {
+    return cmd_tokens(&path, &app_cfg).await;
   }
 
   info!(
@@ -321,43 +331,30 @@ async fn run_generation_turn(
   // below-@done sections (drafts promoted to `### You`). The below-@done
   // region is appended EXACTLY ONCE here — `parse_file` history already
   // stops at the last `@done`.
-  let mut messages = pf.history.clone();
-  if transcript::find_done_marker(text).is_some()
-    && let Some(section) = section_below_done(text)
-  {
-    for m in transcript::tail_sections(&section) {
-      messages.push(m);
-    }
-  }
-  if let Some(d) = &pf.dangling
-    && !d.partial_text.trim().is_empty()
-  {
-    messages.push(ChatMessage::user(format!(
-      "[resume] previous assistant output was interrupted; continue exactly where it stopped:\n```\n{}\n```",
-      d.partial_text.trim_end()
-    )));
-  }
+  let (messages, _dropped, _) = build_request_messages(text, pf, cfg).await?;
 
-  // Long sessions: drop the OLDEST turns from the request (never the file)
-  // so the prompt fits the context window. Keeps the system message and
-  // always cuts at a clean turn boundary.
   let context_budget = pf
     .config
     .max_context_tokens
     .unwrap_or(cfg.max_context_tokens);
-  messages = truncate_messages(messages, context_budget);
-
   let max_tokens = context_budget / 4;
   let tools = pf.config.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(true);
   let tool_defs = tools.then(tools::definitions);
+
+  // Route the request to the per-session model from the file header, falling
+  // back to the app default. In a router-mode llama-server this selects the
+  // GGUF to load; warm it so the first stream isn't a cold reload.
+  let model = pf.config.model.as_deref().unwrap_or(&cfg.model);
+  client.ensure_model_loaded(model).await;
 
   // First write: `### Assistant` header (+ thinking open if the first delta
   // is reasoning — we handle markers in the event closure).
   let mut active = StreamWriter::new(path, &base_text, live.map(|(_, t)| t));
 
-  info!("→ {path:?}: generating (messages={})", messages.len());
+  info!("→ {path:?}: generating (model={model}, messages={})", messages.len());
   let result = client
     .chat_stream(
+      model,
       &messages,
       tool_defs.as_deref(),
       max_tokens,
@@ -667,6 +664,95 @@ fn cmd_abort(path: &str) {
   println!("abort requested on {path}; the daemon stops the turn on its next sweep");
 }
 
+/// Measure the real token footprint of the request the daemon would send for
+/// a session file, using the model's actual tokenizer (llama-server
+/// `/tokenize`). Read-only; never modifies the file.
+async fn cmd_tokens(path: &str, cfg: &AppConfig) {
+  let text = match std::fs::read_to_string(path) {
+    Ok(t) => t,
+    Err(e) => {
+      eprintln!("slopfile tokens: cannot read {path}: {e}");
+      std::process::exit(1);
+    }
+  };
+  let pf = transcript::parse_file(&text);
+  let (messages, dropped, count) = match build_request_messages(&text, &pf, cfg).await {
+    Ok(v) => v,
+    Err(e) => {
+      eprintln!("slopfile tokens: {e}");
+      std::process::exit(1);
+    }
+  };
+  let context_budget = pf
+    .config
+    .max_context_tokens
+    .unwrap_or(cfg.max_context_tokens);
+
+  let headroom = context_budget.saturating_sub(count as u32);
+
+  println!("tokens: {path}");
+  println!("  messages:    {} sent ({} oldest dropped to fit budget)", messages.len(), dropped);
+  println!("  model tokens: {count}  (via llama-server /tokenize, content only)");
+  println!("  context budget: {context_budget}  output allowance: {}", context_budget / 4);
+  println!("  input headroom: {headroom}");
+}
+
+/// Tokenize the concatenated message contents against the model tokenizer.
+/// llama.cpp exposes `/tokenize` on the server root and mirrors it under
+/// `/v1/`; try both.
+async fn request_token_count(
+  api_base: &str,
+  messages: &[ChatMessage],
+) -> Result<usize, String> {
+  let mut content = String::new();
+  for m in messages {
+    if let Some(c) = &m.content {
+      content.push_str(c);
+    }
+    if let Some(r) = &m.reasoning_content {
+      content.push('\n');
+      content.push_str(r);
+    }
+    if let Some(calls) = &m.tool_calls {
+      for c in calls {
+        content.push('\n');
+        content.push_str(&c.arguments);
+      }
+    }
+    content.push('\n');
+  }
+  if content.is_empty() {
+    return Ok(0);
+  }
+  let client = reqwest::Client::new();
+  let mut last_err = String::new();
+  for url in [format!("{api_base}/tokenize"), format!("{api_base}/v1/tokenize")] {
+    let resp = match client
+      .post(&url)
+      .json(&serde_json::json!({"content": content}))
+      .send()
+      .await
+    {
+      Ok(r) => r,
+      Err(e) => {
+        last_err = format!("{url}: {e}");
+        continue;
+      }
+    };
+    if !resp.status().is_success() {
+      last_err = format!("{url}: HTTP {}", resp.status());
+      continue;
+    }
+    if let Ok(v) = resp.json::<serde_json::Value>().await
+      && let Some(toks) = v.get("tokens").and_then(|t| t.as_array())
+    {
+      return Ok(toks.len());
+    }
+    last_err = format!("{url}: no `tokens` array in response");
+  }
+  Err(format!("cannot reach model tokenizer: {last_err}"))
+}
+
 /// The default session file: header (default settings) + system prompt
 /// (adapted from pi) + an empty `### You` section for the first message.
 pub fn session_template(cfg: &AppConfig) -> String {
@@ -719,9 +805,61 @@ Current working directory: {}",
 
 // ── Conversation truncation ─────────────────────────────────────────────
 
-/// Rough char-per-token estimate for budget checks (English ≈ 4 chars/tok).
-const CHARS_PER_TOKEN: usize = 4;
+/// Assemble the exact request the daemon would send for this session:
+/// history + below-`@done` tail sections + a dangling-output resume hint,
+/// then drop the OLDEST turns (never from the file) so the request fits the
+/// context window. Bounded by the model's real tokenizer. Keeps the system
+/// message and cuts at a clean turn boundary.
+///
+/// Returns the final messages, how many old turns were dropped, and the
+/// token count of the final request.
+async fn build_request_messages(
+  text: &str,
+  pf: &ParsedFile,
+  cfg: &AppConfig,
+) -> Result<(Vec<ChatMessage>, usize, usize), String> {
+  let mut messages = pf.history.clone();
+  if transcript::find_done_marker(text).is_some()
+    && let Some(section) = section_below_done(text)
+  {
+    for m in transcript::tail_sections(&section) {
+      messages.push(m);
+    }
+  }
+  if let Some(d) = &pf.dangling
+    && !d.partial_text.trim().is_empty()
+  {
+    messages.push(ChatMessage::user(format!(
+      "[resume] previous assistant output was interrupted; continue exactly where it stopped:\n```\n{}\n```",
+      d.partial_text.trim_end()
+    )));
+  }
+  let context_budget = pf.config.max_context_tokens.unwrap_or(cfg.max_context_tokens);
+  let before = messages.len();
+  if before == 0 {
+    return Ok((messages, 0, 0));
+  }
+  let counts = request_token_counts(&cfg.api_base, &messages).await?;
+  let truncated = truncate_messages(messages, &counts, context_budget);
+  let dropped = before - truncated.len();
+  let keep_from = before - (truncated.len() - 1);
+  let sent_tokens = counts[0] + counts[keep_from..].iter().sum::<usize>();
+  Ok((truncated, dropped, sent_tokens))
+}
 
+/// Tokenize each message against the model tokenizer, one per message.
+async fn request_token_counts(
+  api_base: &str,
+  messages: &[ChatMessage],
+) -> Result<Vec<usize>, String> {
+  let mut counts = Vec::with_capacity(messages.len());
+  for m in messages {
+    counts.push(request_token_count(api_base, std::slice::from_ref(m)).await?);
+  }
+  Ok(counts)
+}
+
+#[cfg(test)]
 fn msg_chars(m: &ChatMessage) -> usize {
   m.content.as_ref().map_or(0, |c| c.len())
     + m.reasoning_content.as_ref().map_or(0, |c| c.len())
@@ -733,26 +871,30 @@ fn msg_chars(m: &ChatMessage) -> usize {
 }
 
 /// Drop the OLDEST messages (after the system prompt) until the estimated
-/// prompt size fits `max_tokens`. Keeps the NEWEST turns. The first kept
-/// message is a `User` or `Assistant` turn start — never a `Tool` result,
-/// which would orphan its tool-call id. If even the newest turn doesn't
-/// fit, the newest messages are kept anyway (a partial context beats an
-/// empty one).
-pub fn truncate_messages(messages: Vec<ChatMessage>, max_tokens: u32) -> Vec<ChatMessage> {
+/// prompt size fits `max_tokens`, using per-message token counts from the
+/// model's real tokenizer. Keeps the NEWEST turns. The first kept message
+/// is a `User` or `Assistant` turn start — never a `Tool` result, which
+/// would orphan its tool-call id. If even the newest turn doesn't fit, the
+/// newest messages are kept anyway (a partial context beats an empty one).
+pub fn truncate_messages(
+  messages: Vec<ChatMessage>,
+  token_counts: &[usize],
+  max_tokens: u32,
+) -> Vec<ChatMessage> {
   if messages.is_empty() {
     return messages;
   }
-  let budget = (max_tokens as usize).saturating_mul(CHARS_PER_TOKEN);
-  let total: usize = messages.iter().map(msg_chars).sum();
+  let budget = max_tokens as usize;
+  let total: usize = token_counts.iter().sum();
   if total <= budget || messages.len() <= 2 {
     return messages;
   }
   // Largest prefix (1-based index) that fits within the budget.
-  let sys_len = msg_chars(&messages[0]);
+  let sys_tokens = token_counts[0];
   let mut keep_through = messages.len() - 1;
-  let mut sum = sys_len + messages.iter().skip(1).map(msg_chars).sum::<usize>();
-  for (i, m) in messages.iter().enumerate().skip(1) {
-    sum -= msg_chars(m);
+  let mut sum = sys_tokens + token_counts[1..].iter().sum::<usize>();
+  for (i, &toks) in token_counts.iter().enumerate().skip(1) {
+    sum -= toks;
     if sum <= budget {
       keep_through = i;
       break;
@@ -1160,7 +1302,7 @@ fn drop_skip_lines(text: &str) -> String {
 /// (bounded only by max_tokens) and pin the CPU for minutes.
 ///
 /// Requires the docker socket mounted into this container
-/// (`/var/run/docker.sock`, see docker-pi/docker-compose.yml) and the
+/// (`/var/run/docker.sock`, see docker/docker-compose.yml) and the
 /// container user in the host's docker group.
 fn restart_llama_server(socket: &str, container: &str) -> Result<(), String> {
   use std::io::{Read, Write};

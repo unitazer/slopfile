@@ -98,16 +98,30 @@ impl ToolCallAccumulator {
 
 pub struct LlamaClient {
     base: String,
-    model: String,
     client: reqwest::Client,
 }
 
 impl LlamaClient {
-    pub fn new(api_base: &str, model: &str) -> Self {
+    pub fn new(api_base: &str, _model: &str) -> Self {
         Self {
             base: api_base.trim_end_matches('/').to_string(),
-            model: model.to_string(),
             client: reqwest::Client::new(),
+        }
+    }
+
+    /// Warm-load a model before streaming so the first request doesn't pay a
+    /// cold reload. Best effort: a single-model llama-server (no router mode)
+    /// has no load endpoint and must not fail the turn — any error is
+    /// ignored and the router auto-loads on first use anyway.
+    pub async fn ensure_model_loaded(&self, model: &str) {
+        let body = serde_json::json!({ "model": model });
+        for path in ["models/load", "v1/models/load"] {
+            let url = format!("{}/{path}", self.base);
+            if let Ok(resp) = self.client.post(&url).json(&body).send().await
+                && resp.status().is_success()
+            {
+                return;
+            }
         }
     }
 
@@ -115,9 +129,11 @@ impl LlamaClient {
     /// `StreamEvent::Done(StreamResult)`. Returning `false` from `on_event`
     /// stops the stream early (`StreamResult::aborted` is set). `keep_going`
     /// is polled while the stream is idle (no SSE events); returning `false`
-    /// aborts the stream the same way.
+    /// aborts the stream the same way. `model` routes the request — in a
+    /// llama.cpp router-mode server it selects which model to run.
     pub async fn chat_stream(
         &self,
+        model: &str,
         messages: &[ChatMessage],
         tools: Option<&[ToolDefinition]>,
         max_new_tokens: u32,
@@ -125,7 +141,7 @@ impl LlamaClient {
         keep_going: impl FnMut() -> bool,
     ) -> Result<StreamResult, ApiError> {
         let body = serde_json::json!({
-            "model": self.model,
+            "model": model,
             "messages": sanitize_messages(messages),
             "stream": true,
             "max_tokens": max_new_tokens,

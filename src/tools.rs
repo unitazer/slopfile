@@ -186,6 +186,11 @@ fn read(workdir: &Path, args: &Value) -> ToolResult {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("read: cannot read {path_str}: {e}")),
   };
+  // Refuse to expose session transcripts / daemon-owned files. Any slopfile
+  // runtime artifact (transcript, status line) carries this marker.
+  if content.contains("<!-- slopfile") {
+    return ToolResult::err("read: refusing to read a slopfile transcript or daemon-owned file");
+  }
   let mut lines: Vec<&str> = content.split('\n').collect();
   if lines.last().is_some_and(|l| l.is_empty()) {
     lines.pop();
@@ -601,6 +606,22 @@ mod tests {
 
   async fn t(name: &str, args: Value, dir: PathBuf) -> ToolResult {
     run(name, &args.to_string(), dir, 30_000).await
+  }
+
+  #[tokio::test]
+  async fn read_rejects_transcript_files() {
+    let wd = test_dir("read-transcript");
+    let content = "### You\nhi\n### Assistant\nhi\n<!-- slopfile:live {\"phase\":\"idle\"} -->";
+    let _ = t("write", json!({"path": "transcript.md", "content": content}), wd.clone()).await;
+    let w2 = t("write", json!({"path": "plain.md", "content": "just text\n"}), wd.clone()).await;
+    assert!(w2.ok, "write plain failed: {}", w2.output);
+
+    let r = t("read", json!({"path": "transcript.md"}), wd.clone()).await;
+    assert!(!r.ok, "transcript read should be refused");
+    assert!(r.output.contains("refusing"), "unexpected msg: {}", r.output);
+
+    let ok = t("read", json!({"path": "plain.md"}), wd.clone()).await;
+    assert!(ok.ok, "plain read should succeed: {}", ok.output);
   }
 
   #[tokio::test]

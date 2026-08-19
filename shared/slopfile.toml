@@ -1,0 +1,12 @@
+confirmations = "ask"
+api_base = "http://127.0.0.1:8080"
+workdir = "/home/unitazer/things/clanker/slopfile/workspace"
+transcripts_dir = "/home/unitazer/things/clanker/slopfile/shared/transcripts"
+sweep_interval_ms = 250
+model = "qwen3.8-27b"
+tool_timeout_ms = 30000
+# Restart the llama-server container when an abort interrupts a live
+# stream. llama.cpp cannot cancel an in-flight generation, so this is the
+# only way to stop the orphaned completion from pinning the CPU.
+abort_restart_server = true
+llama_container = "clanker-llama"

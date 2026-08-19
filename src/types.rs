@@ -266,7 +266,7 @@ pub enum StreamEvent {
   Done(StreamResult),
 }
 
-// ── App config (docker-pi/shared/slopfile.toml) ─────────────────────────
+// ── App config (docker/shared/slopfile.toml) ─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
