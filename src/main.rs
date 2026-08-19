@@ -1045,8 +1045,6 @@ fn resolve_questions(
 
     let mut updated = out.clone();
     updated.replace_range(header_ix..end_ix.min(updated.len()), &tool_out);
-    // Drop stray /skip lines (below the block / typed on their own line);
-    // they are commands, not user messages.
     out = drop_skip_lines(&updated);
   }
 

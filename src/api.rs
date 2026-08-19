@@ -51,7 +51,6 @@ pub struct ToolCallAccumulator {
 impl ToolCallAccumulator {
     pub fn accumulate(&mut self, delta: &SseToolCallDelta) {
         let idx = delta.index.unwrap_or(0);
-        // Extend the vec with placeholders if needed.
         while self.calls.len() <= idx {
             self.calls.push(SseToolCallDelta {
                 index: Some(self.calls.len()),

@@ -108,14 +108,12 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
         })
         .collect();
 
-    // Parse table rows: `| 1 | red or blue | red, blue |`
     let mut found_header_row = false;
     for line in block_text.lines().skip(1) {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        // Stop at the ANSWER: line.
         if line.starts_with("ANSWER") {
             break;
         }
