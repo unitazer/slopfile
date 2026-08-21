@@ -98,11 +98,16 @@ pub struct LlamaClient {
 }
 
 impl LlamaClient {
-    pub fn new(api_base: &str, _model: &str) -> Self {
+    pub fn new(api_base: &str) -> Self {
         Self {
             base: api_base.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Shared HTTP client for auxiliary endpoints (tokenize, etc.).
+    pub(crate) fn rest(&self) -> &reqwest::Client {
+        &self.client
     }
 
     pub async fn ensure_model_loaded(&self, model: &str) {
@@ -209,9 +214,6 @@ impl LlamaClient {
                         }
                     }
                     if !cont {
-                        if std::env::var("SLOP_DEBUG").is_ok() {
-                            eprintln!("DEBUG ABORT-SOURCE: on_event (chunk) returned false");
-                        }
                         result.aborted = true;
                         self.cancel_generation().await;
                         break;
@@ -329,7 +331,7 @@ use super::*;
 
     #[tokio::test]
     async fn tool_call_fragments_accumulate_end_to_end() {
-        let client = LlamaClient::new("http://localhost:9", "test");
+        let client = LlamaClient::new("http://localhost:9");
         let sse = vec![
             "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"abc123\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"cit\"}}]}}]}\n\n",
@@ -360,7 +362,7 @@ use super::*;
 
     #[tokio::test]
     async fn text_and_reasoning_accumulate() {
-        let client = LlamaClient::new("http://localhost:9", "test");
+        let client = LlamaClient::new("http://localhost:9");
         let sse = vec![
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" think.\",\"content\":\"Hi\"}}]}\n\n",
@@ -378,7 +380,7 @@ use super::*;
 
     #[tokio::test]
     async fn returning_false_from_callback_aborts_the_stream() {
-        let client = LlamaClient::new("http://localhost:9", "test");
+        let client = LlamaClient::new("http://localhost:9");
         let sse = vec![
             "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\" two\"}}]}\n\n",
@@ -403,7 +405,7 @@ use super::*;
 
     #[tokio::test]
     async fn watchdog_aborts_when_keep_going_returns_false() {
-        let client = LlamaClient::new("http://localhost:9", "test");
+        let client = LlamaClient::new("http://localhost:9");
         let sse = vec![
             "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\" two\"}}]}\n\n",

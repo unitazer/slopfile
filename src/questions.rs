@@ -18,6 +18,55 @@ pub struct QuestionsBlock {
 
 pub const BLOCK_HEADER: &str = "QUESTIONS";
 
+/// Parse one question from its stashed JSON shape
+/// (`{"question":..., "answers":[...], "default":...}`), filling blanks the
+/// same way the renderer does (`"?"`, no options).
+pub fn question_from_value(id: u32, v: &serde_json::Value) -> Option<Question> {
+  let question = v.get("question")?.as_str()?.to_string();
+  let answers = v
+    .get("answers")?
+    .as_array()?
+    .iter()
+    .map(|a| a.as_str().unwrap_or("").to_string())
+    .collect::<Vec<_>>();
+  let default = v.get("default").and_then(|d| d.as_str()).map(String::from);
+  Some(Question {
+    id,
+    question,
+    answers,
+    default,
+  })
+}
+
+/// Lenient variant used when re-rendering a live tool call: missing fields
+/// become renderer defaults instead of dropping the question.
+pub fn question_from_tool_item(id: u32, v: &serde_json::Value) -> Question {
+  let question = v
+    .get("question")
+    .and_then(|q| q.as_str())
+    .unwrap_or("?")
+    .to_string();
+  let answers = v
+    .get("answers")
+    .and_then(|a| a.as_array())
+    .map(|a| {
+      a.iter()
+        .map(|x| x.as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  let default = v
+    .get("default")
+    .and_then(|d| d.as_str())
+    .map(String::from);
+  Question {
+    id,
+    question,
+    answers,
+    default,
+  }
+}
+
 pub fn render_block(qs: &[Question]) -> String {
     let mut out = String::new();
     out.push_str(BLOCK_HEADER);
@@ -77,22 +126,7 @@ pub fn parse_block(text: &str) -> Option<QuestionsBlock> {
         .map(|(id, json)| {
             let q = serde_json::from_str::<serde_json::Value>(&json)
                 .ok()
-                .and_then(|v| {
-                    let question = v.get("question")?.as_str()?.to_string();
-                    let answers = v
-                        .get("answers")?
-                        .as_array()?
-                        .iter()
-                        .map(|a| a.as_str().unwrap_or("").to_string())
-                        .collect::<Vec<_>>();
-                    let default = v.get("default").and_then(|d| d.as_str()).map(String::from);
-                    Some(Question {
-                        id,
-                        question,
-                        answers,
-                        default,
-                    })
-                });
+                .and_then(|v| question_from_value(id, &v));
             (id, (json, q))
         })
         .collect();

@@ -6,6 +6,7 @@ pub const ABORTED_MARKER: &str = "<!-- slopfile:aborted -->";
 pub const THINK_START: &str = "<!-- thinking -->";
 pub const THINK_END: &str = "<!-- /thinking -->";
 pub const CONTEXT_FULL_PREFIX: &str = "<!-- slopfile:context-full";
+pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit the token cap mid-response; trim the useless old turns above, then write your next message below this note -->";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token<'a> {
@@ -64,6 +65,10 @@ impl<'a> Token<'a> {
 
   pub fn line_end(&self) -> usize {
     self.offset + self.text.len() + self.eol_len
+  }
+
+  pub fn is_skip(&self) -> bool {
+    self.kind == TokKind::Skip || (self.kind == TokKind::Answer && self.payload == "/skip")
   }
 }
 

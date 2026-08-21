@@ -72,15 +72,19 @@ local function arm_marker(marker)
   vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
 end
 
+local function request_send(notify_msg)
+  arm_marker(SEND_MARKER)
+  vim.cmd("write")
+  checktime()
+  vim.notify("slopfile: " .. notify_msg, vim.log.levels.INFO)
+end
+
 function M.send()
   if not is_session_buf(0) then
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
-  arm_marker(SEND_MARKER)
-  vim.cmd("write")
-  checktime()
-  vim.notify("slopfile: sent", vim.log.levels.INFO)
+  request_send("sent")
 end
 
 function M.resume()
@@ -88,10 +92,7 @@ function M.resume()
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
-  arm_marker(SEND_MARKER)
-  vim.cmd("write")
-  checktime()
-  vim.notify("slopfile: resume requested", vim.log.levels.INFO)
+  request_send("resume requested")
 end
 
 function M.abort()
@@ -100,9 +101,7 @@ function M.abort()
     return
   end
   vim.cmd("write")
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  table.insert(lines, ABORT_MARKER)
-  vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+  arm_marker(ABORT_MARKER)
   vim.cmd("write")
   checktime()
   vim.notify("slopfile: abort requested", vim.log.levels.INFO)

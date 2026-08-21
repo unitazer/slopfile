@@ -16,7 +16,6 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
   pub id: String,
-  pub type_: String,
   pub name: String,
   pub arguments: String,
 }
@@ -54,7 +53,6 @@ impl<'de> serde::Deserialize<'de> for ToolCall {
     let w = ToolCallWire::deserialize(d)?;
     Ok(Self {
       id: w.id,
-      type_: w.type_,
       name: w.function.name,
       arguments: w.function.arguments,
     })
@@ -65,7 +63,6 @@ impl ToolCall {
   pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
     Self {
       id: id.into(),
-      type_: "function".to_string(),
       name: name.into(),
       arguments: arguments.into(),
     }
@@ -119,6 +116,7 @@ impl ChatMessage {
     }
   }
 
+  #[cfg(test)]
   pub fn assistant(text: impl Into<String>) -> Self {
     Self {
       role: Role::Assistant,
@@ -234,10 +232,35 @@ pub enum StreamEvent {
 }
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Confirmations {
+  Yolo,
+  #[default]
+  #[serde(other)]
+  Ask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+  #[default]
+  Idle,
+  WaitingAnswer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Thinking {
+  #[default]
+  #[serde(other)]
+  Auto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-  #[serde(default = "default_confirmations")]
-  pub confirmations: String,
+  #[serde(default)]
+  pub confirmations: Confirmations,
   #[serde(default = "default_api_base")]
   pub api_base: String,
   #[serde(default = "default_workdir")]
@@ -258,17 +281,14 @@ pub struct AppConfig {
   pub llama_container: String,
 }
 
-fn default_confirmations() -> String {
-  "ask".to_string()
-}
 fn default_api_base() -> String {
-  "http://llama-server:8080".to_string()
+  "http://127.0.0.1:8080".to_string()
 }
 fn default_workdir() -> String {
-  "/workspace".to_string()
+  "workspace".to_string()
 }
 fn default_transcripts_dir() -> String {
-  "/shared/transcripts".to_string()
+  "shared/transcripts".to_string()
 }
 fn default_sweep_interval_ms() -> u64 {
   250
@@ -292,7 +312,7 @@ fn default_llama_container() -> String {
 impl Default for AppConfig {
   fn default() -> Self {
     Self {
-      confirmations: default_confirmations(),
+      confirmations: Confirmations::default(),
       api_base: default_api_base(),
       workdir: default_workdir(),
       transcripts_dir: default_transcripts_dir(),
@@ -321,7 +341,7 @@ pub struct SessionConfig {
   #[serde(default)]
   pub model: Option<String>,
   #[serde(default)]
-  pub thinking: Option<String>,
+  pub thinking: Thinking,
   #[serde(default)]
   pub tool_timeout_ms: Option<u64>,
   #[serde(default)]
@@ -359,6 +379,6 @@ impl ToolResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LiveStatus {
-  pub phase: String,
+  pub phase: Phase,
   pub model: String,
 }

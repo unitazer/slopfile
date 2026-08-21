@@ -186,9 +186,10 @@ cd slopfile           # repo root
 
 `start.sh` is idempotent — it errors out if the docker daemon is down, uses
 `docker compose up -d` (harmless if containers are already running, and waits
-for llama-server to be healthy), builds the host `slopfile` binary if missing,
-and opens nvim with the plugin loaded on the most recent transcript (creating
-one via `slopfile init` if none exist).
+for llama-server to be healthy), builds the host `slopfile` binary in release
+mode and deploys it into the container (`docker/run.sh deploy`), then opens
+nvim with the plugin loaded on the most recent transcript (creating one via
+`slopfile init` if none exist).
 
 Or manually:
 

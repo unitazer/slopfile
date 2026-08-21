@@ -1,11 +1,19 @@
-  use std::{env::temp_dir, fs::read_to_string, thread::spawn};
+use std::{env::temp_dir, fs::read_to_string, thread::spawn};
 
 use super::*;
-use crate::types::Role;
+use crate::daemon::{next_action, Action};
+use crate::docker::restart_llama_server;
+use crate::flow::{
+  questions_resolvable, resolve_questions, session_template,
+};
+use crate::lex::CONTEXT_FULL_NOTE;
+use crate::stream::StreamWriter;
+use crate::transcript::{draft_tail, tail_user_text};
+use crate::types::{Confirmations, Role};
 
 fn yolo_cfg() -> AppConfig {
     AppConfig {
-      confirmations: "yolo".into(),
+      confirmations: Confirmations::Yolo,
       api_base: "http://127.0.0.1:8080".into(),
       workdir: "/tmp".into(),
       transcripts_dir: "/tmp".into(),
@@ -81,7 +89,7 @@ fn yolo_cfg() -> AppConfig {
     });
 
     let path = sock.to_str().unwrap();
-    assert!(restart_llama_server(path, "clanker-llama").is_ok(), "204 → ok");
+    assert!(restart_llama_server(path, "clanker-llama").is_ok(), "204 -> ok");
     server.join().unwrap();
 
     let sock2 = sock.with_extension("sock2");
@@ -139,7 +147,7 @@ fn yolo_cfg() -> AppConfig {
     let pf2 = transcript::parse_file(&after);
     let roles: Vec<Role> = pf2.history.iter().map(|m| m.role).collect();
     assert_eq!(*roles.last().unwrap(), Role::Tool);
-    assert!(has_work(&pf2, &after, &cfg, false), "daemon continues after yolo");
+    assert!(next_action(&pf2, &after, &cfg, false) != Action::Idle, "daemon continues after yolo");
     std::fs::remove_dir_all(&dir).ok();
   }
 
@@ -152,9 +160,9 @@ fn yolo_cfg() -> AppConfig {
 
     let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
-    let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
+    let cfg = AppConfig { confirmations: Confirmations::Ask, ..yolo_cfg() };
     assert!(!questions_resolvable(&pf, &cfg));
-    assert!(!has_work(&pf, &text, &cfg, false), "ask mode waits, no work");
+    assert!(next_action(&pf, &text, &cfg, false) == Action::Idle, "ask mode waits, no work");
     std::fs::remove_dir_all(&dir).ok();
   }
 
@@ -173,7 +181,7 @@ fn yolo_cfg() -> AppConfig {
 
     let pf = transcript::parse_file(&text);
     assert_eq!(pf.pending_questions.len(), 2, "two pending blocks parsed");
-    let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
+    let cfg = AppConfig { confirmations: Confirmations::Ask, ..yolo_cfg() };
     assert!(
       !questions_resolvable(&pf, &cfg),
       "leading unanswered block must gate resolvability"
@@ -197,7 +205,7 @@ fn yolo_cfg() -> AppConfig {
       sample_with_question_block()
     );
     std::fs::write(&path, src.clone()).unwrap();
-    strip_abort_marker(&path, &src).unwrap();
+    transcript::strip_abort_marker(&path, &src).unwrap();
     let after = read_to_string(&path).unwrap();
     assert!(!after.contains("slopfile:abort"));
     assert!(after.contains("### You"));
@@ -229,12 +237,12 @@ Let me read a file.
       "<!-- slopfile:live {\"phase\":\"generating\"} --><!-- slopfile:abort -->\n"
     ));
     let pf = transcript::parse_file(prose);
-    assert!(has_work(&pf, prose, &yolo_cfg(), false), "prose mention must not stall the file");
+    assert!(next_action(&pf, prose, &yolo_cfg(), false) != Action::Idle, "prose mention must not stall the file");
   }
 
   #[test]
-  fn stream_writer_stops_and_strips_when_marker_appears_mid_stream() {
-    let dir = temp_dir().join("slopfile-test-streamabort");
+  fn stream_writer_finalizes_sections_and_keeps_live_line() {
+    let dir = temp_dir().join("slopfile-test-streamwriter");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.md");
     std::fs::write(
@@ -243,28 +251,36 @@ Let me read a file.
     )
     .unwrap();
 
+    let live = "<!-- slopfile:live {\"phase\":\"generating\"} -->".to_string();
     let mut w = StreamWriter::new(
       &path,
       &read_to_string(&path).unwrap(),
-      Some("<!-- slopfile:live {\"phase\":\"generating\"} -->".into()),
+      Some(live.clone()),
     );
     assert!(w.handle(&types::StreamEvent::Text("hello ".into())));
-    {
-      let mut f = read_to_string(&path).unwrap();
-      f.push_str(transcript::ABORT_MARKER);
-      f.push('\n');
-      std::fs::write(&path, f).unwrap();
-    }
-    assert!(!w.handle(&types::StreamEvent::Text("world".into())));
+    assert!(w.handle(&types::StreamEvent::Text("world".into())));
+    w.finish_section();
     let after = read_to_string(&path).unwrap();
-    assert!(after.contains("hello"), "text up to abort is kept");
-    assert!(!after.contains("world"), "post-abort text dropped");
-    assert!(!after.contains("slopfile:abort"), "marker stripped");
-    assert!(
-      after
-        .trim_end()
-        .ends_with("<!-- slopfile:live {\"phase\":\"generating\"} -->")
-    );
+    assert!(after.contains("hello world"), "streamed text kept: {after}");
+    assert!(after.trim_end().ends_with(&live), "live line restored at bottom");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn finalize_turn_appends_marker_and_strips_abort_lines() {
+    let dir = temp_dir().join("slopfile-test-finalize");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.md");
+    std::fs::write(
+      &path,
+      "### Assistant\npartial reply\n<!-- slopfile:abort -->\nlive line below\n",
+    )
+    .unwrap();
+    daemon::finalize_turn(&path, "<!-- @done -->\n".into()).unwrap();
+    let after = read_to_string(&path).unwrap();
+    assert!(!after.contains("slopfile:abort"), "abort lines stripped");
+    assert!(after.contains("partial reply"));
+    assert!(after.contains("<!-- @done -->"));
     std::fs::remove_dir_all(&dir).ok();
   }
 
@@ -275,8 +291,8 @@ Let me read a file.
     let path = dir.join("s.md");
     std::fs::write(&path, "### You\nhi\n").unwrap();
 
-    assert!(!file_has_abort(&path), "marker-free file must keep going");
-    let keep_going = || !file_has_abort(&path);
+    assert!(!transcript::file_has_abort(&path), "marker-free file must keep going");
+    let keep_going = || !transcript::file_has_abort(&path);
     assert!(keep_going(), "no marker -> keep_going() true (continue)");
 
     let mut f = read_to_string(&path).unwrap();
@@ -284,7 +300,7 @@ Let me read a file.
     f.push('\n');
     std::fs::write(&path, f).unwrap();
 
-    assert!(file_has_abort(&path), "marker present -> has abort");
+    assert!(transcript::file_has_abort(&path), "marker present -> has abort");
     assert!(!keep_going(), "marker present -> keep_going() false (abort)");
     std::fs::remove_dir_all(&dir).ok();
   }
@@ -301,7 +317,7 @@ Let me read a file.
     let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
     assert!(!pf.pending_questions.is_empty());
-    let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
+    let cfg = AppConfig { confirmations: Confirmations::Ask, ..yolo_cfg() };
     assert!(questions_resolvable(&pf, &cfg), "/skip resolves in ask mode");
     resolve_questions(&path, &text, &pf, &cfg).unwrap();
 
@@ -315,45 +331,6 @@ Let me read a file.
   }
 
   #[test]
-  fn truncate_keeps_system_and_drops_oldest_turns() {
-    let mut msgs = vec![ChatMessage::system("sys prompt here")];
-    for i in 1..=8 {
-      msgs.push(ChatMessage::user(format!("user turn number {i} with some body text")));
-      msgs.push(ChatMessage::assistant(format!("assistant answer number {i} with some body text")));
-    }
-    let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
-    let small = truncate_messages(msgs.clone(), &counts, 12);
-    assert_eq!(small[0].role, Role::System);
-    assert!(small.len() < msgs.len(), "old turns dropped: {} -> {}",
-      msgs.len(), small.len());
-    let last = small.last().unwrap();
-    assert_eq!(last.content.as_deref(), Some("assistant answer number 8 with some body text"));
-    assert!(matches!(small[1].role, Role::User | Role::Assistant));
-
-    let big = truncate_messages(msgs.clone(), &counts, 1_000_000);
-    assert_eq!(big.len(), msgs.len());
-  }
-
-  #[test]
-  fn truncate_cuts_tool_rounds_as_a_pair() {
-    let mut msgs = vec![ChatMessage::system("sys")];
-    for i in 1..=4 {
-      msgs.push(ChatMessage::user(format!("u{i}")));
-      let call = ToolCall::new(format!("id{i}"), "bash".to_string(), "{}".to_string());
-      let mut asst = ChatMessage::assistant(format!("thinking then call {i}"));
-      asst.tool_calls = Some(vec![call.clone()]);
-      msgs.push(asst);
-      msgs.push(ChatMessage::tool(call.id.clone(), "bash".to_string(), "out".to_string()));
-    }
-    let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
-    let small = truncate_messages(msgs.clone(), &counts, 6);
-    assert!(matches!(small[1].role, Role::User | Role::Assistant));
-    let has_call = small.iter().any(|m| m.tool_calls.is_some());
-    let has_result = small.iter().any(|m| m.role == Role::Tool);
-    assert_eq!(has_call, has_result, "tool round is atomic");
-  }
-
-  #[test]
   fn draft_below_done_is_work() {
     let dir = temp_dir().join("slopfile-test-draft");
     std::fs::create_dir_all(&dir).unwrap();
@@ -361,8 +338,8 @@ Let me read a file.
     std::fs::write(&path, format!("{}\n<!-- @done -->\nkeep running daemons\n", sample_with_question_block())).unwrap();
     let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
-    assert!(has_work(&pf, &text, &yolo_cfg(), false));
-    assert_eq!(draft_tail_after_done(&text).map(|s| s.trim().to_string()), Some("keep running daemons".into()));
+    assert!(next_action(&pf, &text, &yolo_cfg(), false) != Action::Idle);
+    assert_eq!(draft_tail(&text).map(|s| s.trim().to_string()), Some("keep running daemons".into()));
     std::fs::remove_dir_all(&dir).ok();
   }
 
@@ -370,24 +347,24 @@ Let me read a file.
   fn ask_mode_draft_waits_for_send_marker() {
     let base = "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\n<!-- @done -->\n";
     let draft = format!("{base}keep the daemons running\n");
-    let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
+    let cfg = AppConfig { confirmations: Confirmations::Ask, ..yolo_cfg() };
 
     let pf = transcript::parse_file(&draft);
     assert!(
-      !has_work(&pf, &draft, &cfg, false),
+      next_action(&pf, &draft, &cfg, false) == Action::Idle,
       "a plain save must not launch the model"
     );
 
     let sent = format!("{draft}{}\n", transcript::SEND_MARKER);
     let pf2 = transcript::parse_file(&sent);
-    assert!(has_work(&pf2, &sent, &cfg, true), "a :Send arms the file");
+    assert!(next_action(&pf2, &sent, &cfg, true) != Action::Idle, "a :Send arms the file");
     assert!(transcript::send_marker_present(&sent));
     assert!(
-      draft_tail_after_done(&sent).is_some_and(|d| d.contains("keep the daemons running")),
+      draft_tail(&sent).is_some_and(|d| d.contains("keep the daemons running")),
       "the marker must never become the draft"
     );
 
-    let stripped = without_send_lines(&sent);
+    let stripped = transcript::without_send_lines(&sent);
     assert!(!transcript::send_marker_present(&stripped), "daemon consumes the marker");
     assert!(stripped.contains("keep the daemons running"), "draft kept");
   }
@@ -400,9 +377,9 @@ Let me read a file.
     let note_only = format!("{base}{note}");
     let text = &note_only;
     let pf = transcript::parse_file(text);
-    assert!(draft_tail_after_done(text).is_none(), "note is not a draft");
-    assert!(section_below_done(text).is_none(), "note is not a section");
-    assert!(!has_work(&pf, text, &yolo_cfg(), false), "note-only tail must be idle");
+    assert!(draft_tail(text).is_none(), "note is not a draft");
+    assert!(tail_user_text(text).is_none(), "note is not a section");
+    assert!(next_action(&pf, text, &yolo_cfg(), false) == Action::Idle, "note-only tail must be idle");
     assert!(!pf
       .history
       .iter()
@@ -412,10 +389,10 @@ Let me read a file.
     let text = &note_and_draft;
     let pf = transcript::parse_file(text);
     assert_eq!(
-      draft_tail_after_done(text).map(|s| s.trim().to_string()),
+      draft_tail(text).map(|s| s.trim().to_string()),
       Some("continue the work".into())
     );
-    assert!(has_work(&pf, text, &yolo_cfg(), false));
+    assert!(next_action(&pf, text, &yolo_cfg(), false) != Action::Idle);
   }
 
   #[test]
@@ -428,13 +405,13 @@ Let me read a file.
     );
     std::fs::write(&path, &text).unwrap();
     let _pf = transcript::parse_file(&text);
-    promote_draft(&path, &text).expect("promote");
+    crate::flow::promote_draft(&path, &text).expect("promote");
     let after = read_to_string(&path).unwrap();
     let note_ix = after.find(CONTEXT_FULL_NOTE).expect("note kept");
     let you_ix = after.find("### You\nnext message").expect("section right before draft");
     let done_ix = after.find("<!-- @done -->").expect("done marker");
     assert!(done_ix < note_ix && note_ix < you_ix, "layout: {after}");
-    let section = section_below_done(&after).expect("promoted section");
+    let section = tail_user_text(&after).expect("promoted section");
     let msgs = transcript::tail_sections(&section);
     assert!(msgs
       .iter()
@@ -491,4 +468,3 @@ Let me read a file.
 
     std::fs::remove_dir_all(&dir).ok();
   }
-

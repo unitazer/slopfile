@@ -162,17 +162,37 @@ pub async fn run(
   }
 }
 
+/// Fetch a required string argument, with a uniform `<tool>: missing string
+/// argument "<key>"` error. Use [`arg!`] / [`path!`] at call sites that bail.
+fn str_arg<'a>(tool: &str, args: &'a Value, key: &str) -> Result<&'a str, ToolResult> {
+  args.get(key).and_then(Value::as_str).ok_or_else(|| {
+    ToolResult::err(format!("{tool}: missing string argument \"{key}\""))
+  })
+}
+
+macro_rules! arg {
+  ($tool:expr, $args:expr, $key:expr) => {
+    match str_arg($tool, $args, $key) {
+      Ok(v) => v,
+      Err(e) => return e,
+    }
+  };
+}
+
+macro_rules! path {
+  ($workdir:expr, $s:expr) => {
+    match resolve_in($workdir, $s) {
+      Ok(p) => p,
+      Err(e) => return ToolResult::err(e),
+    }
+  };
+}
 
 fn read(workdir: &Path, args: &Value) -> ToolResult {
-  let Some(path_str) = args.get("path").and_then(Value::as_str) else {
-    return ToolResult::err("read: missing string argument \"path\"");
-  };
+  let path_str = arg!("read", args, "path");
   let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
   let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
-  let path = match resolve_in(workdir, path_str) {
-    Ok(p) => p,
-    Err(e) => return ToolResult::err(e),
-  };
+  let path = path!(workdir, path_str);
   let content = match read_to_string(&path) {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("read: cannot read {path_str}: {e}")),
@@ -192,16 +212,9 @@ fn read(workdir: &Path, args: &Value) -> ToolResult {
 }
 
 fn write(workdir: &Path, args: &Value) -> ToolResult {
-  let Some(path_str) = args.get("path").and_then(Value::as_str) else {
-    return ToolResult::err("write: missing string argument \"path\"");
-  };
-  let Some(content) = args.get("content").and_then(Value::as_str) else {
-    return ToolResult::err("write: missing string argument \"content\"");
-  };
-  let path = match resolve_in(workdir, path_str) {
-    Ok(p) => p,
-    Err(e) => return ToolResult::err(e),
-  };
+  let path_str = arg!("write", args, "path");
+  let content = arg!("write", args, "content");
+  let path = path!(workdir, path_str);
   if let Some(parent) = path.parent()
     && let Err(e) = create_dir_all(parent)
   {
@@ -214,22 +227,13 @@ fn write(workdir: &Path, args: &Value) -> ToolResult {
 }
 
 fn edit(workdir: &Path, args: &Value) -> ToolResult {
-  let Some(path_str) = args.get("path").and_then(Value::as_str) else {
-    return ToolResult::err("edit: missing string argument \"path\"");
-  };
-  let Some(old) = args.get("old").and_then(Value::as_str) else {
-    return ToolResult::err("edit: missing string argument \"old\"");
-  };
-  let Some(new) = args.get("new").and_then(Value::as_str) else {
-    return ToolResult::err("edit: missing string argument \"new\"");
-  };
+  let path_str = arg!("edit", args, "path");
+  let old = arg!("edit", args, "old");
+  let new = arg!("edit", args, "new");
   if old.is_empty() {
     return ToolResult::err("edit: old text must not be empty");
   }
-  let path = match resolve_in(workdir, path_str) {
-    Ok(p) => p,
-    Err(e) => return ToolResult::err(e),
-  };
+  let path = path!(workdir, path_str);
   let content = match read_to_string(&path) {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("edit: cannot read {path_str}: {e}")),
@@ -252,14 +256,9 @@ fn edit(workdir: &Path, args: &Value) -> ToolResult {
 }
 
 async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
-  let Some(command) = args.get("command").and_then(Value::as_str) else {
-    return ToolResult::err("bash: missing string argument \"command\"");
-  };
+  let command = arg!("bash", args, "command");
   let cwd_arg = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
-  let cwd = match resolve_in(workdir, cwd_arg) {
-    Ok(p) => p,
-    Err(e) => return ToolResult::err(e),
-  };
+  let cwd = path!(workdir, cwd_arg);
   let mut child = match Command::new("sh")
     .arg("-c")
     .arg(command)
@@ -323,17 +322,12 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
 }
 
 fn grep(workdir: &Path, args: &Value) -> ToolResult {
-  let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
-    return ToolResult::err("grep: missing string argument \"pattern\"");
-  };
+  let pattern = arg!("grep", args, "pattern");
   if pattern.is_empty() {
     return ToolResult::err("grep: empty pattern matches everything; refused");
   }
   let path_arg = args.get("path").and_then(Value::as_str).unwrap_or(".");
-  let root = match resolve_in(workdir, path_arg) {
-    Ok(p) => p,
-    Err(e) => return ToolResult::err(e),
-  };
+  let root = path!(workdir, path_arg);
   let files = match walk_files(workdir, &root) {
     Ok(f) => f,
     Err(e) => return ToolResult::err(e),
@@ -361,17 +355,12 @@ fn grep(workdir: &Path, args: &Value) -> ToolResult {
 }
 
 fn find(workdir: &Path, args: &Value) -> ToolResult {
-  let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
-    return ToolResult::err("find: missing string argument \"pattern\"");
-  };
+  let pattern = arg!("find", args, "pattern");
   if pattern.is_empty() {
     return ToolResult::err("find: empty pattern matches everything; refused");
   }
   let path_arg = args.get("path").and_then(Value::as_str).unwrap_or(".");
-  let root = match resolve_in(workdir, path_arg) {
-    Ok(p) => p,
-    Err(e) => return ToolResult::err(e),
-  };
+  let root = path!(workdir, path_arg);
   let files = match walk_files(workdir, &root) {
     Ok(f) => f,
     Err(e) => return ToolResult::err(e),
@@ -398,10 +387,7 @@ fn find(workdir: &Path, args: &Value) -> ToolResult {
 
 fn ls(workdir: &Path, args: &Value) -> ToolResult {
   let path_arg = args.get("path").and_then(Value::as_str).unwrap_or(".");
-  let root = match resolve_in(workdir, path_arg) {
-    Ok(p) => p,
-    Err(e) => return ToolResult::err(e),
-  };
+  let root = path!(workdir, path_arg);
   let meta = match std::fs::metadata(&root) {
     Ok(m) => m,
     Err(e) => return ToolResult::err(format!("ls: cannot access {path_arg}: {e}")),
