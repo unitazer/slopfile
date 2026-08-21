@@ -3,7 +3,16 @@ use crate::lex::{lex, lex_line, Token, TokKind};
 use crate::questions::QuestionsBlock;
 use crate::types::{ChatMessage, Role, SessionConfig, ToolCall};
 
-pub use crate::lex::ABORT_MARKER;
+#[allow(unused_imports)]
+pub use crate::lex::{ABORT_MARKER, SEND_MARKER};
+
+pub fn send_marker_present(text: &str) -> bool {
+  lex(text).iter().any(|t| t.kind == TokKind::Send)
+}
+
+pub fn is_send_line(line: &str) -> bool {
+  lex_line(line) == TokKind::Send
+}
 
 pub fn abort_marker_present(text: &str) -> bool {
   lex(text).iter().any(|t| t.kind == TokKind::Abort)

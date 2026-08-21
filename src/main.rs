@@ -158,6 +158,7 @@ fn scan_transcripts(dir: &str) -> Result<Vec<PathBuf>, String> {
 
 async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
   let mut turns = 0;
+  let mut sent = false;
   loop {
     turns += 1;
     if turns > 20 {
@@ -165,7 +166,19 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
       return Ok(());
     }
 
-    let text = read_file(path)?;
+    let mut text = read_file(path)?;
+
+    if !sent && transcript::send_marker_present(&text) {
+      let (body, live) = strip_live_line(&text);
+      let mut out = without_send_lines(&body);
+      if let Some((_, live)) = live {
+        out.push('\n');
+        out.push_str(&live);
+      }
+      write_file(path, out.clone())?;
+      text = out;
+      sent = true;
+    }
 
     if text.trim().is_empty() {
       if read_file(path)?.trim().is_empty() {
@@ -181,7 +194,7 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
     }
 
     let pf = transcript::parse_file(&text);
-    if !has_work(&pf, &text, cfg) {
+    if !has_work(&pf, &text, cfg, sent) {
       return Ok(());
     }
 
@@ -209,7 +222,15 @@ async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Resul
   }
 }
 
-fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
+fn has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig, sent: bool) -> bool {
+  // yolo auto-answers questions and never waits for an explicit send.
+  if cfg.confirmations == "yolo" {
+    return auto_has_work(pf, text, cfg);
+  }
+  sent && auto_has_work(pf, text, cfg)
+}
+
+fn auto_has_work(pf: &ParsedFile, text: &str, cfg: &AppConfig) -> bool {
   if pf.dangling.is_some() {
     return true;
   }
@@ -1147,6 +1168,19 @@ fn without_abort_lines(text: &str) -> String {
   let mut out = String::new();
   for l in text.split('\n') {
     if transcript::is_abort_line(l) {
+      continue;
+    }
+    out.push_str(l);
+    out.push('\n');
+  }
+  out.truncate(out.len().saturating_sub(1));
+  out
+}
+
+fn without_send_lines(text: &str) -> String {
+  let mut out = String::new();
+  for l in text.split('\n') {
+    if transcript::is_send_line(l) {
       continue;
     }
     out.push_str(l);

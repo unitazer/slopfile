@@ -139,7 +139,7 @@ fn yolo_cfg() -> AppConfig {
     let pf2 = transcript::parse_file(&after);
     let roles: Vec<Role> = pf2.history.iter().map(|m| m.role).collect();
     assert_eq!(*roles.last().unwrap(), Role::Tool);
-    assert!(has_work(&pf2, &after, &cfg), "daemon continues after yolo");
+    assert!(has_work(&pf2, &after, &cfg, false), "daemon continues after yolo");
     std::fs::remove_dir_all(&dir).ok();
   }
 
@@ -154,7 +154,7 @@ fn yolo_cfg() -> AppConfig {
     let pf = transcript::parse_file(&text);
     let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
     assert!(!questions_resolvable(&pf, &cfg));
-    assert!(!has_work(&pf, &text, &cfg), "ask mode waits, no work");
+    assert!(!has_work(&pf, &text, &cfg, false), "ask mode waits, no work");
     std::fs::remove_dir_all(&dir).ok();
   }
 
@@ -229,7 +229,7 @@ Let me read a file.
       "<!-- slopfile:live {\"phase\":\"generating\"} --><!-- slopfile:abort -->\n"
     ));
     let pf = transcript::parse_file(prose);
-    assert!(has_work(&pf, prose, &yolo_cfg()), "prose mention must not stall the file");
+    assert!(has_work(&pf, prose, &yolo_cfg(), false), "prose mention must not stall the file");
   }
 
   #[test]
@@ -361,9 +361,35 @@ Let me read a file.
     std::fs::write(&path, format!("{}\n<!-- @done -->\nkeep running daemons\n", sample_with_question_block())).unwrap();
     let text = read_to_string(&path).unwrap();
     let pf = transcript::parse_file(&text);
-    assert!(has_work(&pf, &text, &yolo_cfg()));
+    assert!(has_work(&pf, &text, &yolo_cfg(), false));
     assert_eq!(draft_tail_after_done(&text).map(|s| s.trim().to_string()), Some("keep running daemons".into()));
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn ask_mode_draft_waits_for_send_marker() {
+    let base = "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n\n### Assistant\n<!-- @done -->\n";
+    let draft = format!("{base}keep the daemons running\n");
+    let cfg = AppConfig { confirmations: "ask".into(), ..yolo_cfg() };
+
+    let pf = transcript::parse_file(&draft);
+    assert!(
+      !has_work(&pf, &draft, &cfg, false),
+      "a plain save must not launch the model"
+    );
+
+    let sent = format!("{draft}{}\n", transcript::SEND_MARKER);
+    let pf2 = transcript::parse_file(&sent);
+    assert!(has_work(&pf2, &sent, &cfg, true), "a :Send arms the file");
+    assert!(transcript::send_marker_present(&sent));
+    assert!(
+      draft_tail_after_done(&sent).is_some_and(|d| d.contains("keep the daemons running")),
+      "the marker must never become the draft"
+    );
+
+    let stripped = without_send_lines(&sent);
+    assert!(!transcript::send_marker_present(&stripped), "daemon consumes the marker");
+    assert!(stripped.contains("keep the daemons running"), "draft kept");
   }
 
   #[test]
@@ -376,7 +402,7 @@ Let me read a file.
     let pf = transcript::parse_file(text);
     assert!(draft_tail_after_done(text).is_none(), "note is not a draft");
     assert!(section_below_done(text).is_none(), "note is not a section");
-    assert!(!has_work(&pf, text, &yolo_cfg()), "note-only tail must be idle");
+    assert!(!has_work(&pf, text, &yolo_cfg(), false), "note-only tail must be idle");
     assert!(!pf
       .history
       .iter()
@@ -389,7 +415,7 @@ Let me read a file.
       draft_tail_after_done(text).map(|s| s.trim().to_string()),
       Some("continue the work".into())
     );
-    assert!(has_work(&pf, text, &yolo_cfg()));
+    assert!(has_work(&pf, text, &yolo_cfg(), false));
   }
 
   #[test]

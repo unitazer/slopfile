@@ -2,6 +2,7 @@
 local M = {}
 
 local ABORT_MARKER = "<!-- slopfile:abort -->"
+local SEND_MARKER = "<!-- slopfile:send -->"
 
 local function is_session_buf(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr or 0)
@@ -60,11 +61,23 @@ function M.init()
   vim.notify("slopfile: init requested (daemon formats empty sessions)", vim.log.levels.INFO)
 end
 
+local function arm_marker(marker)
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  for _, l in ipairs(lines) do
+    if l:match("^%s*" .. marker .. "%s*$") then
+      return
+    end
+  end
+  table.insert(lines, marker)
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+end
+
 function M.send()
   if not is_session_buf(0) then
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
+  arm_marker(SEND_MARKER)
   vim.cmd("write")
   checktime()
   vim.notify("slopfile: sent", vim.log.levels.INFO)
@@ -75,6 +88,7 @@ function M.resume()
     vim.notify("slopfile: not a session .md buffer", vim.log.levels.WARN)
     return
   end
+  arm_marker(SEND_MARKER)
   vim.cmd("write")
   checktime()
   vim.notify("slopfile: resume requested", vim.log.levels.INFO)

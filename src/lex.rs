@@ -1,5 +1,6 @@
 
 pub const DONE_MARKER: &str = "<!-- @done -->";
+pub const SEND_MARKER: &str = "<!-- slopfile:send -->";
 pub const ABORT_MARKER: &str = "<!-- slopfile:abort -->";
 pub const ABORTED_MARKER: &str = "<!-- slopfile:aborted -->";
 pub const THINK_START: &str = "<!-- thinking -->";
@@ -22,6 +23,7 @@ pub enum TokKind {
   FenceClose,
   Heading,
   Done,
+  Send,
   Abort,
   Aborted,
   Live,
@@ -40,7 +42,10 @@ pub enum TokKind {
 
 impl TokKind {
   pub fn is_daemon_owned(self) -> bool {
-    matches!(self, TokKind::Live | TokKind::Abort | TokKind::Aborted | TokKind::ContextFull)
+    matches!(
+      self,
+      TokKind::Live | TokKind::Send | TokKind::Abort | TokKind::Aborted | TokKind::ContextFull
+    )
   }
 
   pub fn is_turn_end(self) -> bool {
@@ -146,6 +151,7 @@ fn classify(raw: &str) -> TokenKindWithPayload<'_> {
   let t = raw.trim();
   match t {
     _ if t == DONE_MARKER => token(TokKind::Done, ""),
+    _ if t == SEND_MARKER => token(TokKind::Send, ""),
     _ if t == THINK_START => token(TokKind::ThinkingOpen, ""),
     _ if t == THINK_END => token(TokKind::ThinkingEnd, ""),
     _ if backtick_run(t).is_some() => token(TokKind::FenceClose, ""),
