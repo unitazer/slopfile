@@ -114,6 +114,34 @@ Here is the listing.
   }
 
   #[test]
+  fn dangling_partial_is_not_duplicated_into_history() {
+    // Regression: a transcript whose last turn is a tool call with NO done
+    // marker and no live line anywhere used to fold the dangling assistant
+    // section into history AND replay it, producing two consecutive
+    // assistant messages that llama-server rejects (HTTP 400).
+    let txt = concat!(
+      "```toml\nmodel = \"m\"\n```\n# S\nSys.\n\n### You\ngo\n\n",
+      "### Assistant\nrunning it\n",
+      "<!-- tool:bash {\"command\":\"lua -v\"} -->\nLua 5.5\n",
+      "<!-- result:bash ok=1ms -->\n",
+      "### Assistant\n<!-- thinking -->\nmid-thought\n"
+    );
+    let pf = parse_file(txt);
+    assert!(pf.dangling.is_some(), "tail is dangling");
+    let last_two: Vec<Role> = pf.history.iter().rev().take(2).map(|m| m.role).collect();
+    assert_eq!(last_two, vec![Role::Tool, Role::Assistant]);
+    let tool_turn = &pf.history[pf.history.len() - 2];
+    assert!(tool_turn.tool_calls.is_some(), "history ends with the tool-call turn");
+    assert!(
+      !pf
+        .history
+        .iter()
+        .any(|m| m.content.as_deref().is_some_and(|c| c.contains("mid-thought"))),
+      "partial must not leak into history"
+    );
+  }
+
+  #[test]
   fn dangling_partial_replays_as_assistant_messages() {
     let partial = "<!-- thinking -->\nlet me think about this\n<!-- /thinking -->\nContinue the work.\n";
     let msgs = assistant_section_messages(partial);
@@ -299,13 +327,18 @@ real reply
       .iter()
       .filter(|m| m.role == Role::Assistant)
       .count();
-    assert_eq!(asst_msgs, 2);
+    assert_eq!(asst_msgs, 1, "unfinished trailing section stays out of history");
     assert!(!pf
       .history
       .iter()
       .any(|m| m.tool_calls.is_some()), "fenced tool marker must not open a block");
-    let last = pf.history.last().unwrap();
-    assert_eq!(last.content.as_deref().unwrap().trim(), "real reply");
+    assert!(
+      pf.dangling
+        .as_ref()
+        .is_some_and(|d| d.partial_text.contains("real reply")),
+      "trailing prose is the dangling partial: {:?}",
+      pf.dangling
+    );
   }
 
   #[test]

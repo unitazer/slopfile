@@ -449,18 +449,6 @@ pub fn parse_file(text: &str) -> ParsedFile {
     }
   }
 
-  let last_done_line = toks
-    .iter()
-    .rfind(|t| t.kind.is_turn_end())
-    .map(|t| t.line);
-  let status_line = toks.iter().rfind(|t| t.kind == TokKind::Live).map(|t| t.line);
-  let history_end = match (last_done_line, status_line) {
-    (Some(d), _) => d + 1,
-    (None, Some(s)) => s,
-    (None, None) => n_lines,
-  };
-  history.extend(build_history(&toks, history_end, Mode::System));
-
   let dangling = asst_lines.last().and_then(|&last_asst| {
     let after_ix = toks
       .iter()
@@ -488,14 +476,35 @@ pub fn parse_file(text: &str) -> ParsedFile {
       .count();
     if tools > results || (tools == 0 && !section.trim().is_empty()) {
       let heading = toks.iter().find(|t| t.line == last_asst)?;
-      Some(DanglingTail {
+      Some((last_asst, DanglingTail {
         resume_offset: heading.line_end(),
         partial_text: text[after_ix + heading.text.len()..section_end].to_string(),
-      })
+      }))
     } else {
       None
     }
   });
+  let dangling_asst_line = dangling.as_ref().map(|(line, _)| *line);
+
+  let last_done_line = toks
+    .iter()
+    .rfind(|t| t.kind.is_turn_end())
+    .map(|t| t.line);
+  let status_line = toks.iter().rfind(|t| t.kind == TokKind::Live).map(|t| t.line);
+  // A dangling partial assistant section is replayed separately; it must not
+  // also land in history, or the request ends with two identical assistant
+  // messages and llama-server rejects it.
+  let mut history_end = match (last_done_line, status_line) {
+    (Some(d), _) => d + 1,
+    (None, Some(s)) => s,
+    (None, None) => n_lines,
+  };
+  if let Some(line) = dangling_asst_line {
+    history_end = history_end.min(line);
+  }
+  history.extend(build_history(&toks, history_end, Mode::System));
+
+  let dangling = dangling.map(|(_, tail)| tail);
 
   let tail = match last_done_line {
     Some(d) => {
