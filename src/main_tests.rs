@@ -515,6 +515,14 @@ Let me read a file.
       t2.contains("tools_excluded = [\"question\", \"subagent\"]"),
       "depth-2 child loses subagent tool: {t2}"
     );
+    assert!(
+      t2.contains("nobody will answer") && !t2.contains("call the `question` tool"),
+      "prompt adapts to missing question tool: {t2}"
+    );
+    assert!(
+      !t2.contains("- subagent:") && t1.contains("- subagent:"),
+      "prompt advertises only available tools"
+    );
 
     let err = spawn_subagent(&c2, "too deep", &cfg).unwrap_err();
     assert!(err.contains("depth limit"), "{err}");

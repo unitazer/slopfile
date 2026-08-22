@@ -36,7 +36,7 @@ pub fn session_template(cfg: &AppConfig) -> String {
 pub fn session_template_with(cfg: &AppConfig, tools_excluded: &[String]) -> String {
   let mut out = session_header(&cfg.model, DEFAULT_TOOLS, tools_excluded);
   out.push_str("# Session\n");
-  out.push_str(&system_prompt_default(cfg));
+  out.push_str(&system_prompt_default(cfg, tools_excluded));
   out.push_str("\n### You\n");
   out
 }
@@ -130,11 +130,17 @@ pub fn inject_subagent_report(
   write_file(parent, reassemble(&body, &extra, live.as_deref()))
 }
 
-fn system_prompt_default(cfg: &AppConfig) -> String {
+fn system_prompt_default(cfg: &AppConfig, tools_excluded: &[String]) -> String {
+  let has = |t: &str| !tools_excluded.iter().any(|x| x == t);
+  let decision_line = if has("question") {
+    "When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing."
+  } else {
+    "There is no `question` tool and nobody will answer; make reasonable decisions yourself and state your reasoning."
+  };
   let mut out = format!(
     "You are an expert software engineering assistant. You help the user by reading files, running commands, editing code, and writing files, and you reply to them in plain text.
 
-You act by calling tools. Your text replies and tool calls are relayed to the user automatically, one step at a time; continue based on each tool result. When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing.
+You act by calling tools. Your text replies and tool calls are relayed to the user automatically, one step at a time; continue based on each tool result. {decision_line}
 
 Available tools:
 - read: Read files as numbered lines
@@ -143,21 +149,28 @@ Available tools:
 - bash: Execute shell commands (ls, grep, find, etc.) in the workdir
 - grep: Search file contents for a substring
 - find: Find files by name suffix pattern
-- ls: List directory contents
-- subagent: Spawn a worker with its own fresh context to handle a self-contained task; its final report is returned here automatically
-
-Guidelines:
+- ls: List directory contents"
+  );
+  if has("subagent") {
+    out.push_str("\n- subagent: Spawn a worker with its own fresh context to handle a self-contained task; its final report is returned here automatically");
+  }
+  out.push_str(
+    "\n\nGuidelines:
 - Prefer grep/find/ls tools over bash for file exploration
 - Use read to examine files before editing. Use this tool instead of cat or sed.
 - Use edit for precise changes (old text must match exactly)
-- Use write only for new files or complete rewrites
-- Use subagent for large self-contained subtasks (e.g. 'research X and report back', 'fix all lint errors in module Y'); give it every detail it needs, since it cannot see this conversation. Spawn it, then wait for its report instead of duplicating its work.
-- Be concise in your replies; don't echo back full file contents unless asked
+- Use write only for new files or complete rewrites",
+  );
+  if has("subagent") {
+    out.push_str("\n- Use subagent for large self-contained subtasks (e.g. 'research X and report back', 'fix all lint errors in module Y'); give it every detail it needs, since it cannot see this conversation. Spawn it, then wait for its report instead of duplicating its work.");
+  }
+  out.push_str(&format!(
+    "\n- Be concise in your replies; don't echo back full file contents unless asked
 - Show file paths clearly when working with files
 
 Current working directory: {}",
     cfg.workdir
-  );
+  ));
   out.push_str(&skills_index(&cfg.skills_dir));
   out
 }
