@@ -267,6 +267,8 @@ pub struct AppConfig {
   pub workdir: String,
   #[serde(default = "default_transcripts_dir")]
   pub transcripts_dir: String,
+  #[serde(default = "default_skills_dir")]
+  pub skills_dir: String,
   #[serde(default = "default_sweep_interval_ms")]
   pub sweep_interval_ms: u64,
   #[serde(default = "default_model")]
@@ -289,6 +291,9 @@ fn default_workdir() -> String {
 }
 fn default_transcripts_dir() -> String {
   "shared/transcripts".to_string()
+}
+fn default_skills_dir() -> String {
+  "shared/skills".to_string()
 }
 fn default_sweep_interval_ms() -> u64 {
   250
@@ -316,6 +321,7 @@ impl Default for AppConfig {
       api_base: default_api_base(),
       workdir: default_workdir(),
       transcripts_dir: default_transcripts_dir(),
+      skills_dir: default_skills_dir(),
       sweep_interval_ms: default_sweep_interval_ms(),
       model: default_model(),
       tool_timeout_ms: default_tool_timeout_ms(),

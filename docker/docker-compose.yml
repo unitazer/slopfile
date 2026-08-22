@@ -50,6 +50,7 @@ services:
       SLOPFILE_CONFIG: /shared/slopfile.toml
       SLOPFILE_API_BASE: http://llama-server:8080
       SLOPFILE_TRANSCRIPTS: /shared/transcripts
+      SLOPFILE_SKILLS_DIR: /shared/skills
       SLOPFILE_WORKDIR: /workspace
       RUST_LOG: slopfile=info,warn
     restart: unless-stopped

@@ -17,6 +17,7 @@ fn yolo_cfg() -> AppConfig {
       api_base: "http://127.0.0.1:8080".into(),
       workdir: "/tmp".into(),
       transcripts_dir: "/tmp".into(),
+      skills_dir: "/tmp/does-not-exist".into(),
       sweep_interval_ms: 250,
       model: "qwen3.8-27b".into(),
       max_context_tokens: 8192,
@@ -442,6 +443,46 @@ Let me read a file.
     let sp = pf.history[0].content.as_deref().unwrap();
     assert!(sp.contains("expert software engineering assistant"));
     assert!(!sp.contains("# Session"), "heading stripped from prompt");
+  }
+
+  #[test]
+  fn session_template_lists_skills() {
+    let dir = temp_dir().join("slopfile-test-skills");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+      dir.join("b-deploy.md"),
+      "# Deploy checklist\n\nAlways run the tests before shipping.\n\nDetails here.\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("a-style.md"), "# Style guide\nUse tabs.\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "ignored, not markdown\n").unwrap();
+
+    let mut cfg = yolo_cfg();
+    cfg.skills_dir = dir.to_string_lossy().into();
+    let tpl = session_template(&cfg);
+    assert!(tpl.contains("Skills available in"), "index missing: {tpl}");
+    assert!(tpl.contains("- a-style.md: Use tabs"), "{tpl}");
+    assert!(tpl.contains("- b-deploy.md: Always run the tests before shipping."), "{tpl}");
+    assert!(!tpl.contains("notes.txt"), "non-md must be skipped: {tpl}");
+    std::fs::write(
+      dir.join("c-front.md"),
+      "---\nname: front-skill\ndescription: >\n  Handles frontmatter\n  skills properly.\nmetadata:\n  x: 1\n---\n\n# Body ignored\n",
+    )
+    .unwrap();
+    let tpl2 = session_template(&cfg);
+    assert!(
+      tpl2.contains("- c-front.md: Handles frontmatter skills properly."),
+      "frontmatter desc missing: {tpl2}"
+    );
+    std::fs::write(
+      dir.join("d-manual.md"),
+      "---\nname: manual-only\ndescription: Only for explicit requests.\ndisable-model-invocation: true\n---\n\n# Manual\n",
+    )
+    .unwrap();
+    let tpl3 = session_template(&cfg);
+    assert!(!tpl3.contains("d-manual.md"), "disabled skill must be skipped: {tpl3}");
+    assert!(tpl3.contains("- c-front.md:"), "other skills still listed: {tpl3}");
+    std::fs::remove_dir_all(&dir).ok();
   }
 
   #[test]

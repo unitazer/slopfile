@@ -79,12 +79,18 @@ fn load_app_config() -> AppConfig {
     if cfg.transcripts_dir == "shared/transcripts" && root.join("shared/transcripts").is_dir() {
       cfg.transcripts_dir = root.join("shared/transcripts").to_string_lossy().into();
     }
+    if cfg.skills_dir == "shared/skills" && root.join("shared/skills").is_dir() {
+      cfg.skills_dir = root.join("shared/skills").to_string_lossy().into();
+    }
   }
   if let Ok(v) = var("SLOPFILE_API_BASE") {
     cfg.api_base = v;
   }
   if let Ok(v) = var("SLOPFILE_TRANSCRIPTS") {
     cfg.transcripts_dir = v;
+  }
+  if let Ok(v) = var("SLOPFILE_SKILLS_DIR") {
+    cfg.skills_dir = v;
   }
   if let Ok(v) = var("SLOPFILE_WORKDIR") {
     cfg.workdir = v;

@@ -144,13 +144,14 @@ pub async fn run(
   arguments_json: &str,
   workdir: PathBuf,
   timeout_ms: u64,
+  extra_read_roots: &[PathBuf],
 ) -> ToolResult {
   let args: Value = match serde_json::from_str(arguments_json) {
     Ok(v) => v,
     Err(e) => return ToolResult::err(format!("bad arguments json: {e}")),
   };
   match name {
-    "read" => read(&workdir, &args),
+    "read" => read(&workdir, extra_read_roots, &args),
     "write" => write(&workdir, &args),
     "edit" => edit(&workdir, &args),
     "bash" => bash(&workdir, &args, timeout_ms).await,
@@ -188,11 +189,21 @@ macro_rules! path {
   };
 }
 
-fn read(workdir: &Path, args: &Value) -> ToolResult {
+fn read(workdir: &Path, extra_roots: &[PathBuf], args: &Value) -> ToolResult {
   let path_str = arg!("read", args, "path");
   let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
   let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
-  let path = path!(workdir, path_str);
+  let path = if extra_roots.is_empty() {
+    path!(workdir, path_str)
+  } else {
+    match resolve_in(workdir, path_str) {
+      Ok(p) => p,
+      Err(_) => match extra_roots.iter().find_map(|root| resolve_in(root, path_str).ok()) {
+        Some(p) => p,
+        None => return ToolResult::err(format!("read: path escapes workdir: {path_str}")),
+      },
+    }
+  };
   let content = match read_to_string(&path) {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("read: cannot read {path_str}: {e}")),
@@ -561,7 +572,7 @@ mod tests {
   }
 
   async fn t(name: &str, args: Value, dir: PathBuf) -> ToolResult {
-    run(name, &args.to_string(), dir, 30_000).await
+    run(name, &args.to_string(), dir, 30_000, &[]).await
   }
 
   #[tokio::test]
@@ -578,6 +589,36 @@ mod tests {
 
     let ok = t("read", json!({"path": "plain.md"}), wd.clone()).await;
     assert!(ok.ok, "plain read should succeed: {}", ok.output);
+  }
+
+  #[tokio::test]
+  async fn read_allows_extra_roots_but_only_for_read() {
+    let wd = test_dir("extra-roots-wd");
+    let skills = test_dir("extra-roots-skills");
+    fs::write(skills.join("skill.md"), "# Skill\nbody line\n").unwrap();
+
+    let args = json!({"path": skills.join("skill.md").to_string_lossy()});
+    let refused = run("read", &args.to_string(), wd.clone(), 30_000, &[]).await;
+    assert!(!refused.ok, "read outside workdir without extra root must fail");
+
+    let allowed =
+      run("read", &args.to_string(), wd.clone(), 30_000, &[skills.clone()]).await;
+    assert!(allowed.ok, "read with extra root should succeed: {}", allowed.output);
+    assert!(allowed.output.contains("body line"), "{}", allowed.output);
+
+    let escaped_write = run(
+      "write",
+      &json!({"path": skills.join("evil.md").to_string_lossy(), "content": "x"}).to_string(),
+      wd.clone(),
+      30_000,
+      &[skills.clone()],
+    )
+    .await;
+    assert!(!escaped_write.ok, "write must never use extra roots: {}", escaped_write.output);
+    assert!(!skills.join("evil.md").exists(), "no file may be written via extra root");
+
+    let _ = fs::remove_dir_all(&wd);
+    let _ = fs::remove_dir_all(&skills);
   }
 
   #[tokio::test]
@@ -830,7 +871,7 @@ mod tests {
   #[tokio::test]
   async fn bash_timeout_kills_the_child() {
     let wd = test_dir("bash-timeout");
-    let r = run("bash", "{\"command\":\"sleep 5\"}", wd.clone(), 200).await;
+    let r = run("bash", "{\"command\":\"sleep 5\"}", wd.clone(), 200, &[]).await;
     assert!(!r.ok, "sleep 5 with 200ms timeout should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
     let _ = fs::remove_dir_all(&wd);
@@ -841,7 +882,7 @@ mod tests {
     let wd = test_dir("bash-bgkill");
     let pid_file = wd.join("bg.pid");
     let cmd = format!("sleep 60 & echo $! > {}", pid_file.display());
-    let r = run("bash", &json!({ "command": cmd }).to_string(), wd.clone(), 200).await;
+    let r = run("bash", &json!({ "command": cmd }).to_string(), wd.clone(), 200, &[]).await;
     assert!(!r.ok, "should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
     let bg_pid: i32 = fs::read_to_string(&pid_file)
