@@ -270,6 +270,30 @@ Let me read a file.
   }
 
   #[test]
+  fn stream_translates_raw_think_tags_and_drops_orphans() {
+    let dir = temp_dir().join("slopfile-test-thinktags");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.md");
+    let seed = "```toml\nmodel = \"m\"\n```\n# S\nSys.\n\n### You\ngo\n";
+    std::fs::write(&path, seed).unwrap();
+
+    let mut w = StreamWriter::new(&path, &read_to_string(&path).unwrap(), None);
+    // resumed model closes the replayed reasoning block with a raw tag
+    assert!(w.handle(&types::StreamEvent::Text("</think>answer text".into())));
+    assert!(w.handle(&types::StreamEvent::Reasoning("hmm".into())));
+    assert!(w.handle(&types::StreamEvent::Text("<think>ignored open".into())));
+    w.finish_section();
+
+    let after = read_to_string(&path).unwrap();
+    assert!(!after.contains("</think>") && !after.contains("<think>"), "raw tags gone: {after}");
+    assert!(after.contains("<!-- /thinking -->"), "orphan close became marker");
+    assert!(after.contains("answer text"), "{after}");
+    assert!(after.contains("<!-- thinking -->\nhmm"), "reasoning kept: {after}");
+    assert!(after.contains("ignored open"), "{after}");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
   fn finalize_turn_appends_marker_and_strips_abort_lines() {
     let dir = temp_dir().join("slopfile-test-finalize");
     std::fs::create_dir_all(&dir).unwrap();

@@ -49,25 +49,68 @@ impl<'a> StreamWriter<'a> {
     match ev {
       StreamEvent::Text(t) => {
         self.ensure_header();
-        if self.in_reasoning {
-          self.in_reasoning = false;
-          self.out.push_str("<!-- /thinking -->\n");
-        }
-        self.out.push_str(t);
-        self.flush();
+        self.write_tag_aware(t);
       }
       StreamEvent::Reasoning(r) => {
         self.ensure_header();
-        if !self.in_reasoning {
-          self.in_reasoning = true;
-          self.out.push_str("<!-- thinking -->\n");
-        }
-        self.out.push_str(r);
-        self.flush();
+        self.emit(r, true);
       }
       StreamEvent::ToolCallFragment(_) | StreamEvent::Done(_) => {}
     }
     true
+  }
+
+  fn emit(&mut self, s: &str, reasoning: bool) {
+    if reasoning {
+      if !self.in_reasoning {
+        self.in_reasoning = true;
+        self.out.push_str("<!-- thinking -->\n");
+      }
+    } else if self.in_reasoning {
+      self.in_reasoning = false;
+      self.out.push_str("<!-- /thinking -->\n");
+    }
+    if !s.is_empty() {
+      self.out.push_str(s);
+    }
+    self.flush();
+  }
+
+  /// Models like Qwen3 close their native reasoning with literal
+  /// `<think>`/`</think>` tags that llama-server can leak into the text
+  /// channel (typically when resuming a cut-off reasoning block). Translate
+  /// them to harness markers; an orphan `</think>` with no matching open
+  /// state is dropped instead of polluting the transcript.
+  fn write_tag_aware(&mut self, mut s: &str) {
+    loop {
+      let open = s.find("<think>");
+      let close = s.find("</think>");
+      let pos = match (open, close) {
+        (None, None) => {
+          if !s.is_empty() {
+            self.emit(s, self.in_reasoning);
+          }
+          return;
+        }
+        (o, c) => match (o, c) {
+          (Some(o), Some(c)) => o.min(c),
+          (Some(o), None) => o,
+          (None, Some(c)) => c,
+          _ => unreachable!(),
+        },
+      };
+      let (before, rest) = s.split_at(pos);
+      if !before.is_empty() {
+        self.emit(before, self.in_reasoning);
+      }
+      if let Some(open_rest) = rest.strip_prefix("<think>") {
+        s = open_rest;
+        self.emit("", true);
+      } else {
+        s = rest.strip_prefix("</think>").expect("matched earlier");
+        self.emit("", false);
+      }
+    }
   }
 
   fn flush(&mut self) {
