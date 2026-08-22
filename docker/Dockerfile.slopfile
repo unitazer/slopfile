@@ -9,7 +9,7 @@ ENV RUSTUP_HOME=/usr/lib/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:${PATH}
 RUN pacman-key --init && \
-    pacman -Syu --noconfirm --needed rustup python sudo git curl lua53 && \
+    pacman -Syu --noconfirm --needed rustup python sudo git curl lua53 fd && \
     rustup default stable && \
     useradd -u 1000 -m slopfile && \
     echo 'slopfile ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/slopfile && \
