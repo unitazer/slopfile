@@ -8,7 +8,6 @@ use crate::types::{AppConfig, Confirmations, LiveStatus, Phase, ToolCall, ToolRe
 use std::path::{Path, PathBuf};
 
 pub const SUBAGENT_SUFFIX: &str = ".sub-";
-pub const SUBAGENT_REPORTED_MARKER: &str = "<!-- slopfile:reported -->";
 
 pub const DEFAULT_TOOLS: &[&str] = &[
   "read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent",

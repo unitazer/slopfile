@@ -5,9 +5,9 @@ use crate::daemon::{next_action, Action};
 use crate::docker::restart_llama_server;
 use crate::flow::{
   questions_resolvable, resolve_questions, session_template, spawn_subagent, subagent_depth,
-  write_tool_blocks, SUBAGENT_REPORTED_MARKER,
+  write_tool_blocks,
 };
-use crate::lex::CONTEXT_FULL_NOTE;
+use crate::lex::{CONTEXT_FULL_NOTE, REPORTED_MARKER};
 use crate::stream::StreamWriter;
 use crate::transcript::{draft_tail, tail_user_text};
 use crate::types::{AppConfig, Confirmations, Role};
@@ -573,14 +573,14 @@ Let me read a file.
     std::fs::write(&running, format!("### Assistant\nworking\n{}\n", crate::lex::DONE_MARKER)).unwrap();
     std::fs::write(
       &done,
-      format!("### Assistant\ndone\n{}\n{SUBAGENT_REPORTED_MARKER}\n", crate::lex::DONE_MARKER),
+      format!("### Assistant\ndone\n{}\n{REPORTED_MARKER}\n", crate::lex::DONE_MARKER),
     )
     .unwrap();
 
     let waiting = crate::daemon::unfinished_subagents(&parent).unwrap();
     assert_eq!(waiting, vec![running.clone()]);
 
-    std::fs::write(&running, format!("{}\n", SUBAGENT_REPORTED_MARKER)).unwrap();
+    std::fs::write(&running, format!("{}\n", REPORTED_MARKER)).unwrap();
     assert!(crate::daemon::unfinished_subagents(&parent).unwrap().is_empty());
 
     // lookalike files with the prefix but no strict `.sub-NN` shape never block
@@ -655,7 +655,7 @@ Let me read a file.
     crate::daemon::deliver_subagent_result(&child, crate::daemon::SubagentReport::FromTranscript).await.unwrap();
 
     let child_text = read_to_string(&child).unwrap();
-    assert!(child_text.contains(SUBAGENT_REPORTED_MARKER), "{child_text}");
+    assert!(child_text.contains(REPORTED_MARKER), "{child_text}");
     let parent_text = read_to_string(&parent).unwrap();
     assert!(parent_text.contains("[system] Subagent 'p.sub-01' finished."), "{parent_text}");
     assert!(parent_text.contains("the full final report"), "{parent_text}");
@@ -672,6 +672,27 @@ Let me read a file.
     assert_eq!(once_more.matches("the full final report").count(), 1, "no duplicate reports");
 
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn reported_marker_is_daemon_owned_and_keeps_child_idle() {
+    use crate::lex::{lex, TokKind};
+    let text = format!(
+      "### Assistant\nfinal report\n{}\n{}\n",
+      crate::lex::DONE_MARKER,
+      REPORTED_MARKER
+    );
+    let kinds: Vec<TokKind> = lex(&text).into_iter().map(|t| t.kind).collect();
+    assert!(kinds.contains(&TokKind::Reported), "marker lexed as Reported: {kinds:?}");
+    assert!(
+      lex(&text).iter().all(|t| !t.kind.is_daemon_owned() || t.kind == TokKind::Reported),
+      "reported marker counts as daemon-owned"
+    );
+    assert!(tail_user_text(&text).is_none(), "reported marker is not queued user text");
+
+    let cfg = yolo_cfg();
+    let pf = crate::transcript::parse_file(&text);
+    assert_eq!(next_action(&pf, &text, &cfg, false), Action::Idle);
   }
 
   #[test]

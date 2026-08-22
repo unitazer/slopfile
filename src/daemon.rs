@@ -1,9 +1,9 @@
 use crate::flow::{
   inject_subagent_report, is_subagent_path, questions_resolvable, promote_draft,
   render_questions_block, resolve_questions, session_template, write_status,
-  write_tool_blocks, SUBAGENT_REPORTED_MARKER, SUBAGENT_SUFFIX,
+  write_tool_blocks, SUBAGENT_SUFFIX,
 };
-use crate::lex::{ABORTED_MARKER, CONTEXT_FULL_NOTE, DONE_MARKER};
+use crate::lex::{ABORTED_MARKER, CONTEXT_FULL_NOTE, DONE_MARKER, REPORTED_MARKER};
 use crate::stream::StreamWriter;
 use crate::tokens::build_request_messages;
 use crate::transcript::{
@@ -330,7 +330,7 @@ pub(crate) fn unfinished_subagents(parent: &Path) -> Result<Vec<PathBuf>, String
       out.push(p);
       continue;
     };
-    if !text.contains(SUBAGENT_REPORTED_MARKER) {
+    if !text.contains(REPORTED_MARKER) {
       out.push(p);
     }
   }
@@ -349,7 +349,7 @@ pub(crate) async fn deliver_subagent_result(
 ) -> Result<(), String> {
   let _gen = gen_lock().lock().await;
   let text = read_file(path)?;
-  if text.contains(SUBAGENT_REPORTED_MARKER) {
+  if text.contains(REPORTED_MARKER) {
     return Ok(());
   }
   let name = path
@@ -371,7 +371,7 @@ pub(crate) async fn deliver_subagent_result(
   let (body, live) = strip_live_line(&text);
   write_file(
     path,
-    reassemble(&body, &format!("{SUBAGENT_REPORTED_MARKER}\n"), live.as_deref()),
+    reassemble(&body, &format!("{REPORTED_MARKER}\n"), live.as_deref()),
   )?;
   info!("→ {:?}: report delivered to parent", path);
   Ok(())

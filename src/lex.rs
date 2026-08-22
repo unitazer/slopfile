@@ -7,6 +7,7 @@ pub const THINK_START: &str = "<!-- thinking -->";
 pub const THINK_END: &str = "<!-- /thinking -->";
 pub const CONTEXT_FULL_PREFIX: &str = "<!-- slopfile:context-full";
 pub const SOLVED_MARKER: &str = "<!-- slopfile:solved -->";
+pub const REPORTED_MARKER: &str = "<!-- slopfile:reported -->";
 pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit the token cap mid-response; trim the useless old turns above, then write your next message below this note -->";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub enum TokKind {
   Live,
   ContextFull,
   Solved,
+  Reported,
   ThinkingOpen,
   ThinkingEnd,
   Tool,
@@ -53,6 +55,7 @@ impl TokKind {
         | TokKind::Aborted
         | TokKind::ContextFull
         | TokKind::Solved
+        | TokKind::Reported
     )
   }
 
@@ -178,6 +181,7 @@ fn classify(raw: &str) -> TokenKindWithPayload<'_> {
     }
     _ if t == ABORTED_MARKER => token(TokKind::Aborted, ""),
     _ if t == SOLVED_MARKER => token(TokKind::Solved, ""),
+    _ if t == REPORTED_MARKER => token(TokKind::Reported, ""),
     _ if t.starts_with("<!-- slopfile:live ") && t.ends_with("-->") => {
       token(TokKind::Live, closing_payload(t, "<!-- slopfile:live "))
     }

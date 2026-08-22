@@ -66,6 +66,13 @@ async fn main() {
   loop {
     let files = scan_transcripts(&app_cfg.transcripts_dir).unwrap_or_default();
     for path in files {
+      if slopfile::flow::is_subagent_path(&path)
+        && std::fs::read_to_string(&path)
+          .map(|t| t.contains(slopfile::lex::REPORTED_MARKER))
+          .unwrap_or(false)
+      {
+        continue;
+      }
       let mut guard = busy.lock().await;
       if guard.contains(&path) {
         continue;
