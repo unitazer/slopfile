@@ -21,7 +21,9 @@ sessions=( "$TRANSCRIPTS"/*.md )
 shopt -u nullglob
 if [ "${#sessions[@]}" -eq 0 ]; then
   SESSION="$TRANSCRIPTS/1.md"
-  "$BIN" init "$SESSION"
+  # Seed via the container: a host-run init would freeze host paths into the
+  # session's system prompt (skills dir, cwd) that the container can't resolve.
+  "$REPO/docker/run.sh" shell -c 'slopfile init /shared/transcripts/1.md'
 else
   SESSION="$(ls -t -- "${sessions[@]}" | head -1)"
 fi
