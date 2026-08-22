@@ -164,6 +164,9 @@ Available tools:
   if has("subagent") {
     out.push_str("\n- Use subagent for large self-contained subtasks (e.g. 'research X and report back', 'fix all lint errors in module Y'); give it every detail it needs, since it cannot see this conversation. Spawn it, then wait for its report instead of duplicating its work.");
   }
+  out.push_str(
+    "\n- NEVER dump large file listings into the conversation. Scope find/ls/grep tightly: target a specific subdirectory and pattern, exclude build/generated/vendor trees (e.g. */build/*, */bin/main/*, .gradle, node_modules, target), pipe through head -50 when output could be long. A listing of hundreds of files shreds the context window and helps no one.",
+  );
   out.push_str(&format!(
     "\n- Be concise in your replies; don't echo back full file contents unless asked
 - Show file paths clearly when working with files
