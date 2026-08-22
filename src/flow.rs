@@ -166,6 +166,9 @@ Available tools:
   out.push_str(
     "\n- NEVER dump large file listings into the conversation. Prefer `fd` over find (it respects .gitignore, so build/generated dirs stay out of your context); scope listings to a specific subdirectory and pattern, and pipe through head -50 when output could be long.",
   );
+  out.push_str(
+    "\n- The container filesystem is ephemeral: anything installed via a package manager vanishes on rebuild. If a required tool or version is missing, stop and tell the user so the image gets updated; do not paper over it with ad-hoc installs.",
+  );
   out.push_str(&format!(
     "\n- Be concise in your replies; don't echo back full file contents unless asked
 - Show file paths clearly when working with files
