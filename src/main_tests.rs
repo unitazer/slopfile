@@ -4,12 +4,13 @@ use super::*;
 use crate::daemon::{next_action, Action};
 use crate::docker::restart_llama_server;
 use crate::flow::{
-  questions_resolvable, resolve_questions, session_template,
+  questions_resolvable, resolve_questions, session_template, spawn_subagent, subagent_depth,
+  write_tool_blocks, SUBAGENT_REPORTED_MARKER,
 };
 use crate::lex::CONTEXT_FULL_NOTE;
 use crate::stream::StreamWriter;
 use crate::transcript::{draft_tail, tail_user_text};
-use crate::types::{Confirmations, Role};
+use crate::types::{AppConfig, Confirmations, Role};
 
 fn yolo_cfg() -> AppConfig {
     AppConfig {
@@ -24,6 +25,7 @@ fn yolo_cfg() -> AppConfig {
       tool_timeout_ms: 30000,
       abort_restart_server: false,
       llama_container: "test-llama".into(),
+      subagent_max_depth: 2,
     }
   }
 
@@ -427,7 +429,8 @@ Let me read a file.
     let tpl = session_template(&cfg);
     assert!(tpl.contains("```toml\n"), "header fence: {tpl}");
     assert!(tpl.contains("model = \"qwen3.8-27b\""), "default model: {tpl}");
-    assert!(tpl.contains("tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\"]"));
+    assert!(tpl.contains("tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\", \"question\", \"subagent\"]"));
+    assert!(!tpl.contains("solve"), "solve is campaign-only: {tpl}");
     assert!(tpl.contains("# Session\n"), "session heading: {tpl}");
     assert!(tpl.contains("You are an expert software engineering assistant"));
     assert!(!tpl.contains("This session is a Markdown transcript file"));
@@ -486,6 +489,184 @@ Let me read a file.
   }
 
   #[test]
+  fn subagent_depth_and_spawn_filtering() {
+    assert_eq!(subagent_depth("session"), 0);
+    assert_eq!(subagent_depth("session.sub-01"), 1);
+    assert_eq!(subagent_depth("session.sub-01.sub-02"), 2);
+
+    let dir = temp_dir().join("slopfile-test-spawn");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = yolo_cfg();
+    cfg.subagent_max_depth = 2;
+    let parent = dir.join("session.md");
+    std::fs::write(&parent, "x\n").unwrap();
+
+    let c1 = spawn_subagent(&parent, "do task one", &cfg).unwrap();
+    assert_eq!(c1.file_name().unwrap(), "session.sub-01.md");
+    let t1 = read_to_string(&c1).unwrap();
+    assert!(t1.contains("tools_excluded = [\"question\"]"), "{t1}");
+    assert!(t1.ends_with("### You\ndo task one\n"), "{t1}");
+
+    let c2 = spawn_subagent(&c1, "nested task", &cfg).unwrap();
+    assert_eq!(c2.file_name().unwrap(), "session.sub-01.sub-01.md");
+    let t2 = read_to_string(&c2).unwrap();
+    assert!(
+      t2.contains("tools_excluded = [\"question\", \"subagent\"]"),
+      "depth-2 child loses subagent tool: {t2}"
+    );
+
+    let err = spawn_subagent(&c2, "too deep", &cfg).unwrap_err();
+    assert!(err.contains("depth limit"), "{err}");
+
+    let c1b = spawn_subagent(&parent, "second child", &cfg).unwrap();
+    assert_eq!(c1b.file_name().unwrap(), "session.sub-02.md");
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[tokio::test]
+  async fn tool_blocks_spawn_subagents_and_enforce_exclusions() {
+    let dir = temp_dir().join("slopfile-test-blocks");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = yolo_cfg();
+    let parent = dir.join("s.md");
+    let text = concat!(
+      "```toml\nmodel = \"qwen3.8-27b\"\ntools_excluded = [\"bash\"]\n```\n",
+      "# S\nSys.\n\n### You\nhi\n"
+    );
+    std::fs::write(&parent, text).unwrap();
+
+    let pf = crate::transcript::parse_file(text);
+    let bash_call = crate::types::ToolCall::new("1", "bash", "{\"command\":\"echo hi\"}");
+    write_tool_blocks(&parent, &[bash_call], &cfg, &pf).await.unwrap();
+    let after = read_to_string(&parent).unwrap();
+    assert!(after.contains("tool is disabled"), "{after}");
+
+    let sub_call =
+      crate::types::ToolCall::new("2", "subagent", "{\"name\":\"w\",\"task\":\"do it\"}");
+    write_tool_blocks(&parent, &[sub_call], &cfg, &pf).await.unwrap();
+    let after2 = read_to_string(&parent).unwrap();
+    assert!(after2.contains("spawned at"), "{after2}");
+    assert!(dir.join("s.sub-01.md").exists());
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn unfinished_subagents_blocks_until_reported() {
+    let dir = temp_dir().join("slopfile-test-wait");
+    std::fs::create_dir_all(&dir).unwrap();
+    let parent = dir.join("p.md");
+    let running = dir.join("p.sub-01.md");
+    let done = dir.join("p.sub-02.md");
+    std::fs::write(&parent, "x\n").unwrap();
+    std::fs::write(&running, format!("### Assistant\nworking\n{}\n", crate::lex::DONE_MARKER)).unwrap();
+    std::fs::write(
+      &done,
+      format!("### Assistant\ndone\n{}\n{SUBAGENT_REPORTED_MARKER}\n", crate::lex::DONE_MARKER),
+    )
+    .unwrap();
+
+    let waiting = crate::daemon::unfinished_subagents(&parent).unwrap();
+    assert_eq!(waiting, vec![running.clone()]);
+
+    std::fs::write(&running, format!("{}\n", SUBAGENT_REPORTED_MARKER)).unwrap();
+    assert!(crate::daemon::unfinished_subagents(&parent).unwrap().is_empty());
+
+    // lookalike files with the prefix but no strict `.sub-NN` shape never block
+    let lookalike = dir.join("p.sub-notes.md");
+    let grandchild = dir.join("p.sub-01.sub-01.md");
+    std::fs::write(&lookalike, "unrelated\n").unwrap();
+    std::fs::write(&grandchild, "nested, not a direct child\n").unwrap();
+    assert!(crate::daemon::unfinished_subagents(&parent).unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[tokio::test]
+  async fn tools_allowlist_and_solve_are_enforced_at_runtime() {
+    let dir = temp_dir().join("slopfile-test-allow");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = yolo_cfg();
+    let parent = dir.join("s.md");
+    // `tools` is a real allowlist: find and solve are off it; grep is excluded.
+    let text = concat!(
+      "```toml\nmodel = \"qwen3.8-27b\"\ntools = [\"read\", \"bash\"]\n",
+      "tools_excluded = [\"grep\"]\n```\n# S\nSys.\n\n### You\nhi\n"
+    );
+    std::fs::write(&parent, text).unwrap();
+    let pf = crate::transcript::parse_file(text);
+
+    for (id, name, args) in [
+      ("1", "find", "{\"suffix\":\".rs\"}"),
+      ("2", "solve", "{\"summary\":\"done\"}"),
+      ("3", "grep", "{\"pattern\":\"x\"}"),
+      ("4", "read", "{}"),
+    ] {
+      std::fs::write(&parent, text).unwrap();
+      let call = crate::types::ToolCall::new(id, name, args);
+      write_tool_blocks(&parent, &[call], &cfg, &pf).await.unwrap();
+      let after = read_to_string(&parent).unwrap();
+      match name {
+        "read" => assert!(!after.contains("tool is disabled"), "{after}"),
+        _ => assert!(after.contains("tool is disabled"), "{name}: {after}"),
+      }
+    }
+    assert!(
+      !read_to_string(&parent).unwrap().contains(crate::lex::SOLVED_MARKER),
+      "solve must not terminate a normal session"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[tokio::test]
+  async fn deliver_subagent_result_injects_report_into_parent() {
+    let dir = temp_dir().join("slopfile-test-deliver");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let parent = dir.join("p.md");
+    std::fs::write(
+      &parent,
+      "```toml\nmodel = \"qwen3.8-27b\"\n```\n# S\nSys.\n\n### You\nhi\n",
+    )
+    .unwrap();
+    let child = dir.join("p.sub-01.md");
+    std::fs::write(
+      &child,
+      format!(
+        "```toml\nmodel = \"qwen3.8-27b\"\ntools_excluded = [\"question\"]\n```\n# S\nSys.\n\n### You\ntask\n\n### Assistant\nthe full final report\n{}\n",
+        crate::lex::DONE_MARKER
+      ),
+    )
+    .unwrap();
+
+    crate::daemon::deliver_subagent_result(&child, crate::daemon::SubagentReport::FromTranscript).await.unwrap();
+
+    let child_text = read_to_string(&child).unwrap();
+    assert!(child_text.contains(SUBAGENT_REPORTED_MARKER), "{child_text}");
+    let parent_text = read_to_string(&parent).unwrap();
+    assert!(parent_text.contains("[system] Subagent 'p.sub-01' finished."), "{parent_text}");
+    assert!(parent_text.contains("the full final report"), "{parent_text}");
+    assert!(parent_text.contains(crate::transcript::SEND_MARKER), "{parent_text}");
+
+    let pf = crate::transcript::parse_file(&parent_text);
+    assert_eq!(pf.history.len(), 2, "system + report turn: {:?}", pf.history);
+    let last = pf.history.last().unwrap();
+    assert_eq!(last.role, crate::types::Role::User);
+    assert!(last.content.as_deref().is_some_and(|c| c.contains("the full final report")));
+
+    crate::daemon::deliver_subagent_result(&child, crate::daemon::SubagentReport::FromTranscript).await.unwrap();
+    let once_more = read_to_string(&parent).unwrap();
+    assert_eq!(once_more.matches("the full final report").count(), 1, "no duplicate reports");
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
   fn init_refuses_nonempty_and_initializes_empty() {
     let dir = temp_dir().join("slopfile-test-init");
     std::fs::create_dir_all(&dir).unwrap();
@@ -506,6 +687,10 @@ Let me read a file.
     let missing = dir.join("missing.md");
     let tpl2 = init_template_for(&missing.to_string_lossy(), &cfg).expect("missing file initializes");
     assert!(tpl2.contains("model = \"qwen3.8-27b\""));
+
+    let reserved = dir.join("my.sub-notes.md");
+    let err = init_template_for(&reserved.to_string_lossy(), &cfg).unwrap_err();
+    assert!(err.contains(".sub-"), "{err}");
 
     std::fs::remove_dir_all(&dir).ok();
   }

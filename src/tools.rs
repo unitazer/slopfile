@@ -102,6 +102,29 @@ pub fn definitions() -> Vec<ToolDefinition> {
       }),
     ),
     tool_def(
+      "subagent",
+      "Spawn a subagent that works on a task in its own fresh context. It has the same file and shell tools as you but no `question` tool, and it cannot see this conversation. Give it a self-contained task with all needed context. Its full final report is delivered back to you automatically when it finishes.",
+      json!({
+          "type": "object",
+          "properties": {
+              "name": { "type": "string", "description": "Short identifier for the subagent, e.g. 'test-runner'" },
+              "task": { "type": "string", "description": "Complete, self-contained description of what the subagent should do" }
+          },
+          "required": ["name", "task"]
+      }),
+    ),
+    tool_def(
+      "solve",
+      "End the optimization campaign. Call this ONLY when you are certain nothing worthwhile remains to explore and the problem is solved as defined by the task. Requires a summary of the final state.",
+      json!({
+          "type": "object",
+          "properties": {
+              "summary": { "type": "string", "description": "Short summary of why the problem is considered solved / nothing is left to explore" }
+          },
+          "required": ["summary"]
+      }),
+    ),
+    tool_def(
       "question",
       "Ask the user multiple questions. Blocks until the user answers; not executed directly by the tool runner.",
       json!({
@@ -159,6 +182,7 @@ pub async fn run(
     "find" => find(&workdir, &args),
     "ls" => ls(&workdir, &args),
     "question" => ToolResult::err("question tool is handled by the agent loop, not executed here"),
+    "solve" => ToolResult::err("solve is handled by the agent loop, not executed here"),
     other => ToolResult::err(format!("unknown tool: {other}")),
   }
 }
@@ -602,7 +626,7 @@ mod tests {
     assert!(!refused.ok, "read outside workdir without extra root must fail");
 
     let allowed =
-      run("read", &args.to_string(), wd.clone(), 30_000, &[skills.clone()]).await;
+      run("read", &args.to_string(), wd.clone(), 30_000, std::slice::from_ref(&skills)).await;
     assert!(allowed.ok, "read with extra root should succeed: {}", allowed.output);
     assert!(allowed.output.contains("body line"), "{}", allowed.output);
 
@@ -611,7 +635,7 @@ mod tests {
       &json!({"path": skills.join("evil.md").to_string_lossy(), "content": "x"}).to_string(),
       wd.clone(),
       30_000,
-      &[skills.clone()],
+      std::slice::from_ref(&skills),
     )
     .await;
     assert!(!escaped_write.ok, "write must never use extra roots: {}", escaped_write.output);
@@ -929,7 +953,7 @@ mod tests {
     assert_eq!(
       names,
       [
-        "read", "write", "edit", "bash", "grep", "find", "ls", "question"
+        "read", "write", "edit", "bash", "grep", "find", "ls", "subagent", "solve", "question"
       ]
     );
     for d in &defs {

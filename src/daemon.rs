@@ -1,6 +1,7 @@
 use crate::flow::{
-  questions_resolvable, promote_draft, render_questions_block, resolve_questions, session_template,
-  write_status, write_tool_blocks,
+  inject_subagent_report, is_subagent_path, questions_resolvable, promote_draft,
+  render_questions_block, resolve_questions, session_template, write_status,
+  write_tool_blocks, SUBAGENT_REPORTED_MARKER, SUBAGENT_SUFFIX,
 };
 use crate::lex::{ABORTED_MARKER, CONTEXT_FULL_NOTE, DONE_MARKER};
 use crate::stream::StreamWriter;
@@ -12,16 +13,34 @@ use crate::transcript::{
 };
 use crate::api::LlamaClient;
 use crate::types::{AppConfig, Confirmations, Phase, Role};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
+fn gen_lock() -> &'static AsyncMutex<()> {
+  static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+  LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
 pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
+  let is_sub = is_subagent_path(path);
+  let eff_cfg = if is_sub {
+    let mut c = cfg.clone();
+    c.confirmations = Confirmations::Yolo;
+    c
+  } else {
+    cfg.clone()
+  };
   let mut turns = 0;
   let mut sent = false;
   loop {
     turns += 1;
     if turns > 20 {
       warn!("{path:?}: giving up after {turns} turns");
+      if is_sub {
+        deliver_subagent_result(path, SubagentReport::FromTranscript).await?;
+      }
       return Ok(());
     }
 
@@ -45,14 +64,27 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
 
     if abort_marker_present(&text) {
       strip_abort_marker(path, &text)?;
+      if is_sub {
+        deliver_subagent_result(path, SubagentReport::Aborted).await?;
+      }
       return Ok(());
     }
 
     let pf = parse_file(&text);
-    match next_action(&pf, &text, cfg, sent) {
-      Action::Idle => return Ok(()),
+    if !unfinished_subagents(path)?.is_empty() {
+      let _g = gen_lock().lock().await;
+      write_status(path, &pf, Phase::WaitingSubagents)?;
+      return Ok(());
+    }
+    match next_action(&pf, &text, &eff_cfg, sent) {
+      Action::Idle => {
+        if is_sub {
+          deliver_subagent_result(path, SubagentReport::FromTranscript).await?;
+        }
+        return Ok(());
+      }
       Action::ResolveQuestions => {
-        resolve_questions(path, &text, &pf, cfg)?;
+        resolve_questions(path, &text, &pf, &eff_cfg)?;
         continue;
       }
       Action::PromoteDraft => {
@@ -60,13 +92,14 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
         continue;
       }
       Action::WaitForAnswer => {
+        let _g = gen_lock().lock().await;
         write_status(path, &pf, Phase::WaitingAnswer)?;
         return Ok(());
       }
       Action::Generate => {}
     }
 
-    let outcome = run_generation_turn(path, &text, &pf, cfg, client).await?;
+    let outcome = run_generation_turn(path, &text, &pf, &eff_cfg, client).await?;
     match outcome {
       TurnOutcome::Done => return Ok(()),
       TurnOutcome::AwaitsNextTurn => continue,
@@ -136,6 +169,7 @@ async fn run_generation_turn(
   cfg: &AppConfig,
   client: &LlamaClient,
 ) -> Result<TurnOutcome, String> {
+  let _gen = gen_lock().lock().await;
   let (body, live) = strip_live_line(text);
   let base_text = match &pf.dangling {
     Some(d) => body[..d.resume_offset.min(body.len())].to_string(),
@@ -146,7 +180,13 @@ async fn run_generation_turn(
 
   let max_tokens = crate::tokens::context_budget(pf, cfg) / 4;
   let tools_enabled = pf.config.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(true);
-  let tool_defs = tools_enabled.then(crate::tools::definitions);
+  let excluded = pf.config.tools_excluded.clone();
+  let tool_defs = tools_enabled.then(|| {
+    crate::tools::definitions()
+      .into_iter()
+      .filter(|d| !excluded.iter().any(|x| x == &d.function.name))
+      .collect::<Vec<_>>()
+  });
 
   let model = pf.config.model.as_deref().unwrap_or(&cfg.model);
   client.ensure_model_loaded(model).await;
@@ -234,4 +274,105 @@ async fn maybe_restart_llama(cfg: &AppConfig, path: &Path) {
     Ok(Err(e)) => warn!("{path:?}: aborted but couldn't restart llama-server: {e}"),
     Err(e) => warn!("{path:?}: aborted, llama restart task failed: {e}"),
   }
+}
+
+fn final_assistant_text(pf: &ParsedFile) -> Option<String> {
+  pf.history.iter().rev().find_map(|m| {
+    if matches!(m.role, Role::Assistant)
+      && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+    {
+      m.content.clone()
+    } else {
+      None
+    }
+  })
+}
+
+fn subagent_parent_path(child: &Path) -> Result<PathBuf, String> {
+  let dir = child.parent().ok_or("subagent transcript has no directory")?;
+  let stem = child
+    .file_stem()
+    .ok_or("subagent transcript has no file stem")?
+    .to_string_lossy()
+    .into_owned();
+  let ix = stem.rfind(SUBAGENT_SUFFIX).ok_or("not a subagent transcript")?;
+  Ok(dir.join(format!("{}.md", &stem[..ix])))
+}
+
+pub(crate) fn unfinished_subagents(parent: &Path) -> Result<Vec<PathBuf>, String> {
+  let dir = parent.parent().ok_or("parent transcript has no directory")?;
+  let stem = parent
+    .file_stem()
+    .ok_or("parent transcript has no file stem")?
+    .to_string_lossy()
+    .into_owned();
+  let prefix = format!("{stem}{SUBAGENT_SUFFIX}");
+  let mut out = Vec::new();
+  for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+    let p = match entry {
+      Ok(e) => e.path(),
+      Err(_) => continue,
+    };
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+      continue;
+    };
+    if !name.starts_with(&prefix) || !name.ends_with(".md") {
+      continue;
+    }
+    let suffix = name
+      .trim_end_matches(".md")
+      .strip_prefix(&prefix)
+      .expect("name starts with prefix");
+    if suffix.len() != 2 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+      continue;
+    }
+    let Ok(text) = read_file(&p) else {
+      out.push(p);
+      continue;
+    };
+    if !text.contains(SUBAGENT_REPORTED_MARKER) {
+      out.push(p);
+    }
+  }
+  out.sort();
+  Ok(out)
+}
+
+pub(crate) enum SubagentReport {
+  FromTranscript,
+  Aborted,
+}
+
+pub(crate) async fn deliver_subagent_result(
+  path: &Path,
+  outcome: SubagentReport,
+) -> Result<(), String> {
+  let _gen = gen_lock().lock().await;
+  let text = read_file(path)?;
+  if text.contains(SUBAGENT_REPORTED_MARKER) {
+    return Ok(());
+  }
+  let name = path
+    .file_stem()
+    .map(|s| s.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "subagent".to_string());
+  let (report, ok) = match outcome {
+    SubagentReport::FromTranscript => {
+      let pf = parse_file(&text);
+      (
+        final_assistant_text(&pf)
+          .unwrap_or_else(|| "(subagent produced no text output)".to_string()),
+        true,
+      )
+    }
+    SubagentReport::Aborted => ("subagent was aborted before completing".to_string(), false),
+  };
+  inject_subagent_report(&subagent_parent_path(path)?, &name, &report, ok)?;
+  let (body, live) = strip_live_line(&text);
+  write_file(
+    path,
+    reassemble(&body, &format!("{SUBAGENT_REPORTED_MARKER}\n"), live.as_deref()),
+  )?;
+  info!("→ {:?}: report delivered to parent", path);
+  Ok(())
 }

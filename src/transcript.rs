@@ -125,6 +125,14 @@ pub fn find_done_marker(text: &str) -> Option<usize> {
   lex(text).iter().rfind(|t| t.kind.is_turn_end()).map(|t| t.offset)
 }
 
+pub fn turn_cycle_complete(text: &str) -> bool {
+  let pf = parse_file(text);
+  pf.dangling.is_none()
+    && !send_marker_present(text)
+    && tail_user_text(text).is_none()
+    && find_done_marker(text).is_some()
+}
+
 pub fn turn_end_tail_start(text: &str) -> Option<usize> {
   lex(text)
     .iter()

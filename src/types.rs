@@ -247,6 +247,7 @@ pub enum Phase {
   #[default]
   Idle,
   WaitingAnswer,
+  WaitingSubagents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -281,6 +282,8 @@ pub struct AppConfig {
   pub abort_restart_server: bool,
   #[serde(default = "default_llama_container")]
   pub llama_container: String,
+  #[serde(default = "default_subagent_max_depth")]
+  pub subagent_max_depth: u32,
 }
 
 fn default_api_base() -> String {
@@ -313,6 +316,9 @@ fn default_abort_restart_server() -> bool {
 fn default_llama_container() -> String {
   "clanker-llama".to_string()
 }
+fn default_subagent_max_depth() -> u32 {
+  2
+}
 
 impl Default for AppConfig {
   fn default() -> Self {
@@ -328,6 +334,7 @@ impl Default for AppConfig {
       max_context_tokens: default_max_context(),
       abort_restart_server: default_abort_restart_server(),
       llama_container: default_llama_container(),
+      subagent_max_depth: default_subagent_max_depth(),
     }
   }
 }
@@ -353,7 +360,16 @@ pub struct SessionConfig {
   #[serde(default)]
   pub tools: Option<Vec<String>>,
   #[serde(default)]
+  pub tools_excluded: Vec<String>,
+  #[serde(default)]
   pub max_context_tokens: Option<u32>,
+}
+
+impl SessionConfig {
+  pub fn allows_tool(&self, name: &str) -> bool {
+    !self.tools_excluded.iter().any(|t| t == name)
+      && self.tools.as_ref().is_none_or(|l| l.iter().any(|t| t == name))
+  }
 }
 
 

@@ -6,6 +6,7 @@ pub const ABORTED_MARKER: &str = "<!-- slopfile:aborted -->";
 pub const THINK_START: &str = "<!-- thinking -->";
 pub const THINK_END: &str = "<!-- /thinking -->";
 pub const CONTEXT_FULL_PREFIX: &str = "<!-- slopfile:context-full";
+pub const SOLVED_MARKER: &str = "<!-- slopfile:solved -->";
 pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit the token cap mid-response; trim the useless old turns above, then write your next message below this note -->";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub enum TokKind {
   Aborted,
   Live,
   ContextFull,
+  Solved,
   ThinkingOpen,
   ThinkingEnd,
   Tool,
@@ -45,7 +47,12 @@ impl TokKind {
   pub fn is_daemon_owned(self) -> bool {
     matches!(
       self,
-      TokKind::Live | TokKind::Send | TokKind::Abort | TokKind::Aborted | TokKind::ContextFull
+      TokKind::Live
+        | TokKind::Send
+        | TokKind::Abort
+        | TokKind::Aborted
+        | TokKind::ContextFull
+        | TokKind::Solved
     )
   }
 
@@ -170,6 +177,7 @@ fn classify(raw: &str) -> TokenKindWithPayload<'_> {
       token(TokKind::Abort, "")
     }
     _ if t == ABORTED_MARKER => token(TokKind::Aborted, ""),
+    _ if t == SOLVED_MARKER => token(TokKind::Solved, ""),
     _ if t.starts_with("<!-- slopfile:live ") && t.ends_with("-->") => {
       token(TokKind::Live, closing_payload(t, "<!-- slopfile:live "))
     }

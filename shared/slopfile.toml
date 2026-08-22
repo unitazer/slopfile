@@ -7,3 +7,4 @@ model = "qwen3.8-27b"
 tool_timeout_ms = 30000
 abort_restart_server = true
 llama_container = "clanker-llama"
+subagent_max_depth = 2

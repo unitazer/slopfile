@@ -1,21 +1,133 @@
 use crate::lex::{lex, TokKind};
 use crate::questions::{self, QuestionsBlock};
 use crate::tools;
-use crate::transcript::{read_file, reassemble, strip_live_line, write_file, ParsedFile};
-use crate::types::{AppConfig, Confirmations, LiveStatus, Phase, ToolCall};
+use crate::transcript::{
+  read_file, reassemble, strip_live_line, write_file, ParsedFile, SEND_MARKER,
+};
+use crate::types::{AppConfig, Confirmations, LiveStatus, Phase, ToolCall, ToolResult};
 use std::path::{Path, PathBuf};
 
-pub fn session_template(cfg: &AppConfig) -> String {
-  let mut out = String::new();
-  out.push_str("```toml\n");
-  out.push_str(&format!("model = \"{}\"\n", cfg.model));
-  out.push_str("thinking = \"auto\"\n");
-  out.push_str("tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\"]\n");
+pub const SUBAGENT_SUFFIX: &str = ".sub-";
+pub const SUBAGENT_REPORTED_MARKER: &str = "<!-- slopfile:reported -->";
+
+pub const DEFAULT_TOOLS: &[&str] = &[
+  "read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent",
+];
+
+pub fn session_header(model: &str, tools: &[&str], tools_excluded: &[String]) -> String {
+  let list = tools.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
+  let mut out = format!("```toml\nmodel = \"{model}\"\nthinking = \"auto\"\ntools = [{list}]\n");
+  if !tools_excluded.is_empty() {
+    let excluded = tools_excluded
+      .iter()
+      .map(|t| format!("\"{t}\""))
+      .collect::<Vec<_>>()
+      .join(", ");
+    out.push_str(&format!("tools_excluded = [{excluded}]\n"));
+  }
   out.push_str("```\n");
+  out
+}
+
+pub fn session_template(cfg: &AppConfig) -> String {
+  session_template_with(cfg, &[])
+}
+
+pub fn session_template_with(cfg: &AppConfig, tools_excluded: &[String]) -> String {
+  let mut out = session_header(&cfg.model, DEFAULT_TOOLS, tools_excluded);
   out.push_str("# Session\n");
   out.push_str(&system_prompt_default(cfg));
   out.push_str("\n### You\n");
   out
+}
+
+pub fn subagent_depth(stem: &str) -> u32 {
+  stem.matches(SUBAGENT_SUFFIX).count() as u32
+}
+
+pub fn is_subagent_path(path: &Path) -> bool {
+  path.file_stem().is_some_and(|s| subagent_depth(&s.to_string_lossy()) > 0)
+}
+
+pub fn spawn_subagent(
+  parent: &Path,
+  task: &str,
+  cfg: &AppConfig,
+) -> Result<PathBuf, String> {
+  let dir = parent.parent().ok_or("parent transcript has no directory")?;
+  let stem = parent
+    .file_stem()
+    .ok_or("parent transcript has no file stem")?
+    .to_string_lossy()
+    .into_owned();
+  let depth = subagent_depth(&stem);
+  if depth >= cfg.subagent_max_depth {
+    return Err(format!(
+      "subagent depth limit reached (max {}, this transcript is at depth {depth})",
+      cfg.subagent_max_depth
+    ));
+  }
+
+  let prefix = format!("{stem}{SUBAGENT_SUFFIX}");
+  let mut nn = 1u32;
+  loop {
+    let candidate = dir.join(format!("{prefix}{nn:02}.md"));
+    if !candidate.exists() {
+      break;
+    }
+    nn += 1;
+  }
+  let child = dir.join(format!("{prefix}{nn:02}.md"));
+
+  let child_depth = depth + 1;
+  let mut excluded = vec!["question".to_string()];
+  if child_depth >= cfg.subagent_max_depth {
+    excluded.push("subagent".to_string());
+  }
+  let mut template = session_template_with(cfg, &excluded);
+  template.push_str(task.trim_end());
+  template.push('\n');
+  write_file(&child, template)?;
+  Ok(child)
+}
+
+fn handle_subagent_call(parent: &Path, call: &ToolCall, cfg: &AppConfig) -> ToolResult {
+  let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
+    Ok(v) => v,
+    Err(e) => return ToolResult::err(format!("subagent: bad arguments json: {e}")),
+  };
+  let name = args.get("name").and_then(serde_json::Value::as_str).unwrap_or("subagent");
+  let Some(task) = args.get("task").and_then(serde_json::Value::as_str) else {
+    return ToolResult::err("subagent: missing string argument \"task\"");
+  };
+  if task.trim().is_empty() {
+    return ToolResult::err("subagent: task must not be empty");
+  }
+  match spawn_subagent(parent, task, cfg) {
+    Ok(child) => ToolResult::ok(format!(
+      "subagent '{name}' spawned at {}. It runs autonomously and cannot see this conversation; \
+       do not read its transcript unless asked. Its complete final response will be appended \
+       here automatically when it finishes; wait for it instead of redoing its work.",
+      child.display()
+    )),
+    Err(e) => ToolResult::err(e),
+  }
+}
+
+pub fn inject_subagent_report(
+  parent: &Path,
+  name: &str,
+  report: &str,
+  ok: bool,
+) -> Result<(), String> {
+  let text = read_file(parent)?;
+  let (body, live) = strip_live_line(&text);
+  let status = if ok { "finished" } else { "failed" };
+  let extra = format!(
+    "\n### You\n[system] Subagent '{name}' {status}. Its complete final response follows.\n---\n{report}\n---\n\n{}\n",
+    SEND_MARKER
+  );
+  write_file(parent, reassemble(&body, &extra, live.as_deref()))
 }
 
 fn system_prompt_default(cfg: &AppConfig) -> String {
@@ -32,12 +144,14 @@ Available tools:
 - grep: Search file contents for a substring
 - find: Find files by name suffix pattern
 - ls: List directory contents
+- subagent: Spawn a worker with its own fresh context to handle a self-contained task; its final report is returned here automatically
 
 Guidelines:
 - Prefer grep/find/ls tools over bash for file exploration
 - Use read to examine files before editing. Use this tool instead of cat or sed.
 - Use edit for precise changes (old text must match exactly)
 - Use write only for new files or complete rewrites
+- Use subagent for large self-contained subtasks (e.g. 'research X and report back', 'fix all lint errors in module Y'); give it every detail it needs, since it cannot see this conversation. Spawn it, then wait for its report instead of duplicating its work.
 - Be concise in your replies; don't echo back full file contents unless asked
 - Show file paths clearly when working with files
 
@@ -213,14 +327,25 @@ pub async fn write_tool_blocks(
   for call in calls {
     let started = std::time::Instant::now();
     let timeout = pf.config.tool_timeout_ms.unwrap_or(cfg.tool_timeout_ms);
-    let result = tools::run(
-      &call.name,
-      &call.arguments,
-      PathBuf::from(&cfg.workdir),
-      timeout,
-      &[PathBuf::from(&cfg.skills_dir)],
-    )
-    .await;
+    let mut solved = false;
+    let result = if !pf.config.allows_tool(&call.name) {
+      ToolResult::err(format!("{}: tool is disabled in this session", call.name))
+    } else if call.name == "subagent" {
+      handle_subagent_call(path, call, cfg)
+    } else if call.name == "solve" {
+      let r = handle_solve_call(call);
+      solved = r.ok;
+      r
+    } else {
+      tools::run(
+        &call.name,
+        &call.arguments,
+        PathBuf::from(&cfg.workdir),
+        timeout,
+        &[PathBuf::from(&cfg.skills_dir)],
+      )
+      .await
+    };
     let ms = started.elapsed().as_millis();
     block.push_str(&format!("<!-- tool:{} {} -->\n", call.name, call.arguments));
     block.push_str(&result.output);
@@ -229,9 +354,30 @@ pub async fn write_tool_blocks(
     }
     let status = if result.ok { "ok" } else { "err" };
     block.push_str(&format!("<!-- result:{} {status}={ms}ms -->\n", call.name));
+    if solved {
+      block.push_str(&format!(
+        "{}\n{}\n",
+        crate::lex::SOLVED_MARKER,
+        crate::lex::DONE_MARKER
+      ));
+      break;
+    }
   }
 
   write_file(path, reassemble(&body, &block, live.as_deref()))
+}
+
+fn handle_solve_call(call: &ToolCall) -> ToolResult {
+  let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
+    Ok(v) => v,
+    Err(e) => return ToolResult::err(format!("solve: bad arguments json: {e}")),
+  };
+  match args.get("summary").and_then(serde_json::Value::as_str) {
+    Some(s) if !s.trim().is_empty() => ToolResult::ok(format!(
+      "campaign marked as solved: {s}\nThe harness takes over from here."
+    )),
+    _ => ToolResult::err("solve: missing non-empty string argument \"summary\""),
+  }
 }
 
 pub fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String> {
