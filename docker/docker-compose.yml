@@ -9,11 +9,15 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    ulimits:
+      memlock: -1
     volumes:
       - ../shared/models:/models:ro
     command: [
       "--models-preset", "/models/presets.ini",
       "--models-max", "2",
+      "--mlock",
+      "--no-mmap",
       "--host", "0.0.0.0",
       "--port", "8080"
     ]
