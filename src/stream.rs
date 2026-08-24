@@ -79,36 +79,36 @@ impl<'a> StreamWriter<'a> {
   /// Models like Qwen3 close their native reasoning with literal
   /// `<think>`/`</think>` tags that llama-server can leak into the text
   /// channel (typically when resuming a cut-off reasoning block). Translate
-  /// them to harness markers; an orphan `</think>` with no matching open
-  /// state is dropped instead of polluting the transcript.
+  /// them to harness markers. Text-channel events are content by default;
+  /// only the tags switch channels, so an orphan `</think>` closes the
+  /// harness-side block and plain text always terminates reasoning.
   fn write_tag_aware(&mut self, mut s: &str) {
+    let mut reasoning = false;
     loop {
       let open = s.find("<think>");
       let close = s.find("</think>");
-      let pos = match (open, close) {
+      let (pos, is_open) = match (open, close) {
         (None, None) => {
           if !s.is_empty() {
-            self.emit(s, self.in_reasoning);
+            self.emit(s, reasoning);
           }
           return;
         }
-        (o, c) => match (o, c) {
-          (Some(o), Some(c)) => o.min(c),
-          (Some(o), None) => o,
-          (None, Some(c)) => c,
-          _ => unreachable!(),
-        },
+        (Some(o), Some(c)) => {
+          if o <= c { (o, true) } else { (c, false) }
+        }
+        (Some(o), None) => (o, true),
+        (None, Some(c)) => (c, false),
       };
       let (before, rest) = s.split_at(pos);
       if !before.is_empty() {
-        self.emit(before, self.in_reasoning);
+        self.emit(before, reasoning);
       }
+      reasoning = is_open;
       if let Some(open_rest) = rest.strip_prefix("<think>") {
         s = open_rest;
-        self.emit("", true);
       } else {
         s = rest.strip_prefix("</think>").expect("matched earlier");
-        self.emit("", false);
       }
     }
   }
