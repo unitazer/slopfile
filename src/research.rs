@@ -1,4 +1,3 @@
-
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +22,7 @@ pub struct ResearchOpts {
   pub maximize: bool,
   pub max_iters: u32,
   pub eval_timeout_secs: u64,
+  pub iter_timeout_secs: u64,
   pub poll_ms: u64,
 }
 
@@ -36,6 +36,7 @@ impl Default for ResearchOpts {
       maximize: false,
       max_iters: 100,
       eval_timeout_secs: 600,
+      iter_timeout_secs: 7_200,
       poll_ms: 2_000,
     }
   }
@@ -46,7 +47,6 @@ pub struct IterationResult {
   pub solved: bool,
   pub aborted: bool,
 }
-
 
 pub async fn run(opts: ResearchOpts) -> Result<(), String> {
   verify_workdir(&opts)?;
@@ -76,13 +76,14 @@ pub async fn run(opts: ResearchOpts) -> Result<(), String> {
     let path = seed_transcript(&opts, &agents_md, &journal, best, iter)?;
     info!("→ seeded {} (iter {iter})", path.display());
 
-    let outcome = wait_for_iteration(&path, opts.poll_ms).await?;
+    let outcome = wait_for_iteration(&path, opts.poll_ms, opts.iter_timeout_secs).await?;
     if outcome.aborted {
       warn!("✗ iter {iter}: session was aborted");
     }
     if outcome.solved {
       info!("★ iter {iter}: model declared the problem solved");
     }
+    wait_until_settled(&path, opts.poll_ms).await;
 
     let eval = run_eval(&opts).await;
 
@@ -116,7 +117,7 @@ pub async fn run(opts: ResearchOpts) -> Result<(), String> {
     )?;
 
     if outcome.solved {
-      info!("research: campaign complete at iteration {}", iter.saturating_sub(1));
+      info!("research: campaign complete at iteration {iter}");
       break;
     }
     iter += 1;
@@ -148,7 +149,6 @@ pub fn is_better(score: f64, best: Option<f64>, maximize: bool) -> bool {
     }
   }
 }
-
 
 fn git(workdir: &Path, args: &[&str]) -> Result<String, String> {
   let out = std::process::Command::new("git")
@@ -210,7 +210,6 @@ pub fn parse_score_subject(subject: &str) -> Option<f64> {
     .split_whitespace()
     .find_map(|t| t.strip_prefix("score=").and_then(|v| v.parse::<f64>().ok()))
 }
-
 
 pub async fn run_eval(opts: &ResearchOpts) -> Result<f64, String> {
   let mut child = Command::new("sh")
@@ -276,7 +275,6 @@ pub fn parse_eval_output(stdout: &str) -> Option<f64> {
     .find(|l| !l.is_empty())
     .and_then(|l| l.parse::<f64>().ok())
 }
-
 
 const RESEARCH_SYSTEM_PROMPT: &str = "\
 You are an autonomous research agent running unattended iterations on a measurable task.
@@ -384,7 +382,12 @@ pub fn next_iter_number(transcripts_dir: &Path) -> u32 {
   max + 1
 }
 
-async fn wait_for_iteration(path: &Path, poll_ms: u64) -> Result<IterationResult, String> {
+async fn wait_for_iteration(
+  path: &Path,
+  poll_ms: u64,
+  timeout_secs: u64,
+) -> Result<IterationResult, String> {
+  let started = std::time::Instant::now();
   loop {
     tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
@@ -404,13 +407,36 @@ async fn wait_for_iteration(path: &Path, poll_ms: u64) -> Result<IterationResult
     if iteration_finished(&text) {
       return Ok(IterationResult { solved: false, aborted: false });
     }
+    if timeout_secs > 0 && started.elapsed() >= Duration::from_secs(timeout_secs) {
+      warn!(
+        "{}: iteration exceeded {timeout_secs}s; requesting abort",
+        path.display()
+      );
+      let (body, live) = crate::transcript::strip_live_line(&text);
+      crate::transcript::write_file(
+        path,
+        crate::transcript::reassemble(&body, &format!("{}\n", crate::lex::ABORT_MARKER), live.as_deref()),
+      )?;
+      return Ok(IterationResult { solved: false, aborted: true });
+    }
+  }
+}
+
+async fn wait_until_settled(path: &Path, poll_ms: u64) {
+  let mut prev = std::fs::read_to_string(path).unwrap_or_default();
+  for _ in 0..30 {
+    tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+    let cur = std::fs::read_to_string(path).unwrap_or_default();
+    if cur == prev {
+      return;
+    }
+    prev = cur;
   }
 }
 
 pub fn iteration_finished(text: &str) -> bool {
   crate::transcript::turn_cycle_complete(text)
 }
-
 
 #[derive(Serialize)]
 struct LogLine<'a> {
@@ -473,7 +499,6 @@ fn truncate_head(s: &str, max_chars: usize) -> String {
   let tail = tail[tail.find('\n').map(|i| i + 1).unwrap_or(0)..].to_string();
   format!("… [earlier journal entries truncated]\n{tail}")
 }
-
 
 #[cfg(test)]
 mod tests {

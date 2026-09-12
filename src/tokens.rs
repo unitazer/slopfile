@@ -27,8 +27,6 @@ async fn request_token_count(
   if content.is_empty() {
     return Ok(0);
   }
-  // llama-server exposes /tokenize at both the root and under /v1, and some
-  // builds reject an unknown "model" field — try each shape once.
   let mut last_err = String::new();
   for (url, body) in [
     (format!("{api_base}/tokenize"), serde_json::json!({"content": content.clone(), "model": model})),
@@ -72,11 +70,9 @@ async fn request_token_counts(
     .collect()
 }
 
-/// The outcome of assembling a chat request from a parsed transcript.
 #[derive(Debug)]
 pub struct RequestPlan {
   pub messages: Vec<ChatMessage>,
-  /// Oldest messages cut to fit the context budget.
   pub dropped: usize,
   pub token_count: usize,
 }
@@ -88,9 +84,6 @@ pub async fn build_request_messages(
   http: &reqwest::Client,
 ) -> Result<RequestPlan, String> {
   let mut messages = pf.history.clone();
-  // User text between the last turn-end and the dangling assistant section
-  // becomes a real user turn; the partial assistant output itself is replayed
-  // separately below.
   let cap = pf.dangling.as_ref().map(|d| d.resume_offset);
   let section = match cap {
     Some(cap) => tail_user_text_capped(text, cap),
@@ -115,12 +108,15 @@ pub async fn build_request_messages(
     &messages,
   )
   .await?;
-  let truncated = truncate_messages(messages, &counts, context_budget);
+  let (truncated, kept_sum) = truncate_messages(messages, &counts, context_budget);
+  if kept_sum > context_budget as usize {
+    return Err(format!(
+      "request exceeds the context budget even after dropping old turns: {kept_sum} > {context_budget} tokens; trim the transcript"
+    ));
+  }
   Ok(RequestPlan {
     dropped: counts.len() - truncated.len(),
-    token_count: counts[0] + counts[counts.len() - (truncated.len() - 1)..]
-      .iter()
-      .sum::<usize>(),
+    token_count: kept_sum,
     messages: truncated,
   })
 }
@@ -144,26 +140,25 @@ pub fn truncate_messages(
   messages: Vec<ChatMessage>,
   token_counts: &[usize],
   max_tokens: u32,
-) -> Vec<ChatMessage> {
+) -> (Vec<ChatMessage>, usize) {
   if messages.is_empty() {
-    return messages;
+    return (messages, 0);
   }
   let budget = max_tokens as usize;
   let total: usize = token_counts.iter().sum();
   if total <= budget || messages.len() <= 2 {
-    return messages;
+    return (messages, total);
   }
   let sys_tokens = token_counts[0];
-  let mut keep_through = messages.len() - 1;
+  let mut keep_from = messages.len() - 1;
   let mut sum = sys_tokens + token_counts[1..].iter().sum::<usize>();
   for (i, &toks) in token_counts.iter().enumerate().skip(1) {
     sum -= toks;
     if sum <= budget {
-      keep_through = i;
+      keep_from = (i + 1).min(messages.len() - 1);
       break;
     }
   }
-  let mut keep_from = keep_through;
   while keep_from + 1 < messages.len() && !is_turn_start(&messages[keep_from]) {
     keep_from += 1;
   }
@@ -173,12 +168,13 @@ pub fn truncate_messages(
     }
   }
   if keep_from > 1 {
+    let kept_sum = sys_tokens + token_counts[keep_from..].iter().sum::<usize>();
     let mut out = Vec::with_capacity(messages.len() - keep_from + 1);
     out.push(messages[0].clone());
     out.extend(messages[keep_from..].iter().cloned());
-    return out;
+    return (out, kept_sum);
   }
-  messages
+  (messages, total)
 }
 
 fn is_turn_start(m: &ChatMessage) -> bool {
@@ -198,16 +194,18 @@ mod tests {
       msgs.push(ChatMessage::assistant(format!("assistant answer number {i} with some body text")));
     }
     let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
-    let small = truncate_messages(msgs.clone(), &counts, 12);
+    let (small, small_sum) = truncate_messages(msgs.clone(), &counts, 30);
     assert_eq!(small[0].role, Role::System);
     assert!(small.len() < msgs.len(), "old turns dropped: {} -> {}",
       msgs.len(), small.len());
+    assert!(small_sum <= 30, "kept sum must respect the budget: {small_sum}");
     let last = small.last().unwrap();
     assert_eq!(last.content.as_deref(), Some("assistant answer number 8 with some body text"));
     assert!(matches!(small[1].role, Role::User | Role::Assistant));
 
-    let big = truncate_messages(msgs.clone(), &counts, 1_000_000);
+    let (big, big_sum) = truncate_messages(msgs.clone(), &counts, 1_000_000);
     assert_eq!(big.len(), msgs.len());
+    assert_eq!(big_sum, counts.iter().sum::<usize>());
   }
 
   #[test]
@@ -222,10 +220,19 @@ mod tests {
       msgs.push(ChatMessage::tool(call.id.clone(), "bash".to_string(), "out".to_string()));
     }
     let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
-    let small = truncate_messages(msgs.clone(), &counts, 6);
+    let (small, _) = truncate_messages(msgs.clone(), &counts, 6);
     assert!(matches!(small[1].role, Role::User | Role::Assistant));
     let has_call = small.iter().any(|m| m.tool_calls.is_some());
     let has_result = small.iter().any(|m| m.role == Role::Tool);
     assert_eq!(has_call, has_result, "tool round is atomic");
+  }
+
+  #[test]
+  fn oversize_minimal_window_is_returned_whole_with_full_sum() {
+    let msgs = vec![ChatMessage::system("s"), ChatMessage::user("giant turn")];
+    let counts = vec![1, 1000];
+    let (out, sum) = truncate_messages(msgs, &counts, 500);
+    assert_eq!(out.len(), 2, "nothing left to drop");
+    assert_eq!(sum, 1001, "caller must see the budget violation");
   }
 }

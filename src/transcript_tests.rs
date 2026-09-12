@@ -115,10 +115,6 @@ Here is the listing.
 
   #[test]
   fn dangling_partial_is_not_duplicated_into_history() {
-    // Regression: a transcript whose last turn is a tool call with NO done
-    // marker and no live line anywhere used to fold the dangling assistant
-    // section into history AND replay it, producing two consecutive
-    // assistant messages that llama-server rejects (HTTP 400).
     let txt = concat!(
       "```toml\nmodel = \"m\"\n```\n# S\nSys.\n\n### You\ngo\n\n",
       "### Assistant\nrunning it\n",
@@ -552,4 +548,3 @@ ANSWER: (numbers or text, comma separated)\r
     assert!(draft_tail(&txt).is_none(), "heading-led tail is not a draft");
     assert!(tail_user_text(&txt).is_some(), "but it is still user content");
   }
-

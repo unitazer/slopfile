@@ -39,7 +39,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
     if turns > 20 {
       warn!("{path:?}: giving up after {turns} turns");
       if is_sub {
-        deliver_subagent_result(path, SubagentReport::FromTranscript).await?;
+        deliver_subagent_result(path, SubagentReport::TurnCap).await?;
       }
       return Ok(());
     }
@@ -107,28 +107,16 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
   }
 }
 
-/// What the daemon should do with a parsed transcript right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
-  /// Pending questions are answerable (answers present, /skip, or yolo).
   ResolveQuestions,
-  /// A draft sits below the last turn-end; promote it to a `### You` section first.
   PromoteDraft,
-  /// Run a generation turn (fresh user turn or dangling assistant resume).
   Generate,
-  /// Armed but the model asked something nobody answered yet.
   WaitForAnswer,
-  /// Nothing to do.
   Idle,
 }
 
-/// Single source of truth for whether (and how) a transcript needs work.
-///
-/// Questions gate everything else: an unanswered leading block stalls even a
-/// later answered one. Everything below the question gate requires the file to
-/// be armed — either by a consumed send marker or by yolo mode.
 pub(crate) fn next_action(pf: &ParsedFile, text: &str, cfg: &AppConfig, sent: bool) -> Action {
-  // yolo auto-answers questions and never waits for an explicit send.
   let armed = sent || cfg.confirmations == Confirmations::Yolo;
   if !pf.pending_questions.is_empty() {
     return match (armed, questions_resolvable(pf, cfg)) {
@@ -228,6 +216,11 @@ async fn run_generation_turn(
     return Ok(TurnOutcome::Done);
   }
 
+  if result.finish_reason.as_deref().is_none() {
+    info!("⚠ {path:?}: turn interrupted mid-stream (no finish_reason); left dangling for resume");
+    return Ok(TurnOutcome::Done);
+  }
+
   if !result.tool_calls.is_empty() {
     let is_question = result.tool_calls.iter().any(|t| t.name == "question");
     if is_question {
@@ -239,19 +232,12 @@ async fn run_generation_turn(
     return Ok(TurnOutcome::AwaitsNextTurn);
   }
 
-  if result.finish_reason.as_deref().is_none() {
-    info!("⚠ {path:?}: turn interrupted mid-stream (no finish_reason); left dangling for resume");
-    return Ok(TurnOutcome::Done);
-  }
-
   finalize_turn(path, format!("{DONE_MARKER}\n"))?;
   write_status(path, pf, Phase::Idle)?;
   info!("✓ {path:?}: turn complete");
   Ok(TurnOutcome::Done)
 }
 
-/// Re-read the file after a finished turn, drop any abort lines that landed
-/// mid-stream, append `extra`, and restore the live status line.
 pub(crate) fn finalize_turn(path: &Path, extra: String) -> Result<(), String> {
   let text_now = read_file(path)?;
   let (body, live) = strip_live_line(&text_now);
@@ -341,6 +327,7 @@ pub(crate) fn unfinished_subagents(parent: &Path) -> Result<Vec<PathBuf>, String
 pub(crate) enum SubagentReport {
   FromTranscript,
   Aborted,
+  TurnCap,
 }
 
 pub(crate) async fn deliver_subagent_result(
@@ -366,6 +353,17 @@ pub(crate) async fn deliver_subagent_result(
       )
     }
     SubagentReport::Aborted => ("subagent was aborted before completing".to_string(), false),
+    SubagentReport::TurnCap => {
+      let pf = parse_file(&text);
+      let body = final_assistant_text(&pf)
+        .unwrap_or_else(|| "(subagent produced no text output)".to_string());
+      (
+        format!(
+          "(the subagent hit the per-burst turn cap and was cut off mid-work; the report below may be incomplete)\n\n{body}"
+        ),
+        true,
+      )
+    }
   };
   inject_subagent_report(&subagent_parent_path(path)?, &name, &report, ok)?;
   let (body, live) = strip_live_line(&text);

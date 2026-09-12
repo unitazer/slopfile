@@ -1,4 +1,3 @@
-
 use crate::lex::{lex, lex_line, Token, TokKind};
 use crate::questions::QuestionsBlock;
 use crate::types::{ChatMessage, Role, SessionConfig, ToolCall};
@@ -21,6 +20,10 @@ pub fn abort_marker_present(text: &str) -> bool {
 
 pub fn is_abort_line(line: &str) -> bool {
   lex_line(line) == TokKind::Abort
+}
+
+pub fn is_parked_line(line: &str) -> bool {
+  lex_line(line) == TokKind::Parked
 }
 
 pub fn strip_live_line(text: &str) -> (String, Option<String>) {
@@ -56,8 +59,6 @@ pub fn strip_live_line(text: &str) -> (String, Option<String>) {
   (body, last)
 }
 
-/// Rebuild a transcript after stripping the live line: `extra` is appended to
-/// `body`, then the live status line goes back at the very bottom.
 pub fn reassemble(body: &str, extra: &str, live: Option<&str>) -> String {
   let mut out = body.to_string();
   if !out.is_empty() && !out.ends_with('\n') {
@@ -72,7 +73,6 @@ pub fn reassemble(body: &str, extra: &str, live: Option<&str>) -> String {
   }
   out
 }
-
 
 #[derive(Debug, Clone)]
 pub struct DanglingTail {
@@ -89,7 +89,6 @@ pub struct ParsedFile {
   pub dangling: Option<DanglingTail>,
 }
 
-
 fn tool_call_id(name: &str, arguments: &str) -> String {
   fn fnv1a64(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -103,7 +102,10 @@ fn tool_call_id(name: &str, arguments: &str) -> String {
 }
 
 pub fn header_config(text: &str) -> SessionConfig {
-  let toks = lex(text);
+  header_config_from_toks(&lex(text))
+}
+
+fn header_config_from_toks(toks: &[Token<'_>]) -> SessionConfig {
   let Some(open) = toks.iter().find(|t| t.kind == TokKind::FenceOpen && t.payload == "toml") else {
     return SessionConfig::default();
   };
@@ -140,15 +142,11 @@ pub fn turn_end_tail_start(text: &str) -> Option<usize> {
     .map(|t| t.offset + t.text.len())
 }
 
-/// User-authored text below the last turn-end marker (draft, pending request).
-/// Daemon-owned lines and QUESTIONS blocks are excluded. `None` = empty tail.
 pub fn tail_user_text(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
   user_text_below_done(&body)
 }
 
-/// Same as `tail_user_text`, but only text strictly before byte offset `cap`
-/// counts (used to exclude a dangling partial assistant section).
 pub fn tail_user_text_capped(text: &str, cap: usize) -> Option<String> {
   let (body, _live) = strip_live_line(text);
   let end = cap.min(body.len());
@@ -171,8 +169,6 @@ fn user_text_below_done(body: &str) -> Option<String> {
   Some(joined)
 }
 
-/// Like `tail_user_text`, but a tail that opens with an explicit section
-/// heading is not a draft (it is already a structured turn).
 pub fn draft_tail(text: &str) -> Option<String> {
   let (body, _live) = strip_live_line(text);
   let done = lex(&body).into_iter().find(|t| t.kind.is_turn_end())?;
@@ -199,7 +195,6 @@ pub fn draft_tail(text: &str) -> Option<String> {
   }
   Some(joined)
 }
-
 
 pub fn read_file(path: &Path) -> Result<String, String> {
   std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
@@ -233,6 +228,10 @@ pub fn without_abort_lines(text: &str) -> String {
   without_lines_matching(text, is_abort_line)
 }
 
+pub fn without_parked_lines(text: &str) -> String {
+  without_lines_matching(text, is_parked_line)
+}
+
 pub fn without_send_lines(text: &str) -> String {
   without_lines_matching(text, is_send_line)
 }
@@ -242,7 +241,6 @@ pub fn strip_abort_marker(path: &Path, text: &str) -> Result<(), String> {
   let out = reassemble(&without_abort_lines(&body), "", live.as_deref());
   write_file(path, out)
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
@@ -396,7 +394,6 @@ pub fn assistant_section_messages(raw: &str) -> Vec<ChatMessage> {
   build_history(&lex(raw), usize::MAX, Mode::Asst)
 }
 
-
 pub fn parse_file(text: &str) -> ParsedFile {
   let toks = lex(text);
   let n_lines = text.lines().count();
@@ -491,9 +488,6 @@ pub fn parse_file(text: &str) -> ParsedFile {
     .rfind(|t| t.kind.is_turn_end())
     .map(|t| t.line);
   let status_line = toks.iter().rfind(|t| t.kind == TokKind::Live).map(|t| t.line);
-  // A dangling partial assistant section is replayed separately; it must not
-  // also land in history, or the request ends with two identical assistant
-  // messages and llama-server rejects it.
   let mut history_end = match (last_done_line, status_line) {
     (Some(d), _) => d + 1,
     (None, Some(s)) => s,
@@ -530,7 +524,7 @@ pub fn parse_file(text: &str) -> ParsedFile {
     .collect();
 
   ParsedFile {
-    config: header_config(text),
+    config: header_config_from_toks(&toks),
     history,
     tail,
     pending_questions,

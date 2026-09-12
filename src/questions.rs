@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
@@ -18,9 +17,6 @@ pub struct QuestionsBlock {
 
 pub const BLOCK_HEADER: &str = "QUESTIONS";
 
-/// Parse one question from its stashed JSON shape
-/// (`{"question":..., "answers":[...], "default":...}`), filling blanks the
-/// same way the renderer does (`"?"`, no options).
 pub fn question_from_value(id: u32, v: &serde_json::Value) -> Option<Question> {
   let question = v.get("question")?.as_str()?.to_string();
   let answers = v
@@ -38,8 +34,6 @@ pub fn question_from_value(id: u32, v: &serde_json::Value) -> Option<Question> {
   })
 }
 
-/// Lenient variant used when re-rendering a live tool call: missing fields
-/// become renderer defaults instead of dropping the question.
 pub fn question_from_tool_item(id: u32, v: &serde_json::Value) -> Question {
   let question = v
     .get("question")

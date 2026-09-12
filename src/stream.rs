@@ -1,18 +1,18 @@
 use crate::transcript::{reassemble, strip_live_line, without_abort_lines};
 use crate::types::StreamEvent;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
-/// Streams assistant output into the transcript file below the current
-/// section. Aborts are handled by the caller's watchdog (`keep_going` in
-/// `LlamaClient::consume_stream`); finalization strips any abort lines that
-/// landed mid-stream.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
 pub struct StreamWriter<'a> {
   path: &'a Path,
   out: String,
   live: Option<String>,
   wrote_header: bool,
   in_reasoning: bool,
+  last_flush: Instant,
 }
 
 impl<'a> StreamWriter<'a> {
@@ -23,6 +23,7 @@ impl<'a> StreamWriter<'a> {
       live,
       wrote_header: false,
       in_reasoning: false,
+      last_flush: Instant::now(),
     }
   }
 
@@ -76,12 +77,6 @@ impl<'a> StreamWriter<'a> {
     self.flush();
   }
 
-  /// Models like Qwen3 close their native reasoning with literal
-  /// `<think>`/`</think>` tags that llama-server can leak into the text
-  /// channel (typically when resuming a cut-off reasoning block). Translate
-  /// them to harness markers. Text-channel events are content by default;
-  /// only the tags switch channels, so an orphan `</think>` closes the
-  /// harness-side block and plain text always terminates reasoning.
   fn write_tag_aware(&mut self, mut s: &str) {
     let mut reasoning = false;
     loop {
@@ -114,13 +109,16 @@ impl<'a> StreamWriter<'a> {
   }
 
   fn flush(&mut self) {
+    if self.last_flush.elapsed() < FLUSH_INTERVAL {
+      return;
+    }
+    self.last_flush = Instant::now();
     let out = reassemble(&self.out, "", self.live.as_deref());
     if let Err(e) = std::fs::write(self.path, out) {
       warn!("stream write failed: {e}");
     }
   }
 
-  /// Close the reasoning block and write the settled section state.
   pub fn finish_section(&self) {
     let (body, _) = strip_live_line(&self.out);
     let mut extra = String::new();

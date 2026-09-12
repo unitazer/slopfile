@@ -1,4 +1,3 @@
-
 use std::collections::VecDeque;
 use std::fs::{create_dir_all, read_to_string};
 use std::path::{Path, PathBuf};
@@ -11,6 +10,7 @@ use crate::types::{FunctionDefinition, ToolDefinition, ToolResult};
 
 const BASH_OUTPUT_CAP: usize = 30_000;
 const GREP_MATCH_CAP: usize = 500;
+const GREP_LINE_CAP: usize = 2_000;
 const FIND_FILE_CAP: usize = 2_000;
 
 pub fn definitions() -> Vec<ToolDefinition> {
@@ -187,8 +187,6 @@ pub async fn run(
   }
 }
 
-/// Fetch a required string argument, with a uniform `<tool>: missing string
-/// argument "<key>"` error. Use [`arg!`] / [`path!`] at call sites that bail.
 fn str_arg<'a>(tool: &str, args: &'a Value, key: &str) -> Result<&'a str, ToolResult> {
   args.get(key).and_then(Value::as_str).ok_or_else(|| {
     ToolResult::err(format!("{tool}: missing string argument \"{key}\""))
@@ -382,11 +380,17 @@ fn grep(workdir: &Path, args: &Value) -> ToolResult {
           ));
           break 'walk;
         }
-        out.push_str(&format!("{}:{}: {line}\n", rel.display(), idx + 1));
+        let shown = if line.chars().count() > GREP_LINE_CAP {
+          let head: String = line.chars().take(GREP_LINE_CAP).collect();
+          format!("{head}… [line truncated]")
+        } else {
+          line.to_string()
+        };
+        out.push_str(&format!("{}:{}: {shown}\n", rel.display(), idx + 1));
       }
     }
   }
-  ToolResult::ok(out)
+  ToolResult::ok(truncate(&out))
 }
 
 fn find(workdir: &Path, args: &Value) -> ToolResult {
@@ -465,7 +469,6 @@ fn ls(workdir: &Path, args: &Value) -> ToolResult {
   ToolResult::ok(out)
 }
 
-
 fn resolve_in(workdir: &Path, p: &str) -> Result<PathBuf, String> {
   let base = std::fs::canonicalize(workdir).map_err(|e| format!("workdir does not exist: {e}"))?;
   let target = if Path::new(p).is_absolute() {
@@ -500,7 +503,6 @@ fn resolve_in(workdir: &Path, p: &str) -> Result<PathBuf, String> {
     }
   }
 }
-
 
 fn walk_files(workdir: &Path, root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
   let mut files = Vec::new();
@@ -578,7 +580,6 @@ async fn read_into(mut pipe: impl tokio::io::AsyncRead + Unpin) -> String {
   let _ = pipe.read_to_end(&mut buf).await;
   String::from_utf8_lossy(&buf).into_owned()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -870,6 +871,29 @@ mod tests {
     assert!(sub.ok);
     assert!(sub.output.contains("sub/b.txt:1: world again"));
     assert!(!sub.output.contains("a.txt"));
+    let _ = fs::remove_dir_all(&wd);
+  }
+
+  #[tokio::test]
+  async fn grep_truncates_oversized_matching_lines() {
+    let wd = test_dir("grep-longline");
+    fs::write(
+      wd.join("big.json"),
+      format!("{{\"k\":\"{}\"}}\n", "x".repeat(10_000)),
+    )
+    .unwrap();
+    let r = t("grep", json!({"pattern": "\"k\""}), wd.clone()).await;
+    assert!(r.ok, "grep failed: {}", r.output);
+    assert!(
+      r.output.contains("line truncated"),
+      "long line must be capped: {}",
+      r.output
+    );
+    assert!(
+      r.output.len() < 10_000,
+      "output must stay bounded: {}",
+      r.output.len()
+    );
     let _ = fs::remove_dir_all(&wd);
   }
 

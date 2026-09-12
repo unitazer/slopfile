@@ -22,6 +22,8 @@ struct Cli {
   model: Option<String>,
   #[arg(long, default_value_t = 600)]
   eval_timeout_secs: u64,
+  #[arg(long, default_value_t = 7200)]
+  iter_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -43,6 +45,7 @@ async fn main() {
     maximize: cli.maximize,
     max_iters: cli.max_iters,
     eval_timeout_secs: cli.eval_timeout_secs,
+    iter_timeout_secs: cli.iter_timeout_secs,
     poll_ms: 2_000,
   };
 

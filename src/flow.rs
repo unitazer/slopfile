@@ -439,8 +439,6 @@ pub fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
   }
 }
 
-/// End offset of a QUESTIONS block starting at `header_ix`: just past its
-/// stashed `<!-- call:... -->` line, or end of text when unstashable.
 fn block_end(text: &str, header_ix: usize) -> usize {
   text[header_ix..]
     .find("<!-- call:")
@@ -456,7 +454,6 @@ fn questions_block_region(tail: &str) -> Option<&str> {
   Some(&tail[start..block_end(tail, start)])
 }
 
-/// The stashed `<!-- call:name {json} -->` payload of a question block.
 fn stashed_call(block_text: &str) -> String {
   block_text
     .lines()

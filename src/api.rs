@@ -1,4 +1,3 @@
-
 use crate::sse::{stream_chunks, SseError};
 use crate::types::{
     ChatMessage, Role, SseToolCallDelta, StreamEvent, StreamResult, ToolCall, ToolDefinition,
@@ -6,6 +5,9 @@ use crate::types::{
 use futures_util::StreamExt;
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
+
+const KEEP_GOING_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -95,6 +97,7 @@ impl ToolCallAccumulator {
 pub struct LlamaClient {
     base: String,
     client: reqwest::Client,
+    idle_timeout: Duration,
 }
 
 impl LlamaClient {
@@ -102,24 +105,31 @@ impl LlamaClient {
         Self {
             base: api_base.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
+            idle_timeout: Duration::from_secs(300),
         }
     }
 
-    /// Shared HTTP client for auxiliary endpoints (tokenize, etc.).
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
     pub(crate) fn rest(&self) -> &reqwest::Client {
         &self.client
     }
 
     pub async fn ensure_model_loaded(&self, model: &str) {
         let body = serde_json::json!({ "model": model });
+        let mut last_err = String::new();
         for path in ["models/load", "v1/models/load"] {
             let url = format!("{}/{path}", self.base);
-            if let Ok(resp) = self.client.post(&url).json(&body).send().await
-                && resp.status().is_success()
-            {
-                return;
+            match self.client.post(&url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => return,
+                Ok(resp) => last_err = format!("{}: HTTP {}", url, resp.status()),
+                Err(e) => last_err = format!("{url}: {e}"),
             }
         }
+        tracing::warn!("ensure_model_loaded({model}) failed: {last_err}; continuing with whatever is loaded");
     }
 
     pub async fn chat_stream(
@@ -174,12 +184,14 @@ impl LlamaClient {
         let mut result = StreamResult::default();
         let mut acc = ToolCallAccumulator::default();
         let mut chunk_stream = stream_chunks(raw);
+        let mut last_data = Instant::now();
 
         loop {
             tokio::select! {
                 chunk = chunk_stream.next() => {
                     let Some(chunk) = chunk else { break; };
                     let chunk = chunk.map_err(ApiError::from)?;
+                    last_data = Instant::now();
                     if let Some(usage) = &chunk.usage {
                         result.usage = Some(usage.clone());
                     }
@@ -219,11 +231,15 @@ impl LlamaClient {
                         break;
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                _ = tokio::time::sleep(KEEP_GOING_INTERVAL) => {
                     if !keep_going() {
                         result.aborted = true;
                         self.cancel_generation().await;
                         break;
+                    }
+                    if last_data.elapsed() >= self.idle_timeout {
+                        self.cancel_generation().await;
+                        return Err(ApiError::Timeout(last_data.elapsed()));
                     }
                 }
             }
@@ -434,6 +450,20 @@ use super::*;
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(900),
             "abort should fire between 200ms watchdog ticks, not wait for the next chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_times_out() {
+        let client =
+            LlamaClient::new("http://localhost:9").with_idle_timeout(Duration::from_millis(150));
+        let sse = vec!["data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"];
+        let result = client
+            .consume_stream(SlowBytesStream::new(sse), |_| true, || true)
+            .await;
+        assert!(
+            matches!(result, Err(ApiError::Timeout(_))),
+            "stall must surface as a timeout: {result:?}"
         );
     }
 

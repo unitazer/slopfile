@@ -1,7 +1,5 @@
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -11,7 +9,6 @@ pub enum Role {
   Assistant,
   Tool,
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -88,7 +85,6 @@ pub struct FunctionDefinition {
   pub parameters: Value,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
   pub role: Role,
@@ -155,7 +151,6 @@ impl ChatMessage {
   }
 }
 
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct SseChunk {
   #[serde(default)]
@@ -210,7 +205,6 @@ pub struct Usage {
   pub completion_tokens: u32,
 }
 
-
 #[derive(Debug, Clone, Default)]
 pub struct StreamResult {
   pub content: String,
@@ -230,7 +224,6 @@ pub enum StreamEvent {
   #[allow(dead_code)]
   Done(StreamResult),
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -284,6 +277,8 @@ pub struct AppConfig {
   pub llama_container: String,
   #[serde(default = "default_subagent_max_depth")]
   pub subagent_max_depth: u32,
+  #[serde(default = "default_stream_idle_timeout_secs")]
+  pub stream_idle_timeout_secs: u64,
 }
 
 fn default_api_base() -> String {
@@ -319,6 +314,9 @@ fn default_llama_container() -> String {
 fn default_subagent_max_depth() -> u32 {
   2
 }
+fn default_stream_idle_timeout_secs() -> u64 {
+  300
+}
 
 impl Default for AppConfig {
   fn default() -> Self {
@@ -335,6 +333,7 @@ impl Default for AppConfig {
       abort_restart_server: default_abort_restart_server(),
       llama_container: default_llama_container(),
       subagent_max_depth: default_subagent_max_depth(),
+      stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
     }
   }
 }
@@ -347,7 +346,6 @@ impl AppConfig {
     }
   }
 }
-
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -371,7 +369,6 @@ impl SessionConfig {
       && self.tools.as_ref().is_none_or(|l| l.iter().any(|t| t == name))
   }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -397,7 +394,6 @@ impl ToolResult {
     }
   }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LiveStatus {

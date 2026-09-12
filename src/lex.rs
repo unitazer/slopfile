@@ -1,4 +1,3 @@
-
 pub const DONE_MARKER: &str = "<!-- @done -->";
 pub const SEND_MARKER: &str = "<!-- slopfile:send -->";
 pub const ABORT_MARKER: &str = "<!-- slopfile:abort -->";
@@ -8,6 +7,7 @@ pub const THINK_END: &str = "<!-- /thinking -->";
 pub const CONTEXT_FULL_PREFIX: &str = "<!-- slopfile:context-full";
 pub const SOLVED_MARKER: &str = "<!-- slopfile:solved -->";
 pub const REPORTED_MARKER: &str = "<!-- slopfile:reported -->";
+pub const PARKED_MARKER: &str = "<!-- slopfile:parked -->";
 pub const CONTEXT_FULL_NOTE: &str = "<!-- slopfile:context-full: the model hit the token cap mid-response; trim the useless old turns above, then write your next message below this note -->";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,7 @@ pub enum TokKind {
   ContextFull,
   Solved,
   Reported,
+  Parked,
   ThinkingOpen,
   ThinkingEnd,
   Tool,
@@ -56,6 +57,7 @@ impl TokKind {
         | TokKind::ContextFull
         | TokKind::Solved
         | TokKind::Reported
+        | TokKind::Parked
     )
   }
 
@@ -182,6 +184,7 @@ fn classify(raw: &str) -> TokenKindWithPayload<'_> {
     _ if t == ABORTED_MARKER => token(TokKind::Aborted, ""),
     _ if t == SOLVED_MARKER => token(TokKind::Solved, ""),
     _ if t == REPORTED_MARKER => token(TokKind::Reported, ""),
+    _ if t == PARKED_MARKER => token(TokKind::Parked, ""),
     _ if t.starts_with("<!-- slopfile:live ") && t.ends_with("-->") => {
       token(TokKind::Live, closing_payload(t, "<!-- slopfile:live "))
     }
@@ -514,10 +517,11 @@ closed
   }
 
   #[test]
-  fn daemon_owned_is_exactly_abort_live_contextfull() {
+  fn daemon_owned_is_exactly_abort_live_contextfull_parked() {
     assert!(TokKind::Abort.is_daemon_owned());
     assert!(TokKind::Live.is_daemon_owned());
     assert!(TokKind::ContextFull.is_daemon_owned());
+    assert!(TokKind::Parked.is_daemon_owned());
     assert!(!TokKind::Tool.is_daemon_owned());
     assert!(!TokKind::Result.is_daemon_owned());
     assert!(!TokKind::Text.is_daemon_owned());

@@ -26,6 +26,7 @@ fn yolo_cfg() -> AppConfig {
       abort_restart_server: false,
       llama_container: "test-llama".into(),
       subagent_max_depth: 2,
+      stream_idle_timeout_secs: 300,
     }
   }
 
@@ -278,7 +279,6 @@ Let me read a file.
     std::fs::write(&path, seed).unwrap();
 
     let mut w = StreamWriter::new(&path, &read_to_string(&path).unwrap(), None);
-    // resumed model closes the replayed reasoning block with a raw tag
     assert!(w.handle(&types::StreamEvent::Text("</think>answer text".into())));
     assert!(w.handle(&types::StreamEvent::Reasoning("hmm".into())));
     assert!(w.handle(&types::StreamEvent::Text("<think>ignored open".into())));
@@ -607,7 +607,6 @@ Let me read a file.
     std::fs::write(&running, format!("{}\n", REPORTED_MARKER)).unwrap();
     assert!(crate::daemon::unfinished_subagents(&parent).unwrap().is_empty());
 
-    // lookalike files with the prefix but no strict `.sub-NN` shape never block
     let lookalike = dir.join("p.sub-notes.md");
     let grandchild = dir.join("p.sub-01.sub-01.md");
     std::fs::write(&lookalike, "unrelated\n").unwrap();
@@ -624,7 +623,6 @@ Let me read a file.
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = yolo_cfg();
     let parent = dir.join("s.md");
-    // `tools` is a real allowlist: find and solve are off it; grep is excluded.
     let text = concat!(
       "```toml\nmodel = \"qwen3.8-27b\"\ntools = [\"read\", \"bash\"]\n",
       "tools_excluded = [\"grep\"]\n```\n# S\nSys.\n\n### You\nhi\n"
