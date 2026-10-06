@@ -1,3 +1,8 @@
+COMEPLETELY vibecoded, this is a throwaway project, if i feel like its worthy and anyone else
+expresses some interest in it, i might rewrite it on my own.
+the code's definitely questionable at places but if it doesnt work just throw a different clanker at it idgaf
+
+
 # slopfile — a file-as-UI coding agent
 
 `slopfile` is a small daemon that turns a single Markdown file into a whole
@@ -23,15 +28,16 @@ clanker/slopfile/            # the single git repo (source + docker + weights)
 The repo is one git directory: source, docker definitions, the `shared/` runtime
 volume, and a private `workspace/` all live under `slopfile/`. The containers
 mount only `shared/` and `workspace/` — the slopfile source is **not** mounted
-into the agent's container, so the model cannot read or edit its own code. The
-`read` tool additionally refuses files containing the `<!-- slopfile` marker
-(session transcripts / daemon-owned state).
+into the agent's container, so the model cannot read or edit its own code.
 
 ---
 
 ## How the file works
 
-One session = one `.md` file with three regions:
+One session = one `.md` file that is a **stack of regions**. A region opens with
+`<!-- slopfile:NAME -->`, closes with `<!-- /slopfile -->`, and its body is
+copied out verbatim — the body is never re-scanned for structure, so nothing a
+model writes can turn into structure.
 
 ```markdown
 ```toml
@@ -39,46 +45,69 @@ model = "qwen3.8-27b"
 thinking = "auto"
 tools = ["read", "write", "edit", "bash", "grep", "find", "ls"]
 ```
-# Session                        <- HEADER + system prompt start
-
-System prompt / starting text.   <- this is the first text the model sees
-
-### You
+<!-- slopfile:begin -->
+<!-- slopfile:system -->
+You are an expert software engineering assistant…     <- the system prompt
+<!-- /slopfile -->
+<!-- slopfile:turn -->                                 <- one user turn
+<!-- slopfile:user -->
 a user turn
-
-### Assistant
-streamed assistant text, then tool blocks, then
-<!-- @done -->                     done marker (daemon writes it on completion)
-
-anything below the last <!-- @done --> is the TAIL: type your next request here
+<!-- /slopfile -->
+<!-- slopfile:assistant -->
+<!-- slopfile:reasoning -->
+streamed thinking
+<!-- /slopfile -->
+<!-- slopfile:text -->
+streamed reply text
+<!-- /slopfile -->
+<!-- slopfile:call {"id":"c1","name":"bash","arguments":"{\"command\":\"ls\"}"} -->
+<!-- /slopfile -->
+<!-- /slopfile -->                                     <- assistant done
+<!-- slopfile:result {"id":"c1","name":"bash","ok":true,"ms":9} -->
+1: src
+<!-- /slopfile -->
+<!-- /slopfile -->                                     <- turn finished
+<!-- slopfile:input -->
+type your next request here                          <- everything below is yours
 ```
 
-- **Header** — the *first* ` ```toml ` block in the file. Per-session settings.
-  Overrides the app config. Only the first one counts; a later ` ```toml `
-  (e.g. pasted into a code block) is ordinary text.
-- **Middle** — what the LLM actually sees: system prompt, `### You` turns,
-  `### Assistant` output with inline tool blocks.
-- **Tail** — everything below the last `<!-- @done -->`: your drafts, pending
-  `QUESTIONS` blocks, and a daemon-owned status line
-  (`<!-- slopfile:live {...} -->`) at the very bottom.
+- **The fence** — the first ` ```toml ` block. Per-session settings (model,
+  tools, limits); overrides the app config. Human lines around it are kept.
+- **`system`** — the system prompt. Required; the daemon refuses edits that drop it.
+- **`turn`** — one exchange. It is **finished exactly when its region is closed**,
+  which is how the daemon knows a turn ended: no `@done` marker, no `### Assistant`
+  headings, no mode tracking.
+- **`note`** — free text with an author: your own scratchpad, or
+  `<!-- slopfile:note {"by":"harness"} -->` for harness messages (for example
+  "you hit the token cap, go prune").
+- **`question`** — a `{"call":…,"questions":[…]}` header. The human-facing table
+  is rendered into the `input` region below.
+- **`input`** — the only opaque region: it runs to the end of the file, so
+  whatever you type there can never become structure.
 
-The request context sent to the model is **the middle region only** — header,
-tail, comments, status line, and stashed tool JSON are stripped.
+Anything the daemon writes into a body is escaped: a literal `<` is wrapped as
+`<!--slopfile:ESC[<<!--/slopfile:ESC-->`. Both wrapper delimiters start with
+`<`, so escaping that one character makes it impossible for content to forge a
+marker, even by gluing two fragments together.
+
+**All daemon state lives in the daemon, not in the file.** There is no status
+line, no send marker, no abort marker: `armed`, `phase`, `parked`, `solved` and
+friends are process memory, reachable over the control channel (`sf status`).
+The trade-off is that arming a session does not survive a daemon restart — press
+send again.
 
 ### Turn flow
 
-1. Type a request in the tail → hit `:Send` (or `:Resume`).
-2. The daemon promotes the tail text to a `### You` turn and streams an
-   `### Assistant` response.
-3. Tool calls are executed and written as `<!-- tool:... -->` / `<!-- result:... -->`
-   blocks, then the next turn continues.
-4. On clean completion the daemon appends `<!-- @done -->`.
-5. If the model calls the `question` tool, the daemon stops and renders a
-   `QUESTIONS` table in the tail. Answer below the `>` line (e.g. `2`, comma
-   separated, or free text) and `:Send` again; or ` /skip` for
-   defaults/empty. In `confirmations = "yolo"` mode they auto-resolve.
-
----
+1. Type a request below the `input` marker → `sf send` (or `:Send`).
+2. The daemon promotes that text to a `user` region, opens an `assistant`
+   region, and streams `reasoning` / `text` into it as tokens arrive.
+3. Tool calls land as `call` + `result` regions; the daemon loops until the
+   model stops asking for tools.
+4. On clean completion the `turn` region is closed.
+5. `question` → the daemon renders a `QUESTIONS` table into `input` and waits.
+   Answer below the `>` line (indices, comma separated, or free text) and
+   `sf question <session> <answers…>`; `/skip` takes the defaults. In
+   `confirmations = "yolo"` they auto-resolve.
 
 ## Run 1 — host (quick, no Docker for the daemon)
 
@@ -86,16 +115,19 @@ You need a `llama-server` (or any OpenAI-compatible endpoint) reachable at the
 `api_base` from the config.
 
 ```bash
-# 1. Build the binary
+# 1. Build both binaries
 cd slopfile
-cargo build --release                 # -> target/release/slopfile (alias slopfile=./target/release/slopfile)
+cargo build --release                 # -> target/release/{slopfile,sf}
 
-# 2. (optional) create a session file template
-slopfile init "$HOME/things/clanker/slopfile/shared/transcripts/t1.md"
+# 2. (optional) create a session file
+sf init t1                             # -> shared/transcripts/t1.md
 
 # 3. start the daemon (watches the transcripts dir, drives every file)
 slopfile
 ```
+
+The daemon also speaks the control protocol, so `slopfile send|stop|abort|status`
+work identically to `sf` — handy inside the container, where `sf` is not built.
 
 The daemon reads `SLOPFILE_CONFIG` (default
 `slopfile/shared/slopfile.toml`) and can be overridden per-launch:
@@ -118,11 +150,11 @@ Load the plugin once per nvim session, then open a session `.md`:
 ```
 
 (Or add `~/things/clanker/slopfile/nvim/plugin` to your `runtimepath` instead,
-in which case it loads automatically.) If the `slopfile` binary isn't on
-`$PATH`, point the plugin at it first:
+in which case it loads automatically.) The plugin shells out to the `sf` CLI; if
+it isn't on `$PATH`, point the plugin at it first:
 
 ```vim
-let g:slopfile_bin = '~/things/clanker/slopfile/target/release/slopfile'
+let g:sf_bin = '~/things/clanker/slopfile/target/release/sf'
 ```
 
 A 1s timer reloads the buffer while the
@@ -130,18 +162,40 @@ daemon streams; the view follows the stream when your cursor is on the last
 line. Save before expecting updates — `:checktime` refuses to clobber unsaved
 text.
 
-| Command   | Action |
-|-----------|--------|
-| `:Init`   | save an empty buffer; the daemon formats it as a session |
-| `:Send`   | save the buffer + trigger a sweep (tail → `### You`, start/resume) |
-| `:Resume` | force a re-parse of dangling output / pending question block |
-| `:Abort`  | append the abort marker; daemon stops streaming, closes `@done` |
-| `:Status` | re-render the `<!-- slopfile:live ... -->` status line |
-| `:Tokens` | run `slopfile tokens <buffer>` and show the token footprint |
+| Command     | Action |
+|-------------|--------|
+| `:Init`     | `sf init <session>` for this buffer |
+| `:Send`     | save the buffer, then `sf send` — arms and starts/resumes generating |
+| `:Resume`   | alias for `:Send` |
+| `:Stop`     | `sf stop` — let the current turn finish, then go idle |
+| `:Abort`    | `sf abort` — kill the in-flight stream now |
+| `:Status`   | `sf status` — one line of live daemon state |
+| `:Question` | prompt for answers, then `sf question` |
+| `:Tokens`   | `sf tokens` — token/budget report |
 
-The plugin finds the binary via `g:slopfile_bin` (default `slopfile`). CLI
-equivalents: `slopfile abort <path>` (interrupt a session), `slopfile init
-<path>` (create a template), `slopfile tokens <path>` (tokenize a session).
+The plugin finds the CLI via `g:sf_bin` (or the older `g:slopfile_bin`),
+defaulting to `sf` on `$PATH`.
+
+### The `sf` CLI
+
+```bash
+sf init <session>                      # create a session file (local)
+sf send <session>                      # arm + start generating
+sf stop <session>                      # finish the current turn, then idle
+sf abort <session>                     # kill the in-flight stream now
+sf status <session>                    # phase/running/armed/parked/solved/…
+sf question <session> <answers…>       # one argument per pending question
+sf tokens <session>                    # token footprint vs the context budget
+```
+
+`<session>` is a bare name (`1`, `1.md`) resolved inside the daemon's
+transcripts dir; path separators are refused. `--addr` (or `SF_ADDR`, default
+`127.0.0.1:8787`) points at the daemon, `--transcripts` (or
+`SLOPFILE_TRANSCRIPTS`) at the local session dir used by `init` and `tokens`.
+
+The wire is newline-delimited JSON, one request per TCP connection, on
+`127.0.0.1:8787` inside the container's compose network — see the
+`ports:`/`SF_ADDR:` entries in `docker/docker-compose.yml`.
 
 ---
 
@@ -186,10 +240,13 @@ cd slopfile           # repo root
 
 `start.sh` is idempotent — it errors out if the docker daemon is down, uses
 `docker compose up -d` (harmless if containers are already running, and waits
-for llama-server to be healthy), builds the host `slopfile` binary in release
-mode and deploys it into the container (`docker/run.sh deploy`), then opens
-nvim with the plugin loaded on the most recent transcript (creating one via
-`slopfile init` if none exist).
+for llama-server to be healthy), builds the `slopfile` binary in release mode
+inside a throwaway `rust:1-slim` container (no host toolchain needed, so it
+works on NixOS) and deploys it into the running container
+(`docker/run.sh deploy`), then opens nvim with the plugin loaded on the most
+recent transcript (creating one via `slopfile init` if none exist). The nvim
+plugin also needs a host-side binary (`target/release/slopfile`); `start.sh`
+builds one via `cargo` or `nix develop -c cargo` when it's missing.
 
 Or manually:
 
@@ -241,11 +298,37 @@ abort_restart_server = true                    # docker restart llama-server on 
 llama_container = "clanker-llama"              # container to restart on abort
 ```
 
+## The model owns its own context
+
+The session file *is* the model's context — it is parsed back into the request on
+every call — so the model is told its file's path in the system prompt and may
+edit it directly with `read`/`edit`/`write` or with bash. It decides what to drop,
+compress or delete, and the edit becomes its context on the next call. There is no
+summarizer, no successor transcript, and no compaction step: nothing is ever
+rewritten behind the model's back.
+
+- Compress a long turn, delete a dead tool round, keep a running `note` region, or
+  wipe whole turns — whatever it leaves in the file is what it gets back.
+- Subagents get their own file, so they manage their own context too.
+- If the model fills the context mid-response, a harness `note` tells it to prune
+  the file itself; if it doesn't, the usual drop-oldest truncation keeps the
+  request inside the budget.
+- The harness owns the structure and nothing else. An edit that would leave the
+  file unparseable (an unknown region, a `<!-- /slopfile -->` with nothing open, a
+  corrupt `call`/`result`/`question` header) or that drops the ` ```toml ` fence or
+  the `system` region is refused by `edit`/`write` with the reason, and rolled back
+  after a bash edit with the reason appended to that tool's result.
+
 ## Troubleshooting
 
-- **No response / stuck** — the status line shows the current phase
-  (`idle`, `waiting_answer`, `streaming`, …). Open the file in nvim and run
-  `:Status`, or watch `./run.sh logs slopfile`.
+- **No response / stuck** — ask the daemon: `sf status <session>` (or `:Status`)
+  reports `phase` (`idle`, `generating`, `running_tools`, `waiting_answer`,
+  `waiting_subagents`) plus `armed`, `abort`, `parked`, `solved`, `context_full`.
+  Watch `./run.sh logs slopfile` for what the daemon is doing.
+- **The model never starts** — nothing arms a session on its own. `sf send` (or
+  `:Send`) is what sets `armed`, and arming does not survive a daemon restart.
+- **`failed to parse session file`** — the daemon refuses to drive a file whose
+  regions are broken; the message names the region. Fix it by hand, then send.
 - **"waiting_answer"** — the model asked a question; answer below the `> `
   line and `:Send`, or add ` /skip`.
 - **Abort does nothing / can't restart server** — the container can't reach

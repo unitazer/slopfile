@@ -68,14 +68,26 @@ where
                             return Poll::Ready(Some(Err(SseError::Reqwest(e))))
                         }
                         Poll::Ready(None) => {
-                            if !self.buf.is_empty() {
-                                let trailing = String::from_utf8_lossy(&self.buf).to_string();
-                                self.buf.clear();
-                                return Poll::Ready(Some(Err(SseError::Io(format!(
-                                    "stream ended with {trailing:?} unparsed"
-                                )))));
+                            // A complete frame whose trailing newline never arrived is still a
+                            // frame; a genuinely half-written one is not, and is reported.
+                            let trailing = std::mem::take(&mut self.buf);
+                            if trailing.is_empty() {
+                                return Poll::Ready(None);
                             }
-                            return Poll::Ready(None);
+                            return match parse_frame(&trailing) {
+                                Some(Ok((chunk, done))) => {
+                                    self.done = done;
+                                    if done {
+                                        Poll::Ready(None)
+                                    } else {
+                                        Poll::Ready(Some(Ok(chunk)))
+                                    }
+                                }
+                                _ => Poll::Ready(Some(Err(SseError::Io(format!(
+                                    "stream ended with {:?} unparsed",
+                                    String::from_utf8_lossy(&trailing)
+                                ))))),
+                            };
                         }
                         Poll::Pending => return Poll::Pending,
                     }
@@ -95,30 +107,34 @@ fn take_next_event(buf: &mut Vec<u8>) -> Result<Option<(SseChunk, bool)>, SseErr
             return Ok(None);
         };
         let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
-        let line = String::from_utf8_lossy(&line_bytes);
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() || line.starts_with(':') || !line.starts_with("data:") {
-            continue;
-        }
-        let payload = line[5..].trim_start();
-        if payload == "[DONE]" {
-            return Ok(Some((
-                SseChunk {
-                    choices: Vec::new(),
-                    usage: None,
-                },
-                true,
-            )));
-        }
-        match serde_json::from_str::<SseChunk>(payload) {
-            Ok(chunk) => return Ok(Some((chunk, false))),
-            Err(e) => {
-                return Err(SseError::BadJson(format!(
-                    "unparseable data payload: {e}: {payload}"
-                )))
-            }
+        if let Some(event) = parse_frame(&line_bytes) {
+            return Ok(Some(event?));
         }
     }
+}
+
+fn parse_frame(line_bytes: &[u8]) -> Option<Result<(SseChunk, bool), SseError>> {
+    let line = String::from_utf8_lossy(line_bytes);
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.is_empty() || line.starts_with(':') || !line.starts_with("data:") {
+        return None;
+    }
+    let payload = line[5..].trim_start();
+    if payload == "[DONE]" {
+        return Some(Ok((
+            SseChunk {
+                choices: Vec::new(),
+                usage: None,
+            },
+            true,
+        )));
+    }
+    Some(match serde_json::from_str::<SseChunk>(payload) {
+        Ok(chunk) => Ok((chunk, false)),
+        Err(e) => Err(SseError::BadJson(format!(
+            "unparseable data payload: {e}: {payload}"
+        ))),
+    })
 }
 
 pub fn stream_chunks<S>(stream: S) -> SseStream<S>
@@ -201,6 +217,31 @@ mod tests {
         let chunks = collect(stream_from_bytes(vec![sse1, sse2])).expect("collect");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn a_frame_without_a_trailing_newline_is_still_delivered() {
+        let chunks = collect(stream_from_bytes(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\" tail\"}}]}",
+        ]))
+        .expect("collect");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some(" tail"));
+    }
+
+    #[test]
+    fn a_done_frame_without_a_newline_ends_the_stream() {
+        let chunks = collect(stream_from_bytes(vec!["data: [DONE]"])).expect("collect");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn a_half_written_frame_is_reported_not_delivered() {
+        let err = collect(stream_from_bytes(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a",
+        ]))
+        .expect_err("a broken tail is an error");
+        assert!(matches!(err, SseError::Io(_)), "{err:?}");
     }
 
     #[test]

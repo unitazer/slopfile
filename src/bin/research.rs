@@ -9,6 +9,8 @@ use std::path::PathBuf;
 )]
 struct Cli {
   #[arg(long)]
+  addr: Option<String>,
+  #[arg(long)]
   workdir: PathBuf,
   #[arg(long, default_value = "transcripts")]
   transcripts_dir: PathBuf,
@@ -38,6 +40,7 @@ async fn main() {
   let cli = Cli::parse();
   let model = cli.model.unwrap_or_else(load_model_default);
   let opts = ResearchOpts {
+    addr: cli.addr.unwrap_or_else(slopfile::control::addr_from_env),
     workdir: cli.workdir,
     transcripts_dir: cli.transcripts_dir,
     model,

@@ -1,0 +1,181 @@
+use clap::{Parser, Subcommand};
+use env_logger::Env;
+use log::info;
+use slopfile::api::LlamaClient;
+use slopfile::control::{self, Cmd, Req};
+use slopfile::transcript;
+use slopfile::types::AppConfig;
+use std::path::{Path, PathBuf};
+use std::process::exit;
+
+#[derive(Parser)]
+#[command(
+  name = "sf",
+  about = "talk to a running slopfile daemon",
+  version
+)]
+struct Cli {
+  #[arg(long, global = true)]
+  addr: Option<String>,
+  #[arg(long, global = true)]
+  transcripts: Option<PathBuf>,
+  #[command(subcommand)]
+  command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+  /// Create a new session file
+  Init {
+    session: String,
+  },
+  /// Arm the session and start generating
+  Send {
+    session: String,
+  },
+  /// Let the current turn finish, then go idle
+  Stop {
+    session: String,
+  },
+  /// Kill the in-flight stream right now
+  Abort {
+    session: String,
+  },
+  /// Show what the daemon is doing with the session
+  Status {
+    session: String,
+  },
+  /// Answer the questions the model asked
+  Question {
+    session: String,
+    answers: Vec<String>,
+  },
+  /// Report the token budget for a session
+  Tokens {
+    session: String,
+  },
+}
+
+#[tokio::main]
+async fn main() {
+  env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+  let cli = Cli::parse();
+  let cfg = slopfile::load_app_config();
+  let addr = cli
+    .addr
+    .or_else(|| std::env::var("SF_ADDR").ok())
+    .unwrap_or_else(|| control::DEFAULT_ADDR.to_string());
+  let transcripts = cli
+    .transcripts
+    .map(|p| p.to_string_lossy().into_owned())
+    .or_else(|| std::env::var("SLOPFILE_TRANSCRIPTS").ok())
+    .unwrap_or(cfg.transcripts_dir.clone());
+
+  match run(cli.command, &addr, &transcripts, &cfg).await {
+    Ok(()) => {}
+    Err(why) => {
+      eprintln!("{why}");
+      exit(1);
+    }
+  }
+}
+
+async fn run(command: Command, addr: &str, transcripts: &str, cfg: &AppConfig) -> Result<(), String> {
+  match command {
+    Command::Init { session } => init(&session, transcripts, cfg),
+    Command::Tokens { session } => tokens(&session, transcripts, cfg).await,
+    Command::Send { session } => remote(addr, Cmd::Send, &session, vec![]).await,
+    Command::Stop { session } => remote(addr, Cmd::Stop, &session, vec![]).await,
+    Command::Abort { session } => remote(addr, Cmd::Abort, &session, vec![]).await,
+    Command::Status { session } => remote(addr, Cmd::Status, &session, vec![]).await,
+    Command::Question { session, answers } => remote(addr, Cmd::Question, &session, answers).await,
+  }
+}
+
+async fn remote(
+  addr: &str,
+  cmd: Cmd,
+  session: &str,
+  answers: Vec<String>,
+) -> Result<(), String> {
+  let req = Req {
+    cmd,
+    session: session.to_string(),
+    answers,
+  };
+  let resp = control::send_command(addr, &req).await.map_err(|e| e.to_string())?;
+  if !resp.ok {
+    return Err(resp.error.unwrap_or_else(|| "command failed".to_string()));
+  }
+  if let Some(status) = &resp.status {
+    if cmd == Cmd::Status {
+      println!("{status}");
+    }
+  }
+  info!("command `{}` sent to task `{}`", cmd_name(cmd), session);
+  Ok(())
+}
+
+fn cmd_name(cmd: Cmd) -> &'static str {
+  match cmd {
+    Cmd::Send => "send",
+    Cmd::Stop => "stop",
+    Cmd::Abort => "abort",
+    Cmd::Status => "status",
+    Cmd::Question => "question",
+  }
+}
+
+fn init(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(), String> {
+  let path = local_path(session, transcripts);
+  if let Some(dir) = path.parent()
+    && !dir.as_os_str().is_empty()
+  {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+  }
+  control::create_session(&path, cfg, &[])?;
+  info!("initialized task `{}`", path.display());
+  Ok(())
+}
+
+fn local_path(session: &str, transcripts: &str) -> PathBuf {
+  let asked = Path::new(session);
+  if session.contains('/') || asked.exists() {
+    return asked.to_path_buf();
+  }
+  let stem = session.strip_suffix(".md").unwrap_or(session);
+  Path::new(transcripts).join(format!("{stem}.md"))
+}
+
+async fn tokens(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(), String> {
+  let path = local_path(session, transcripts);
+  if !path.exists() {
+    return Err(format!("no such task `{}`", path.display()));
+  }
+  let parsed = transcript::load(&path)?;
+  let client = LlamaClient::new(&cfg.api_base);
+  let messages = parsed.request_messages();
+  let plan = slopfile::tokens::build_request_messages(&parsed, messages, cfg, client.rest())
+    .await
+    .map_err(|e| format!("tokens: {e}"))?;
+  let budget = slopfile::tokens::context_budget(&parsed, cfg);
+  let headroom = budget.saturating_sub(plan.token_count as u32);
+  println!("tokens: {}", path.display());
+  println!(
+    "  messages:     {} sent ({} oldest dropped to fit budget)",
+    plan.messages.len(),
+    plan.dropped
+  );
+  println!(
+    "  model tokens: {}  (via llama-server /tokenize, content only)",
+    plan.token_count
+  );
+  let allowance = slopfile::tokens::output_allowance(budget);
+  println!(
+    "  context budget: {budget}  output allowance: {allowance}  prompt budget: {}",
+    budget.saturating_sub(allowance)
+  );
+  println!("  input headroom: {headroom}");
+  info!("command `tokens` reported for task `{}`", path.display());
+  Ok(())
+}

@@ -1,18 +1,11 @@
-use crate::flow::{
-  inject_subagent_report, is_subagent_path, questions_resolvable, promote_draft,
-  render_questions_block, resolve_questions, session_template, write_status,
-  write_tool_blocks, SUBAGENT_SUFFIX,
-};
-use crate::lex::{ABORTED_MARKER, CONTEXT_FULL_NOTE, DONE_MARKER, REPORTED_MARKER};
+use crate::control::{self, Phase};
+use crate::flow;
+use crate::session::{self, Session, ToolOutcome};
 use crate::stream::StreamWriter;
-use crate::tokens::build_request_messages;
-use crate::transcript::{
-  abort_marker_present, draft_tail, file_has_abort, find_done_marker, parse_file, read_file,
-  reassemble, send_marker_present, strip_abort_marker, strip_live_line, tail_user_text, write_file,
-  without_abort_lines, without_send_lines, ParsedFile,
-};
+use crate::tokens;
+use crate::transcript;
 use crate::api::LlamaClient;
-use crate::types::{AppConfig, Confirmations, Phase, Role};
+use crate::types::{AppConfig, Confirmations};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::sync::Mutex as AsyncMutex;
@@ -23,8 +16,14 @@ fn gen_lock() -> &'static AsyncMutex<()> {
   LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
+fn delivery_lock() -> &'static AsyncMutex<()> {
+  static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+  LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
 pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
-  let is_sub = is_subagent_path(path);
+  let name = control::session_name(path);
+  let is_sub = flow::is_subagent_path(path);
   let eff_cfg = if is_sub {
     let mut c = cfg.clone();
     c.confirmations = Confirmations::Yolo;
@@ -33,7 +32,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
     cfg.clone()
   };
   let mut turns = 0;
-  let mut sent = false;
+  let token_at_entry = control::update(&name, |s| s.arm_token());
   loop {
     turns += 1;
     if turns > 20 {
@@ -41,68 +40,99 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       if is_sub {
         deliver_subagent_result(path, SubagentReport::TurnCap).await?;
       }
+      control::update(&name, |s| {
+        s.running = false;
+        s.settle(token_at_entry);
+      });
       return Ok(());
     }
 
-    let mut text = read_file(path)?;
-
-    if !sent && send_marker_present(&text) {
-      let (body, live) = strip_live_line(&text);
-      let out = reassemble(&without_send_lines(&body), "", live.as_deref());
-      write_file(path, out.clone())?;
-      text = out;
-      sent = true;
+    let mut session = transcript::load(path)?;
+    if session.system.trim().is_empty()
+      && session.turns.is_empty()
+      && !session.has_input()
+      && transcript::read_file(path)?.trim().is_empty()
+    {
+      transcript::save(path, &flow::session_template(cfg, &[]))?;
+      info!("{path:?}: initialized empty session");
+      return Ok(());
+    }
+    // While a question is pending the input region belongs to the answer UI, not to a new turn.
+    if session.has_input()
+      && !session.turn_in_progress()
+      && session.pending_question().is_none()
+    {
+      session.promote_input();
+      transcript::save(path, &session)?;
     }
 
-    if text.trim().is_empty() {
-      if read_file(path)?.trim().is_empty() {
-        write_file(path, session_template(cfg))?;
-        info!("→ {path:?}: initialized empty session");
+    let pending_subagents = unfinished_subagents(path, &session)?;
+    if !pending_subagents.is_empty() {
+      info!(
+        "{path:?}: waiting on {} subagent(s)",
+        pending_subagents.len()
+      );
+      control::update(&name, |s| s.phase = Phase::WaitingSubagents);
+      return Ok(());
+    }
+
+    let armed = control::update(&name, |s| {
+      s.running = false;
+      s.phase = Phase::Idle;
+      if s.model.is_empty() {
+        s.model = session
+          .model()
+          .map(str::to_string)
+          .unwrap_or_else(|| cfg.model.clone());
       }
-      return Ok(());
-    }
+      s.pending_questions = session.pending_question().map_or(0, |q| q.questions.len());
+      s.armed
+    }) || eff_cfg.confirmations == Confirmations::Yolo;
 
-    if abort_marker_present(&text) {
-      strip_abort_marker(path, &text)?;
-      if is_sub {
-        deliver_subagent_result(path, SubagentReport::Aborted).await?;
-      }
-      return Ok(());
-    }
-
-    let pf = parse_file(&text);
-    if !unfinished_subagents(path)?.is_empty() {
-      let _g = gen_lock().lock().await;
-      write_status(path, &pf, Phase::WaitingSubagents)?;
-      return Ok(());
-    }
-    match next_action(&pf, &text, &eff_cfg, sent) {
+    match next_action(&session, &eff_cfg, armed) {
       Action::Idle => {
+        control::update(&name, |s| {
+          s.phase = Phase::Idle;
+          s.clear_abort();
+          s.settle(token_at_entry);
+        });
         if is_sub {
           deliver_subagent_result(path, SubagentReport::FromTranscript).await?;
         }
         return Ok(());
       }
       Action::ResolveQuestions => {
-        resolve_questions(path, &text, &pf, &eff_cfg)?;
-        continue;
-      }
-      Action::PromoteDraft => {
-        promote_draft(path, &text)?;
-        continue;
+        if flow::resolve_questions(&mut session, &eff_cfg)? {
+          transcript::save(path, &session)?;
+          continue;
+        }
+        control::update(&name, |s| s.phase = Phase::WaitingAnswer);
+        return Ok(());
       }
       Action::WaitForAnswer => {
-        let _g = gen_lock().lock().await;
-        write_status(path, &pf, Phase::WaitingAnswer)?;
+        control::update(&name, |s| s.phase = Phase::WaitingAnswer);
         return Ok(());
       }
       Action::Generate => {}
     }
 
-    let outcome = run_generation_turn(path, &text, &pf, &eff_cfg, client).await?;
-    match outcome {
-      TurnOutcome::Done => return Ok(()),
-      TurnOutcome::AwaitsNextTurn => continue,
+    match run_generation_turn(path, session, &eff_cfg, client, &name).await? {
+      TurnOutcome::Done => {
+        control::update(&name, |s| s.settle(token_at_entry));
+        return Ok(());
+      }
+      TurnOutcome::AwaitsNextTurn => {
+        // F7: an abort that lands while the tools are running still ends the burst.
+        if control::snapshot(&name).abort {
+          control::update(&name, |s| {
+            s.phase = Phase::Idle;
+            s.clear_abort();
+            s.settle(token_at_entry);
+          });
+          return Ok(());
+        }
+        continue;
+      }
     }
   }
 }
@@ -110,16 +140,14 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
   ResolveQuestions,
-  PromoteDraft,
   Generate,
   WaitForAnswer,
   Idle,
 }
 
-pub(crate) fn next_action(pf: &ParsedFile, text: &str, cfg: &AppConfig, sent: bool) -> Action {
-  let armed = sent || cfg.confirmations == Confirmations::Yolo;
-  if !pf.pending_questions.is_empty() {
-    return match (armed, questions_resolvable(pf, cfg)) {
+pub(crate) fn next_action(session: &Session, cfg: &AppConfig, armed: bool) -> Action {
+  if session.pending_question().is_some() {
+    return match (armed, flow::questions_resolvable(session, cfg)) {
       (true, true) => Action::ResolveQuestions,
       (true, false) => Action::WaitForAnswer,
       (false, _) => Action::Idle,
@@ -128,18 +156,7 @@ pub(crate) fn next_action(pf: &ParsedFile, text: &str, cfg: &AppConfig, sent: bo
   if !armed {
     return Action::Idle;
   }
-  if pf.dangling.is_some() {
-    return Action::Generate;
-  }
-  if draft_tail(text).is_some_and(|d| !d.trim().is_empty()) {
-    return Action::PromoteDraft;
-  }
-  if tail_user_text(text).is_some_and(|s| !s.trim().is_empty()) {
-    return Action::Generate;
-  }
-  if find_done_marker(text).is_none()
-    && pf.history.last().is_some_and(|m| matches!(m.role, Role::User | Role::Tool))
-  {
+  if session.needs_generation() {
     return Action::Generate;
   }
   Action::Idle
@@ -152,97 +169,214 @@ enum TurnOutcome {
 
 async fn run_generation_turn(
   path: &Path,
-  text: &str,
-  pf: &ParsedFile,
+  session: Session,
   cfg: &AppConfig,
   client: &LlamaClient,
+  name: &str,
 ) -> Result<TurnOutcome, String> {
-  let _gen = gen_lock().lock().await;
-  let (body, live) = strip_live_line(text);
-  let base_text = match &pf.dangling {
-    Some(d) => body[..d.resume_offset.min(body.len())].to_string(),
-    None => body.clone(),
-  };
+  let mut work = session.clone();
+  if work.turn_in_progress() {
+    let (reasoning, text) = work.rewind_open_round();
+    if let Some(r) = reasoning.as_deref() {
+      work.push_reasoning(r);
+    }
+    if let Some(t) = text.as_deref() {
+      work.push_text(t);
+    }
+  } else {
+    work.begin_round();
+  }
+  let resuming = session.turn_in_progress();
+  if resuming {
+    transcript::save(path, &work)?;
+    info!("{path:?}: resuming a turn left open by an earlier run");
+  }
 
-  let messages = build_request_messages(text, pf, cfg, client.rest()).await?.messages;
+  let model = work
+    .model()
+    .map(str::to_string)
+    .unwrap_or_else(|| cfg.model.clone());
 
-  let max_tokens = crate::tokens::context_budget(pf, cfg) / 4;
-  let tools_enabled = pf.config.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(true);
-  let excluded = pf.config.tools_excluded.clone();
-  let tool_defs = tools_enabled.then(|| {
-    crate::tools::definitions()
-      .into_iter()
-      .filter(|d| !excluded.iter().any(|x| x == &d.function.name))
-      .collect::<Vec<_>>()
-  });
+  // Build the request first, then measure it: the context paragraph is part of what gets sent, so
+  // counting before adding it would under-count by a thousand characters.
+  let mut messages = work.request_messages();
+  crate::context::attach_context_file(&mut messages, path);
+  let plan = tokens::build_request_messages(&work, messages, cfg, client.rest()).await?;
+  let mut messages = plan.messages;
+  crate::context::attach_context_file(&mut messages, path);
 
-  let model = pf.config.model.as_deref().unwrap_or(&cfg.model);
-  client.ensure_model_loaded(model).await;
+  let max_tokens = tokens::output_allowance(tokens::context_budget(&work, cfg));
+  let tool_defs = crate::tools::advertised(&work.config);
 
-  let mut active = StreamWriter::new(path, &base_text, live);
+  client.ensure_model_loaded(&model).await;
 
-  info!("→ {path:?}: generating (model={model}, messages={})", messages.len());
-  let result = client
-    .chat_stream(
-      model,
-      &messages,
-      tool_defs.as_deref(),
-      max_tokens,
-      |ev| active.handle(&ev),
-      || !file_has_abort(path),
-    )
-    .await
-    .map_err(|e| format!("chat_stream: {e}"))?;
+  let mut active = StreamWriter::new(path, work);
+  info!(
+    "→ {path:?}: generating (model={model}, messages={}, tokens={}, dropped={})",
+    messages.len(),
+    plan.token_count,
+    plan.dropped
+  );
+  // The lock serializes the model, not the tools: holding it across a 30s bash would stall every
+  // other session behind it.
+  let result = {
+    let _gen = gen_lock().lock().await;
+    control::update(name, |s| {
+      s.running = true;
+      s.phase = Phase::Generating;
+      s.model = model.clone();
+      s.clear_abort();
+    });
+    client
+      .chat_stream(
+        &model,
+        &messages,
+        (!tool_defs.is_empty()).then_some(tool_defs.as_slice()),
+        max_tokens,
+        |ev| active.handle(&ev),
+        || !control::update(name, |s| s.take_abort()),
+      )
+      .await
+  }
+  .map_err(|e| {
+    control::update(name, |s| {
+      s.running = false;
+      s.phase = Phase::Idle;
+    });
+    format!("chat_stream: {e}")
+  })?;
 
   active.finish_section();
+  let mut streamed = active.into_session();
+  control::update(name, |s| {
+    s.running = false;
+    s.phase = Phase::RunningTools;
+  });
 
   if result.aborted {
-    let already_marked = read_file(path)?.trim_end().ends_with(ABORTED_MARKER);
-    let extra = if already_marked {
-      String::new()
-    } else {
-      format!("{ABORTED_MARKER}\n")
-    };
-    finalize_turn(path, extra)?;
-    write_status(path, pf, Phase::Idle)?;
+    streamed.close_turn();
+    transcript::save(path, &streamed)?;
+    control::update(name, |s| s.phase = Phase::Idle);
     maybe_restart_llama(cfg, path).await;
     return Ok(TurnOutcome::Done);
   }
 
   if result.finish_reason.as_deref() == Some("length") {
-    finalize_turn(path, format!("{DONE_MARKER}\n{CONTEXT_FULL_NOTE}\n"))?;
-    write_status(path, pf, Phase::Idle)?;
+    flow::add_context_full_note(&mut streamed);
+    streamed.close_turn();
+    transcript::save(path, &streamed)?;
+    control::update(name, |s| {
+      s.phase = Phase::Idle;
+      s.context_full = true;
+    });
     warn!("⚠ {path:?}: context exhausted mid-turn (finish_reason=length)");
     return Ok(TurnOutcome::Done);
   }
 
-  if result.finish_reason.as_deref().is_none() {
-    info!("⚠ {path:?}: turn interrupted mid-stream (no finish_reason); left dangling for resume");
+  if result.finish_reason.is_none() {
+    transcript::save(path, &streamed)?;
+    control::update(name, |s| {
+      s.running = false;
+      s.phase = Phase::Idle;
+    });
+    warn!("⚠ {path:?}: turn interrupted mid-stream (no finish_reason); left open for resume");
     return Ok(TurnOutcome::Done);
   }
 
   if !result.tool_calls.is_empty() {
-    let is_question = result.tool_calls.iter().any(|t| t.name == "question");
-    if is_question {
-      render_questions_block(path, &result.tool_calls)?;
+    let calls: Vec<session::Call> = result
+      .tool_calls
+      .iter()
+      .map(|c| session::Call {
+        id: c.id.clone(),
+        name: c.name.clone(),
+        arguments: c.arguments.clone(),
+      })
+      .collect();
+    if let Some(at) = result.tool_calls.iter().position(|c| c.name == "question") {
+      let question = &result.tool_calls[at];
+      // Calls that shared the message with the question still have to happen, or the model is
+      // later shown an answer with no record that it ever asked for them.
+      // Calls that shared the message with the question still run; the question itself is recorded
+      // as a result that says it is waiting, and any call left over gets an honest placeholder.
+      let before = &result.tool_calls[..at];
+      let (mut outcomes, solved) = run_calls(&streamed, before, cfg, path).await?;
+      if solved {
+        control::update(name, |s| {
+          s.solved = true;
+          s.phase = Phase::Idle;
+        });
+        info!("✓ {path:?}: campaign marked solved");
+      }
+      streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
+      flow::render_question(&mut streamed, question)?;
+      transcript::save(path, &streamed)?;
       return Ok(TurnOutcome::AwaitsNextTurn);
     }
-    write_tool_blocks(path, &result.tool_calls, cfg, pf).await?;
-    info!("→ {path:?}: {} tool call(s) executed", result.tool_calls.len());
+    let (mut outcomes, solved) = run_calls(&streamed, &result.tool_calls, cfg, path).await?;
+    streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
+    transcript::save(path, &streamed)?;
+    if solved {
+      control::update(name, |s| {
+        s.solved = true;
+        s.phase = Phase::Idle;
+      });
+      streamed.close_turn();
+      transcript::save(path, &streamed)?;
+      info!("✓ {path:?}: campaign marked solved");
+      return Ok(TurnOutcome::Done);
+    }
+    info!("→ {path:?}: {} tool call(s) executed", outcomes.len());
     return Ok(TurnOutcome::AwaitsNextTurn);
   }
 
-  finalize_turn(path, format!("{DONE_MARKER}\n"))?;
-  write_status(path, pf, Phase::Idle)?;
+  streamed.close_turn();
+  transcript::save(path, &streamed)?;
+  control::update(name, |s| s.phase = Phase::Idle);
   info!("✓ {path:?}: turn complete");
   Ok(TurnOutcome::Done)
 }
 
-pub(crate) fn finalize_turn(path: &Path, extra: String) -> Result<(), String> {
-  let text_now = read_file(path)?;
-  let (body, live) = strip_live_line(&text_now);
-  let out = reassemble(&without_abort_lines(&body), &extra, live.as_deref());
-  write_file(path, out)
+pub(crate) async fn run_calls(
+  session: &Session,
+  calls: &[crate::types::ToolCall],
+  cfg: &AppConfig,
+  path: &Path,
+) -> Result<(Vec<session::ToolOutcome>, bool), String> {
+  if calls.is_empty() {
+    return Ok((Vec::new(), false));
+  }
+  match flow::execute_tool_calls(calls, session, cfg, path).await? {
+    flow::ToolPass::Outcomes { outcomes, solved } => Ok((outcomes, solved)),
+    flow::ToolPass::Question => Ok((Vec::new(), false)),
+  }
+}
+
+pub(crate) fn settle_tool_round(
+  mut streamed: Session,
+  calls: Vec<crate::session::Call>,
+  outcomes: &mut Vec<ToolOutcome>,
+  path: &Path,
+) -> Session {
+  match flow::adopt_model_edit(&streamed, path) {
+    Ok(Some(mut edited)) => {
+      if edited.turns.last().and_then(|t| t.rounds.last()).is_none() {
+        edited.begin_round();
+      }
+      edited.finish_round(calls, outcomes.clone());
+      edited
+    }
+    Ok(None) => {
+      streamed.finish_round(calls, outcomes.clone());
+      streamed
+    }
+    Err(why) => {
+      warn!("⚠ {}: context edit rolled back: {why}", path.display());
+      flow::note_rollback(outcomes, &why);
+      streamed.finish_round(calls, outcomes.clone());
+      streamed
+    }
+  }
 }
 
 async fn maybe_restart_llama(cfg: &AppConfig, path: &Path) {
@@ -262,16 +396,20 @@ async fn maybe_restart_llama(cfg: &AppConfig, path: &Path) {
   }
 }
 
-fn final_assistant_text(pf: &ParsedFile) -> Option<String> {
-  pf.history.iter().rev().find_map(|m| {
-    if matches!(m.role, Role::Assistant)
-      && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
-    {
-      m.content.clone()
-    } else {
-      None
-    }
-  })
+fn final_assistant_text(session: &Session) -> Option<String> {
+  session
+    .turns
+    .iter()
+    .rev()
+    .flat_map(|t| t.rounds.iter().rev())
+    .find_map(|r| {
+      r.assistant
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+    })
 }
 
 fn subagent_parent_path(child: &Path) -> Result<PathBuf, String> {
@@ -281,18 +419,18 @@ fn subagent_parent_path(child: &Path) -> Result<PathBuf, String> {
     .ok_or("subagent transcript has no file stem")?
     .to_string_lossy()
     .into_owned();
-  let ix = stem.rfind(SUBAGENT_SUFFIX).ok_or("not a subagent transcript")?;
+  let ix = stem.rfind(flow::SUBAGENT_SUFFIX).ok_or("not a subagent transcript")?;
   Ok(dir.join(format!("{}.md", &stem[..ix])))
 }
 
-pub(crate) fn unfinished_subagents(parent: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn child_paths(parent: &Path) -> Result<Vec<PathBuf>, String> {
   let dir = parent.parent().ok_or("parent transcript has no directory")?;
   let stem = parent
     .file_stem()
     .ok_or("parent transcript has no file stem")?
     .to_string_lossy()
     .into_owned();
-  let prefix = format!("{stem}{SUBAGENT_SUFFIX}");
+  let prefix = format!("{stem}{}", flow::SUBAGENT_SUFFIX);
   let mut out = Vec::new();
   for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
     let p = match entry {
@@ -312,21 +450,35 @@ pub(crate) fn unfinished_subagents(parent: &Path) -> Result<Vec<PathBuf>, String
     if suffix.len() != 2 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
       continue;
     }
-    let Ok(text) = read_file(&p) else {
-      out.push(p);
-      continue;
-    };
-    if !text.contains(REPORTED_MARKER) {
-      out.push(p);
-    }
+    out.push(p);
   }
   out.sort();
   Ok(out)
 }
 
+pub(crate) fn unfinished_subagents(parent: &Path, parent_session: &Session) -> Result<Vec<PathBuf>, String> {
+  Ok(
+    child_paths(parent)?
+      .into_iter()
+      .filter(|child| {
+        let stem = child.file_stem().unwrap_or_default().to_string_lossy();
+        let short = stem
+          .rsplit(flow::SUBAGENT_SUFFIX)
+          .next()
+          .unwrap_or_default()
+          .to_string();
+        // Either proof counts: the report is in the parent, or we already delivered it. Trusting
+        // only the file would wedge the parent forever if the model prunes the report turn, which
+        // the context prompt explicitly invites it to do.
+        !(flow::has_report(parent_session, &short)
+          || control::snapshot(&control::session_name(child)).delivered)
+      })
+      .collect(),
+  )
+}
+
 pub(crate) enum SubagentReport {
   FromTranscript,
-  Aborted,
   TurnCap,
 }
 
@@ -334,28 +486,36 @@ pub(crate) async fn deliver_subagent_result(
   path: &Path,
   outcome: SubagentReport,
 ) -> Result<(), String> {
-  let _gen = gen_lock().lock().await;
-  let text = read_file(path)?;
-  if text.contains(REPORTED_MARKER) {
+  let name = control::session_name(path);
+  if control::snapshot(&name).delivered {
     return Ok(());
   }
-  let name = path
+  // The parent is read-modify-written, so two children finishing at the same moment would lose one
+  // of the reports. Delivery is rare, so one lock for all of it is enough.
+  let _delivery = delivery_lock().lock().await;
+  if control::snapshot(&name).delivered {
+    return Ok(());
+  }
+  let parent_path = subagent_parent_path(path)?;
+  let mut parent = transcript::load(&parent_path)?;
+  let session = transcript::load(path).unwrap_or_default();
+  let short = path
     .file_stem()
     .map(|s| s.to_string_lossy().into_owned())
     .unwrap_or_else(|| "subagent".to_string());
+  let short = short
+    .rsplit(flow::SUBAGENT_SUFFIX)
+    .next()
+    .unwrap_or_default()
+    .to_string();
   let (report, ok) = match outcome {
-    SubagentReport::FromTranscript => {
-      let pf = parse_file(&text);
-      (
-        final_assistant_text(&pf)
-          .unwrap_or_else(|| "(subagent produced no text output)".to_string()),
-        true,
-      )
-    }
-    SubagentReport::Aborted => ("subagent was aborted before completing".to_string(), false),
+    SubagentReport::FromTranscript => (
+      final_assistant_text(&session)
+        .unwrap_or_else(|| "(subagent produced no text output)".to_string()),
+      true,
+    ),
     SubagentReport::TurnCap => {
-      let pf = parse_file(&text);
-      let body = final_assistant_text(&pf)
+      let body = final_assistant_text(&session)
         .unwrap_or_else(|| "(subagent produced no text output)".to_string());
       (
         format!(
@@ -365,12 +525,27 @@ pub(crate) async fn deliver_subagent_result(
       )
     }
   };
-  inject_subagent_report(&subagent_parent_path(path)?, &name, &report, ok)?;
-  let (body, live) = strip_live_line(&text);
-  write_file(
-    path,
-    reassemble(&body, &format!("{REPORTED_MARKER}\n"), live.as_deref()),
-  )?;
+  let injected = flow::inject_subagent_report(&mut parent, &short, &report, ok);
+  transcript::save(&parent_path, &parent)?;
+  // The parent may be mid-generation in another task, and that task's next save would drop this
+  // turn. Read back before latching `delivered`, so a lost report is retried instead of forgotten.
+  let survived = transcript::load(&parent_path)
+    .map(|after| flow::has_report(&after, &short))
+    .unwrap_or(false);
+  control::update(&name, |s| s.delivered = survived);
+  if injected && !survived {
+    return Err(format!(
+      "the report for {short} was written to {} but did not stick; it will be retried",
+      parent_path.display()
+    ));
+  }
+  if !injected {
+    warn!(
+      "→ {:?}: report for {short} was already in the parent, not injecting again",
+      path
+    );
+    return Ok(());
+  }
   info!("→ {:?}: report delivered to parent", path);
   Ok(())
 }

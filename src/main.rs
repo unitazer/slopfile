@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use slopfile::{api::LlamaClient, cmd_abort, cmd_init, cmd_tokens, daemon, load_app_config, scan_transcripts};
+use slopfile::control::{Cmd, Req};
+use slopfile::{api::LlamaClient, control, daemon, load_app_config, scan_transcripts};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -24,14 +25,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+  /// Write a new session file (local, no daemon needed)
   Init {
     path: String,
   },
-  Abort {
-    path: String,
+  /// Arm and generate; same commands as the host `sf` CLI, for use inside the container
+  Send {
+    session: String,
   },
-  Tokens {
-    path: String,
+  Abort {
+    session: String,
+  },
+  Stop {
+    session: String,
+  },
+  Status {
+    session: String,
   },
 }
 
@@ -61,35 +70,6 @@ fn file_fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
   Some((meta.modified().ok()?, meta.len()))
 }
 
-fn park_transcript(path: &Path) -> Option<SystemTime> {
-  let text = std::fs::read_to_string(path).ok()?;
-  let (body, live) = slopfile::transcript::strip_live_line(&text);
-  let out = slopfile::transcript::reassemble(
-    &body,
-    &format!("{}\n", slopfile::lex::PARKED_MARKER),
-    live.as_deref(),
-  );
-  std::fs::write(path, out).ok()?;
-  let parked_at = file_fingerprint(path).map(|(t, _)| t);
-  warn!(
-    "session {}: parked after {PARK_AFTER_FAILURES} consecutive failures; edit the file to retry",
-    path.display()
-  );
-  parked_at
-}
-
-fn unpark_transcript(path: &Path) {
-  let Ok(text) = std::fs::read_to_string(path) else {
-    return;
-  };
-  let cleaned = slopfile::transcript::without_parked_lines(&text);
-  if cleaned != text
-    && let Err(e) = std::fs::write(path, cleaned)
-  {
-    warn!("session {}: could not clear parked marker: {e}", path.display());
-  }
-}
-
 #[tokio::main]
 async fn main() {
   tracing_subscriber::fmt()
@@ -100,16 +80,14 @@ async fn main() {
     .init();
 
   let app_cfg = load_app_config();
+  let addr = control::addr_from_env();
   let cli = Cli::parse();
-  match cli.command {
-    Some(Command::Init { path }) => return cmd_init(&path, &app_cfg),
-    Some(Command::Abort { path }) => return cmd_abort(&path),
-    Some(Command::Tokens { path }) => return cmd_tokens(&path, &app_cfg).await,
-    None => {}
+  if let Some(command) = cli.command {
+    return dispatch(command, &app_cfg, &addr).await;
   }
 
   info!(
-    "slopfile: workdir={} transcripts={} model={} api={} sweep={}ms confirmations={:?}",
+    "slopfile: workdir={} transcripts={} model={} api={} sweep={}ms confirmations={:?} control={addr}",
     app_cfg.workdir,
     app_cfg.transcripts_dir,
     app_cfg.model,
@@ -121,6 +99,16 @@ async fn main() {
 
   let _daemon_lock = acquire_daemon_lock(&app_cfg.transcripts_dir);
 
+  {
+    let cfg = app_cfg.clone();
+    let bind = addr.clone();
+    tokio::spawn(async move {
+      if let Err(e) = control::serve(&bind, cfg).await {
+        error!("control channel is down: {e}");
+      }
+    });
+  }
+
   let idle_secs = if app_cfg.stream_idle_timeout_secs == 0 {
     u64::MAX
   } else {
@@ -131,37 +119,41 @@ async fn main() {
   let busy: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
   let throttled: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
   let failures: Arc<Mutex<HashMap<PathBuf, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-  let parked: Arc<Mutex<HashMap<PathBuf, SystemTime>>> = Arc::new(Mutex::new(HashMap::new()));
-  let reported: Arc<Mutex<HashMap<PathBuf, ((SystemTime, u64), bool)>>> =
+  let parked: Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>> =
     Arc::new(Mutex::new(HashMap::new()));
 
   loop {
-    let files = scan_transcripts(&app_cfg.transcripts_dir).unwrap_or_default();
+    // A sweep that cannot list the directory drives nothing, and must say so rather than looking
+    // identical to "no sessions exist".
+    let files = match scan_transcripts(&app_cfg.transcripts_dir) {
+      Ok(files) => files,
+      Err(e) => {
+        error!("cannot scan {}: {e}; no session will be driven this sweep", app_cfg.transcripts_dir);
+        continue;
+      }
+    };
+    // Entries for files that no longer exist are never revisited, so they would accumulate forever.
+    {
+      let live: std::collections::HashSet<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
+      let mut throttled = throttled.lock().await;
+      throttled.retain(|p, _| live.contains(p.as_path()));
+      drop(throttled);
+      parked.lock().await.retain(|p, _| live.contains(p.as_path()));
+      failures.lock().await.retain(|p, _| live.contains(p.as_path()));
+    }
     for path in files {
-      if slopfile::flow::is_subagent_path(&path) {
-        let fp = file_fingerprint(&path);
-        let mut cache = reported.lock().await;
-        if fp.is_some_and(|k| cache.get(&path).is_some_and(|(known, done)| *done && *known == k)) {
-          continue;
-        }
-        let done = std::fs::read_to_string(&path)
-          .map(|t| t.contains(slopfile::lex::REPORTED_MARKER))
-          .unwrap_or(false);
-        if let Some(k) = fp {
-          cache.insert(path.clone(), (k, done));
-        }
-        if done {
-          continue;
-        }
+      let name = control::session_name(&path);
+      if control::snapshot(&name).delivered {
+        continue;
       }
       let parked_at = parked.lock().await.get(&path).copied();
       if let Some(at) = parked_at {
-        if file_fingerprint(&path).map(|(t, _)| t) == Some(at) {
+        if at.is_some() && file_fingerprint(&path).map(|(t, _)| t) == at {
           continue;
         }
         parked.lock().await.remove(&path);
         failures.lock().await.remove(&path);
-        unpark_transcript(&path);
+        control::update(&name, |s| s.parked = false);
         info!("session {}: unparked (file changed)", path.display());
       }
       let mut guard = busy.lock().await;
@@ -198,9 +190,13 @@ async fn main() {
             };
             if count >= PARK_AFTER_FAILURES {
               failures.lock().await.remove(&path);
-              if let Some(at) = park_transcript(&path) {
-                parked.lock().await.insert(path.clone(), at);
-              }
+              let parked_at = file_fingerprint(&path).map(|(t, _)| t);
+              parked.lock().await.insert(path.clone(), parked_at);
+              control::update(&name, |s| s.parked = true);
+              warn!(
+                "session {}: parked after {PARK_AFTER_FAILURES} consecutive failures; edit the file to retry",
+                path.display()
+              );
             }
           }
         }
@@ -208,5 +204,45 @@ async fn main() {
       });
     }
     sleep(Duration::from_millis(app_cfg.sweep_interval_ms)).await;
+  }
+}
+
+async fn dispatch(command: Command, cfg: &slopfile::types::AppConfig, addr: &str) {
+  let (cmd, session, answers) = match command {
+    Command::Init { path } => {
+      match slopfile::cmd_init(&path, cfg) {
+        Ok(()) => return,
+        Err(e) => {
+          eprintln!("{e}");
+          std::process::exit(1);
+        }
+      }
+    }
+    Command::Send { session } => (Cmd::Send, session, vec![]),
+    Command::Abort { session } => (Cmd::Abort, session, vec![]),
+    Command::Stop { session } => (Cmd::Stop, session, vec![]),
+    Command::Status { session } => (Cmd::Status, session, vec![]),
+  };
+  let req = Req {
+    cmd,
+    session,
+    answers,
+  };
+  match control::send_command(addr, &req).await {
+    Ok(resp) if resp.ok => {
+      if cmd == Cmd::Status
+        && let Some(status) = resp.status
+      {
+        println!("{status}");
+      }
+    }
+    Ok(resp) => {
+      eprintln!("{}", resp.error.unwrap_or_else(|| "command failed".into()));
+      std::process::exit(1);
+    }
+    Err(e) => {
+      eprintln!("{e}");
+      std::process::exit(1);
+    }
   }
 }

@@ -1,131 +1,115 @@
-use crate::transcript::{reassemble, strip_live_line, without_abort_lines};
+use crate::session::{Session, REASONING, TEXT};
+use crate::transcript;
 use crate::types::StreamEvent;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
-pub struct StreamWriter<'a> {
-  path: &'a Path,
-  out: String,
-  live: Option<String>,
-  wrote_header: bool,
-  in_reasoning: bool,
+pub struct StreamWriter {
+  path: PathBuf,
+  session: Session,
   last_flush: Instant,
 }
 
-impl<'a> StreamWriter<'a> {
-  pub fn new(path: &'a Path, body: &str, live: Option<String>) -> Self {
+impl StreamWriter {
+  pub fn new(path: &Path, session: Session) -> Self {
     Self {
-      path,
-      out: body.to_string(),
-      live,
-      wrote_header: false,
-      in_reasoning: false,
+      path: path.to_path_buf(),
+      session,
       last_flush: Instant::now(),
     }
   }
 
-  fn ensure_header(&mut self) {
-    let tail = self.out.trim_end();
-    if tail == "### Assistant" || tail.ends_with("\n### Assistant") {
-      self.wrote_header = true;
-      if !self.out.ends_with('\n') {
-        self.out.push('\n');
-      }
-      return;
-    }
-    if !self.wrote_header {
-      if !self.out.is_empty() && !self.out.ends_with('\n') {
-        self.out.push('\n');
-      }
-      self.out.push_str("### Assistant\n");
-      self.wrote_header = true;
-      self.flush();
-    }
-  }
-
-  pub fn handle(&mut self, ev: &StreamEvent) -> bool {
+  pub fn handle(&mut self, ev: &StreamEvent) {
     match ev {
-      StreamEvent::Text(t) => {
-        self.ensure_header();
-        self.write_tag_aware(t);
-      }
-      StreamEvent::Reasoning(r) => {
-        self.ensure_header();
-        self.emit(r, true);
-      }
+      StreamEvent::Text(t) => self.write_tag_aware(t, false),
+      StreamEvent::Reasoning(r) => self.emit(r, REASONING),
       StreamEvent::ToolCallFragment(_) | StreamEvent::Done(_) => {}
     }
-    true
   }
 
-  fn emit(&mut self, s: &str, reasoning: bool) {
-    if reasoning {
-      if !self.in_reasoning {
-        self.in_reasoning = true;
-        self.out.push_str("<!-- thinking -->\n");
-      }
-    } else if self.in_reasoning {
-      self.in_reasoning = false;
-      self.out.push_str("<!-- /thinking -->\n");
-    }
+  fn emit(&mut self, s: &str, which: &'static str) {
     if !s.is_empty() {
-      self.out.push_str(s);
+      if which == REASONING {
+        self.session.push_reasoning(s);
+      } else {
+        self.session.push_text(s);
+      }
     }
-    self.flush();
+    self.flush(false);
   }
 
-  fn write_tag_aware(&mut self, mut s: &str) {
-    let mut reasoning = false;
+  fn write_tag_aware(&mut self, s: &str, mut reasoning: bool) {
+    let mut rest = s;
     loop {
-      let open = s.find("<think>");
-      let close = s.find("</think>");
+      let open = rest.find("<think>");
+      let close = rest.find("</think>");
       let (pos, is_open) = match (open, close) {
         (None, None) => {
-          if !s.is_empty() {
-            self.emit(s, reasoning);
-          }
+          self.emit(rest, if reasoning { REASONING } else { TEXT });
           return;
         }
         (Some(o), Some(c)) => {
-          if o <= c { (o, true) } else { (c, false) }
+          if o <= c {
+            (o, true)
+          } else {
+            (c, false)
+          }
         }
         (Some(o), None) => (o, true),
         (None, Some(c)) => (c, false),
       };
-      let (before, rest) = s.split_at(pos);
+      let (before, tail) = rest.split_at(pos);
       if !before.is_empty() {
-        self.emit(before, reasoning);
+        self.emit(before, if reasoning { REASONING } else { TEXT });
       }
       reasoning = is_open;
-      if let Some(open_rest) = rest.strip_prefix("<think>") {
-        s = open_rest;
-      } else {
-        s = rest.strip_prefix("</think>").expect("matched earlier");
+      rest = tail
+        .strip_prefix("<think>")
+        .or_else(|| tail.strip_prefix("</think>"))
+        .unwrap_or_default();
+      if rest.is_empty() {
+        self.emit("", if reasoning { REASONING } else { TEXT });
+        return;
       }
     }
   }
 
-  fn flush(&mut self) {
-    if self.last_flush.elapsed() < FLUSH_INTERVAL {
+  fn flush(&mut self, force: bool) {
+    if !force && self.last_flush.elapsed() < FLUSH_INTERVAL {
       return;
     }
     self.last_flush = Instant::now();
-    let out = reassemble(&self.out, "", self.live.as_deref());
-    if let Err(e) = std::fs::write(self.path, out) {
+    self.absorb_user_input();
+    if let Err(e) = transcript::write_file(&self.path, self.session.render()) {
       warn!("stream write failed: {e}");
     }
   }
 
-  pub fn finish_section(&self) {
-    let (body, _) = strip_live_line(&self.out);
-    let mut extra = String::new();
-    if self.in_reasoning {
-      extra.push_str("<!-- /thinking -->\n");
+  /// The snapshot this writer holds was taken before the request went out, so anything the human
+  /// saved into the file while the answer streams is missing from it. Carry that forward before
+  /// rendering, or the next flush silently deletes the words they just typed.
+  fn absorb_user_input(&mut self) {
+    let Ok(on_disk) = transcript::load(&self.path) else {
+      return;
+    };
+    if on_disk.input.trim().is_empty() {
+      return;
     }
-    let clean = without_abort_lines(&reassemble(&body, &extra, self.live.as_deref()));
-    let _ = std::fs::write(self.path, clean);
+    if on_disk.input.trim() == self.session.input.trim() {
+      return;
+    }
+    self.session.input = on_disk.input;
+  }
+
+  pub fn finish_section(&mut self) {
+    self.session.close_section();
+    self.flush(true);
+  }
+
+  pub fn into_session(self) -> Session {
+    self.session
   }
 }

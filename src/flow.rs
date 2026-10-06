@@ -1,11 +1,11 @@
-use crate::lex::{lex, TokKind};
-use crate::questions::{self, QuestionsBlock};
+use crate::context;
+use crate::questions::{self, Question};
+use crate::session::{self, NoteBy, PendingQuestion, Session, ToolOutcome, Turn};
 use crate::tools;
-use crate::transcript::{
-  read_file, reassemble, strip_live_line, write_file, ParsedFile, SEND_MARKER,
-};
-use crate::types::{AppConfig, Confirmations, LiveStatus, Phase, ToolCall, ToolResult};
+use crate::transcript;
+use crate::types::{AppConfig, Confirmations, ToolCall, ToolResult};
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 pub const SUBAGENT_SUFFIX: &str = ".sub-";
 
@@ -13,46 +13,33 @@ pub const DEFAULT_TOOLS: &[&str] = &[
   "read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent",
 ];
 
-pub fn session_header(model: &str, tools: &[&str], tools_excluded: &[String]) -> String {
-  let list = tools.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
-  let mut out = format!("```toml\nmodel = \"{model}\"\nthinking = \"auto\"\ntools = [{list}]\n");
-  if !tools_excluded.is_empty() {
-    let excluded = tools_excluded
-      .iter()
-      .map(|t| format!("\"{t}\""))
-      .collect::<Vec<_>>()
-      .join(", ");
-    out.push_str(&format!("tools_excluded = [{excluded}]\n"));
-  }
-  out.push_str("```\n");
-  out
-}
-
-pub fn session_template(cfg: &AppConfig) -> String {
-  session_template_with(cfg, &[])
-}
-
-pub fn session_template_with(cfg: &AppConfig, tools_excluded: &[String]) -> String {
-  let mut out = session_header(&cfg.model, DEFAULT_TOOLS, tools_excluded);
-  out.push_str("# Session\n");
-  out.push_str(&system_prompt_default(cfg, tools_excluded));
-  out.push_str("\n### You\n");
-  out
-}
-
 pub fn subagent_depth(stem: &str) -> u32 {
   stem.matches(SUBAGENT_SUFFIX).count() as u32
 }
 
 pub fn is_subagent_path(path: &Path) -> bool {
-  path.file_stem().is_some_and(|s| subagent_depth(&s.to_string_lossy()) > 0)
+  path
+    .file_stem()
+    .is_some_and(|s| subagent_depth(&s.to_string_lossy()) > 0)
 }
 
-pub fn spawn_subagent(
-  parent: &Path,
-  task: &str,
-  cfg: &AppConfig,
-) -> Result<PathBuf, String> {
+pub fn session_template(cfg: &AppConfig, excluded: &[String]) -> Session {
+  let config = session::SessionConfig {
+    model: Some(cfg.model.clone()),
+    tools: Some(DEFAULT_TOOLS.iter().map(|t| t.to_string()).collect()),
+    tools_excluded: excluded.to_vec(),
+    ..Default::default()
+  };
+  Session::new(config, system_prompt_default(cfg, excluded))
+}
+
+pub fn subagent_task_template(cfg: &AppConfig, excluded: &[String], task: &str) -> Session {
+  let mut session = session_template(cfg, excluded);
+  session.input = format!("{}\n", task.trim_end());
+  session
+}
+
+pub fn spawn_subagent(parent: &Path, task: &str, cfg: &AppConfig) -> Result<PathBuf, String> {
   let dir = parent.parent().ok_or("parent transcript has no directory")?;
   let stem = parent
     .file_stem()
@@ -66,70 +53,64 @@ pub fn spawn_subagent(
       cfg.subagent_max_depth
     ));
   }
-
   let prefix = format!("{stem}{SUBAGENT_SUFFIX}");
   let mut nn = 1u32;
-  loop {
+  let child = loop {
     let candidate = dir.join(format!("{prefix}{nn:02}.md"));
     if !candidate.exists() {
-      break;
+      break candidate;
     }
     nn += 1;
-  }
-  let child = dir.join(format!("{prefix}{nn:02}.md"));
-
+  };
   let child_depth = depth + 1;
   let mut excluded = vec!["question".to_string()];
   if child_depth >= cfg.subagent_max_depth {
     excluded.push("subagent".to_string());
   }
-  let mut template = session_template_with(cfg, &excluded);
-  template.push_str(task.trim_end());
-  template.push('\n');
-  write_file(&child, template)?;
+  let session = subagent_task_template(cfg, &excluded, task);
+  transcript::save(&child, &session)?;
   Ok(child)
 }
 
-fn handle_subagent_call(parent: &Path, call: &ToolCall, cfg: &AppConfig) -> ToolResult {
-  let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
-    Ok(v) => v,
-    Err(e) => return ToolResult::err(format!("subagent: bad arguments json: {e}")),
-  };
-  let name = args.get("name").and_then(serde_json::Value::as_str).unwrap_or("subagent");
-  let Some(task) = args.get("task").and_then(serde_json::Value::as_str) else {
-    return ToolResult::err("subagent: missing string argument \"task\"");
-  };
-  if task.trim().is_empty() {
-    return ToolResult::err("subagent: task must not be empty");
-  }
-  match spawn_subagent(parent, task, cfg) {
-    Ok(child) => ToolResult::ok(format!(
-      "subagent '{name}' spawned at {}. It runs autonomously and cannot see this conversation; \
-       do not read its transcript unless asked. Its complete final response will be appended \
-       here automatically when it finishes; wait for it instead of redoing its work.",
-      child.display()
-    )),
-    Err(e) => ToolResult::err(e),
-  }
+pub fn report_header(name: &str, ok: bool) -> String {
+  format!(
+    "[system] Subagent '{}' {}. Its complete final response follows.",
+    name,
+    if ok { "finished" } else { "failed" }
+  )
+}
+
+pub fn report_body(header: &str, report: &str) -> String {
+  format!("{header}\n---\n{report}\n---")
+}
+
+pub fn has_report(session: &Session, name: &str) -> bool {
+  let needle = format!("[system] Subagent '{name}' ");
+  session
+    .turns
+    .iter()
+    .filter_map(|t| t.user.as_deref())
+    .any(|u| u.starts_with(&needle))
 }
 
 pub fn inject_subagent_report(
-  parent: &Path,
+  session: &mut Session,
   name: &str,
   report: &str,
   ok: bool,
-) -> Result<(), String> {
-  let text = read_file(parent)?;
-  let (body, live) = strip_live_line(&text);
-  let status = if ok { "finished" } else { "failed" };
-  let extra = format!(
-    "\n### You\n[system] Subagent '{name}' {status}. Its complete final response follows.\n---\n{report}\n---\n\n{}\n",
-    SEND_MARKER
-  );
-  write_file(parent, reassemble(&body, &extra, live.as_deref()))
+) -> bool {
+  if has_report(session, name) {
+    return false;
+  }
+  let header = report_header(name, ok);
+  session.turns.push(Turn {
+    user: Some(report_body(&header, report)),
+    ..Turn::default()
+  });
+  true
 }
 
-fn system_prompt_default(cfg: &AppConfig, tools_excluded: &[String]) -> String {
+pub fn system_prompt_default(cfg: &AppConfig, tools_excluded: &[String]) -> String {
   let has = |t: &str| !tools_excluded.iter().any(|x| x == t);
   let decision_line = if has("question") {
     "When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing."
@@ -202,7 +183,9 @@ fn skills_index(dir: &str) -> String {
     if frontmatter_disabled(&content) {
       continue;
     }
-    let name = f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let name = f
+      .file_name()
+      .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     match skill_summary(&content) {
       Some(desc) => listed.push(format!("- {name}: {desc}\n")),
       None => listed.push(format!("- {name}\n")),
@@ -238,9 +221,10 @@ fn frontmatter_disabled(content: &str) -> bool {
 fn skill_summary(content: &str) -> Option<String> {
   let lines: Vec<&str> = content.lines().collect();
   if lines.first().is_some_and(|l| l.trim() == "---") {
-    return frontmatter_summary(&lines[1..]);
+    frontmatter_summary(&lines[1..])
+  } else {
+    body_summary(&lines)
   }
-  body_summary(&lines)
 }
 
 fn frontmatter_summary(lines: &[&str]) -> Option<String> {
@@ -296,7 +280,6 @@ fn body_summary(lines: &[&str]) -> Option<String> {
         if !rest.is_empty() {
           title = Some(rest.trim());
         }
-        continue;
       }
       continue;
     }
@@ -320,69 +303,94 @@ fn truncate_chars(s: &str, max: usize) -> String {
   }
 }
 
-pub fn write_status(path: &Path, pf: &ParsedFile, phase: Phase) -> Result<(), String> {
-  let text = read_file(path)?;
-  let (body, _live) = strip_live_line(&text);
-  let status = LiveStatus {
-    phase,
-    model: pf.config.model.clone().unwrap_or_default(),
-  };
-  let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".into());
-  let extra = format!("<!-- slopfile:live {json} -->\n");
-  write_file(path, reassemble(&body, &extra, None))
+pub enum ToolPass {
+  Outcomes {
+    outcomes: Vec<ToolOutcome>,
+    solved: bool,
+  },
+  Question,
 }
 
-pub async fn write_tool_blocks(
-  path: &Path,
+pub async fn execute_tool_calls(
   calls: &[ToolCall],
+  session: &Session,
   cfg: &AppConfig,
-  pf: &ParsedFile,
-) -> Result<(), String> {
-  let text = read_file(path)?;
-  let (body, live) = strip_live_line(&text);
-
-  let mut block = String::new();
+  path: &Path,
+) -> Result<ToolPass, String> {
+  if calls.iter().any(|c| c.name == "question") {
+    return Ok(ToolPass::Question);
+  }
+  let mut outcomes = Vec::new();
+  let mut solved = false;
   for call in calls {
     let started = std::time::Instant::now();
-    let timeout = pf.config.tool_timeout_ms.unwrap_or(cfg.tool_timeout_ms);
-    let mut solved = false;
-    let result = if !pf.config.allows_tool(&call.name) {
-      ToolResult::err(format!("{}: tool is disabled in this session", call.name))
-    } else if call.name == "subagent" {
-      handle_subagent_call(path, call, cfg)
-    } else if call.name == "solve" {
-      let r = handle_solve_call(call);
-      solved = r.ok;
-      r
-    } else {
-      tools::run(
-        &call.name,
-        &call.arguments,
-        PathBuf::from(&cfg.workdir),
-        timeout,
-        &[PathBuf::from(&cfg.skills_dir)],
+    let timeout = session
+      .config
+      .tool_timeout_ms
+      .unwrap_or(cfg.tool_timeout_ms);
+    let (result, is_solve) = if !session.config.allows_tool(&call.name) {
+      (
+        ToolResult::err(format!("{}: tool is disabled in this session", call.name)),
+        false,
       )
-      .await
+    } else if call.name == "subagent" {
+      (handle_subagent_call(path, call, cfg), false)
+    } else if call.name == "solve" {
+      (handle_solve_call(call), true)
+    } else {
+      (
+        tools::run(
+          &call.name,
+          &call.arguments,
+          PathBuf::from(&cfg.workdir),
+          timeout,
+          &[PathBuf::from(&cfg.skills_dir)],
+          Some(path),
+        )
+        .await,
+        false,
+      )
     };
     let ms = started.elapsed().as_millis();
-    block.push_str(&format!("<!-- tool:{} {} -->\n", call.name, call.arguments));
-    block.push_str(&result.output);
-    if !result.output.ends_with('\n') {
-      block.push('\n');
-    }
-    let status = if result.ok { "ok" } else { "err" };
-    block.push_str(&format!("<!-- result:{} {status}={ms}ms -->\n", call.name));
-    if solved {
-      block.push_str(&format!(
-        "{}\n{}\n",
-        crate::lex::SOLVED_MARKER,
-        crate::lex::DONE_MARKER
-      ));
+    outcomes.push(ToolOutcome {
+      id: call.id.clone(),
+      name: call.name.clone(),
+      ok: result.ok,
+      ms: ms as u64,
+      output: result.output,
+    });
+    if is_solve && result.ok {
+      solved = true;
       break;
     }
   }
+  Ok(ToolPass::Outcomes { outcomes, solved })
+}
 
-  write_file(path, reassemble(&body, &block, live.as_deref()))
+fn handle_subagent_call(parent: &Path, call: &ToolCall, cfg: &AppConfig) -> ToolResult {
+  let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
+    Ok(v) => v,
+    Err(e) => return ToolResult::err(format!("subagent: bad arguments json: {e}")),
+  };
+  let name = args
+    .get("name")
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or("subagent");
+  let Some(task) = args.get("task").and_then(serde_json::Value::as_str) else {
+    return ToolResult::err("subagent: missing string argument \"task\"");
+  };
+  if task.trim().is_empty() {
+    return ToolResult::err("subagent: task must not be empty");
+  }
+  match spawn_subagent(parent, task, cfg) {
+    Ok(child) => ToolResult::ok(format!(
+      "subagent '{name}' spawned at {}. It runs autonomously and cannot see this conversation; \
+       do not read its transcript unless asked. Its complete final response will be appended \
+       here automatically when it finishes; wait for it instead of redoing its work.",
+      child.display()
+    )),
+    Err(e) => ToolResult::err(e),
+  }
 }
 
 fn handle_solve_call(call: &ToolCall) -> ToolResult {
@@ -398,134 +406,60 @@ fn handle_solve_call(call: &ToolCall) -> ToolResult {
   }
 }
 
-pub fn render_questions_block(path: &Path, calls: &[ToolCall]) -> Result<(), String> {
-  let call = calls
-    .iter()
-    .find(|c| c.name == "question")
-    .expect("question call");
+pub fn render_question(session: &mut Session, call: &ToolCall) -> Result<(), String> {
   let args: serde_json::Value = serde_json::from_str(&call.arguments)
     .map_err(|e| format!("bad question args json: {e}"))?;
   let data = args
     .get("data")
     .and_then(|d| d.as_array())
     .ok_or("question tool needs a data array")?;
-
-  let mut qs = Vec::new();
-  let mut stash = Vec::new();
-  for (i, item) in data.iter().enumerate() {
-    qs.push(questions::question_from_tool_item((i + 1) as u32, item));
-    stash.push(item.to_string());
+  let questions: Vec<Question> = data
+    .iter()
+    .enumerate()
+    .map(|(i, item)| questions::question_from_tool_item((i + 1) as u32, item))
+    .collect();
+  if !session.input.trim().is_empty() {
+    warn!("question call arrived with unpromoted input; replacing it with the answer block");
   }
-
-  let text = read_file(path)?;
-  let (body, live) = strip_live_line(&text);
-  let mut block = questions::render_block(&qs);
-  for (q, json) in qs.iter().zip(stash.iter()) {
-    block.push_str(&format!("<!-- q:{} {json} -->\n", q.id));
-  }
-  block.push_str(&format!("<!-- call:{} {} -->\n", call.name, call.arguments));
-
-  write_file(path, reassemble(&body, &block, live.as_deref()))?;
+  session.input = questions::render_block(&questions);
+  session.set_question(PendingQuestion {
+    call: session::Call {
+      id: call.id.clone(),
+      name: call.name.clone(),
+      arguments: call.arguments.clone(),
+    },
+    questions,
+  });
   Ok(())
 }
 
-pub fn questions_resolvable(pf: &ParsedFile, cfg: &AppConfig) -> bool {
+pub fn questions_resolvable(session: &Session, cfg: &AppConfig) -> bool {
   if cfg.confirmations == Confirmations::Yolo {
     return true;
   }
-  match questions_block_region(&pf.tail) {
-    Some(block) => user_answers_from_tail(block).is_some() || has_skip(block),
-    None => false,
-  }
+  questions::answer_text(&session.input).is_some()
 }
 
-fn block_end(text: &str, header_ix: usize) -> usize {
-  text[header_ix..]
-    .find("<!-- call:")
-    .and_then(|ix| {
-      let line_start = header_ix + ix;
-      text[line_start..].find('\n').map(|nl| line_start + nl + 1)
-    })
-    .unwrap_or(text.len())
+pub fn resolve_questions(session: &mut Session, cfg: &AppConfig) -> Result<bool, String> {
+  let Some(pending) = session.pending_question().cloned() else {
+    return Ok(false);
+  };
+  let skipping = questions::is_skip(&session.input);
+  let raw = questions::answer_text(&session.input);
+  let answers = match (&raw, skipping) {
+    (_, true) => default_answers(&pending.questions),
+    (Some(text), false) => questions::parse_answers(&pending.questions, text)?,
+    (None, false) if cfg.confirmations == Confirmations::Yolo => {
+      default_answers(&pending.questions)
+    }
+    (None, false) => return Ok(false),
+  };
+  session.answer_question(answers)?;
+  Ok(true)
 }
 
-fn questions_block_region(tail: &str) -> Option<&str> {
-  let start = tail.find(questions::BLOCK_HEADER)?;
-  Some(&tail[start..block_end(tail, start)])
-}
-
-fn stashed_call(block_text: &str) -> String {
-  block_text
-    .lines()
-    .find_map(|l| {
-      let l = l.trim();
-      let inner = l.strip_prefix("<!-- call:")?.strip_suffix("-->")?.trim();
-      Some(inner.to_string())
-    })
-    .unwrap_or_else(|| "{}".to_string())
-}
-
-fn has_skip(tail: &str) -> bool {
-  lex(tail).into_iter().any(|t| t.is_skip())
-}
-
-fn user_answers_from_tail(tail: &str) -> Option<String> {
-  lex(tail)
-    .into_iter()
-    .find(|t| t.kind == TokKind::Answer && !t.payload.is_empty() && !t.is_skip())
-    .map(|t| t.payload.to_string())
-}
-
-pub fn resolve_questions(
-  path: &Path,
-  text: &str,
-  pf: &ParsedFile,
-  cfg: &AppConfig,
-) -> Result<(), String> {
-  let (body, live) = strip_live_line(text);
-  let mut out = body.clone();
-
-  for block in &pf.pending_questions {
-    let Some(header_ix) = out.find(questions::BLOCK_HEADER) else {
-      continue;
-    };
-    let end = block_end(&out, header_ix);
-    let block_text = &out[header_ix..end];
-
-    let skipping = has_skip(block_text);
-    let raw = user_answers_from_tail(block_text);
-    let yolo = cfg.confirmations == Confirmations::Yolo;
-    let answers = match (&raw, skipping) {
-      (_, true) => default_answers(block),
-      (Some(t), false) => questions::parse_answers(block, t)?,
-      (None, false) if yolo => default_answers(block),
-      (None, false) => break,
-    };
-
-    let call_json = stashed_call(block_text);
-    let (name, args) = call_json.split_once(' ').unwrap_or(("question", &call_json));
-
-    let mut tool_out = "\n".to_string();
-    tool_out.push_str(&format!("<!-- tool:{name} {args} -->\n"));
-    let payload = serde_json::json!({
-      "answers": answers.iter().map(|(id, a)| serde_json::json!({"id": id, "answer": a})).collect::<Vec<_>>()
-    });
-    tool_out.push_str(&payload.to_string());
-    tool_out.push('\n');
-    tool_out.push_str(&format!("<!-- result:{name} ok=ask -->\n"));
-
-    let mut updated = out.clone();
-    updated.replace_range(header_ix..end, &tool_out);
-    out = drop_skip_lines(&updated);
-  }
-
-  write_file(path, reassemble(&out, "", live.as_deref()))?;
-  Ok(())
-}
-
-fn default_answers(block: &QuestionsBlock) -> Vec<(u32, String)> {
-  block
-    .questions
+fn default_answers(questions: &[Question]) -> Vec<(u32, String)> {
+  questions
     .iter()
     .map(|q| {
       let ans = q
@@ -538,43 +472,28 @@ fn default_answers(block: &QuestionsBlock) -> Vec<(u32, String)> {
     .collect()
 }
 
-fn drop_skip_lines(text: &str) -> String {
-  let had_nl = text.ends_with('\n');
-  let mut out = lex(text)
-    .into_iter()
-    .filter(|t| !t.is_skip())
-    .map(|t| t.text)
-    .collect::<Vec<_>>()
-    .join("\n");
-  if had_nl && !out.is_empty() && !out.ends_with('\n') {
-    out.push('\n');
-  }
-  out
+pub fn add_context_full_note(session: &mut Session) {
+  session.add_note(NoteBy::Harness, context::CONTEXT_FULL_NOTE);
 }
 
-pub fn promote_draft(path: &Path, text: &str) -> Result<(), String> {
-  let (body, live) = strip_live_line(text);
-  let done_ix = crate::transcript::turn_end_tail_start(&body).unwrap_or(0);
-
-  let rest = &body[done_ix..];
-  let skip = rest
-    .lines()
-    .take_while(|l| l.trim().is_empty() || crate::lex::lex_line(l).is_daemon_owned())
-    .map(|l| l.len() + 1)
-    .sum::<usize>()
-    .min(rest.len());
-
-  let marker_end = done_ix + skip;
-  let mut out = String::new();
-  out.push_str(&body[..marker_end]);
-  if !out.is_empty() && !out.ends_with('\n') {
-    out.push('\n');
+pub fn adopt_model_edit(current: &Session, path: &Path) -> Result<Option<Session>, String> {
+  let text = transcript::read_file(path)?;
+  if text == current.render() {
+    return Ok(None);
   }
-  out.push_str("### You\n");
-  out.push_str(body[marker_end..].trim_start_matches('\n'));
-  if let Some(live) = &live {
-    out.push('\n');
-    out.push_str(live);
+  let edited = context::adopt(&text)?;
+  info!("context file edited by the model, synced: {}", path.display());
+  Ok(Some(edited))
+}
+
+pub fn note_rollback(outcomes: &mut [ToolOutcome], why: &str) {
+  if let Some(last) = outcomes.last_mut() {
+    if !last.output.is_empty() && !last.output.ends_with('\n') {
+      last.output.push('\n');
+    }
+    last
+      .output
+      .push_str(&format!("context edit rolled back: {why}"));
+    last.ok = false;
   }
-  write_file(path, out)
 }

@@ -1,4 +1,4 @@
-use crate::transcript::{assistant_section_messages, tail_user_text_capped, ParsedFile};
+use crate::session::Session;
 use crate::types::{AppConfig, ChatMessage, Role};
 
 async fn request_token_count(
@@ -55,18 +55,83 @@ async fn request_token_count(
   Err(format!("cannot reach model tokenizer: {last_err}"))
 }
 
+/// Token counts are cached by content: the system prompt and unchanged tool results dominate a
+/// long session, and re-tokenizing them on every turn is pure overhead.
+#[derive(Default)]
+struct CountCache {
+  counts: std::collections::HashMap<u64, usize>,
+}
+
+fn content_key(m: &ChatMessage) -> u64 {
+  let mut hash: u64 = 0xcbf29ce484222325;
+  let mut eat = |s: &str| {
+    for b in s.bytes() {
+      hash ^= b as u64;
+      hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= 0xff;
+    hash = hash.wrapping_mul(0x100000001b3);
+  };
+  if let Some(c) = &m.content {
+    eat(c);
+  }
+  if let Some(r) = &m.reasoning_content {
+    eat(r);
+  }
+  if let Some(calls) = &m.tool_calls {
+    for c in calls {
+      eat(&c.id);
+      eat(&c.name);
+      eat(&c.arguments);
+    }
+  }
+  if let Some(id) = &m.tool_call_id {
+    eat(id);
+  }
+  hash
+}
+
 async fn request_token_counts(
   api_base: &str,
   client: &reqwest::Client,
   model: &str,
   messages: &[ChatMessage],
 ) -> Result<Vec<usize>, String> {
-  let futs = messages
+  let mut cache = CountCache::default();
+  let mut todo: Vec<(usize, u64)> = messages
     .iter()
-    .map(|m| request_token_count(api_base, client, model, std::slice::from_ref(m)));
-  futures_util::future::join_all(futs)
-    .await
-    .into_iter()
+    .enumerate()
+    .map(|(ix, m)| (ix, content_key(m)))
+    .filter(|(_, key)| !cache.counts.contains_key(key))
+    .collect();
+  todo.dedup_by(|a, b| a.1 == b.1);
+  let mut error = None;
+  const FAN_OUT: usize = 8;
+  let mut chunks = todo.chunks(FAN_OUT);
+  while let Some(batch) = chunks.next() {
+    let futs = batch.iter().map(|(ix, key)| async move {
+      let counted =
+        request_token_count(api_base, client, model, std::slice::from_ref(&messages[*ix])).await;
+      (*key, counted)
+    });
+    for (key, counted) in futures_util::future::join_all(futs).await {
+      match counted {
+        Ok(n) => {
+          cache.counts.insert(key, n);
+        }
+        Err(e) => error = Some(e),
+      }
+    }
+  }
+  messages
+    .iter()
+    .map(|m| {
+      cache
+        .counts
+        .get(&content_key(m))
+        .copied()
+        .ok_or_else(|| error.clone().unwrap_or_else(|| "no token count".to_string()))
+    })
     .collect()
 }
 
@@ -77,41 +142,46 @@ pub struct RequestPlan {
   pub token_count: usize,
 }
 
+/// The room left for the prompt: the model has to fit the prompt *and* the answer in the window,
+/// so the prompt may only use the budget minus the output allowance.
+pub fn prompt_budget(budget: u32) -> u32 {
+  budget.saturating_sub(output_allowance(budget))
+}
+
+pub fn output_allowance(budget: u32) -> u32 {
+  budget / 4
+}
+
 pub async fn build_request_messages(
-  text: &str,
-  pf: &ParsedFile,
+  session: &Session,
+  messages: Vec<ChatMessage>,
   cfg: &AppConfig,
   http: &reqwest::Client,
 ) -> Result<RequestPlan, String> {
-  let mut messages = pf.history.clone();
-  let cap = pf.dangling.as_ref().map(|d| d.resume_offset);
-  let section = match cap {
-    Some(cap) => tail_user_text_capped(text, cap),
-    None => crate::transcript::tail_user_text(text),
-  };
-  if let Some(section) = section {
-    messages.extend(crate::transcript::tail_sections(&section));
-  }
-  if let Some(d) = &pf.dangling
-    && !d.partial_text.trim().is_empty()
-  {
-    messages.extend(assistant_section_messages(&d.partial_text));
-  }
-  let context_budget = context_budget(pf, cfg);
   if messages.is_empty() {
     return Ok(RequestPlan { messages, dropped: 0, token_count: 0 });
   }
-  let counts = request_token_counts(
+  // A tokenizer that is down must not take the session down with it: fall back to a rough
+  // estimate and let the model keep working.
+  let counts = match request_token_counts(
     &cfg.api_base,
     http,
-    pf.config.model.as_deref().unwrap_or(&cfg.model),
+    session.model().unwrap_or(&cfg.model),
     &messages,
   )
-  .await?;
-  let (truncated, kept_sum) = truncate_messages(messages, &counts, context_budget);
-  if kept_sum > context_budget as usize {
+  .await
+  {
+    Ok(counts) => counts,
+    Err(e) => {
+      tracing::warn!("{e}; falling back to a 4-chars-per-token estimate");
+      messages.iter().map(|m| (estimate_chars(m) / 4) + 1).collect()
+    }
+  };
+  let cap = prompt_budget(context_budget(session, cfg));
+  let (truncated, kept_sum) = truncate_messages(messages, &counts, cap);
+  if kept_sum > cap as usize {
     return Err(format!(
-      "request exceeds the context budget even after dropping old turns: {kept_sum} > {context_budget} tokens; trim the transcript"
+      "request exceeds the context budget even after dropping old turns: {kept_sum} > {cap} tokens; trim the transcript"
     ));
   }
   Ok(RequestPlan {
@@ -121,12 +191,14 @@ pub async fn build_request_messages(
   })
 }
 
-pub fn context_budget(pf: &ParsedFile, cfg: &AppConfig) -> u32 {
-  pf.config.max_context_tokens.unwrap_or(cfg.max_context_tokens)
+pub fn context_budget(session: &Session, cfg: &AppConfig) -> u32 {
+  session
+    .config
+    .max_context_tokens
+    .unwrap_or(cfg.max_context_tokens)
 }
 
-#[cfg(test)]
-pub(crate) fn msg_chars(m: &ChatMessage) -> usize {
+pub(crate) fn estimate_chars(m: &ChatMessage) -> usize {
   m.content.as_ref().map_or(0, |c| c.len())
     + m.reasoning_content.as_ref().map_or(0, |c| c.len())
     + m
@@ -134,6 +206,7 @@ pub(crate) fn msg_chars(m: &ChatMessage) -> usize {
       .as_ref()
       .map_or(0, |t| t.iter().map(|c| c.arguments.len() + 16).sum())
     + m.name.as_ref().map_or(0, |n| n.len())
+    + m.tool_call_id.as_ref().map_or(0, |n| n.len())
 }
 
 pub fn truncate_messages(
@@ -159,12 +232,22 @@ pub fn truncate_messages(
       break;
     }
   }
-  while keep_from + 1 < messages.len() && !is_turn_start(&messages[keep_from]) {
-    keep_from += 1;
-  }
-  if keep_from + 1 == messages.len() && !is_turn_start(&messages[keep_from]) {
-    while keep_from > 0 && !is_turn_start(&messages[keep_from]) {
-      keep_from -= 1;
+  // Every adjustment below may only move keep_from *forward*. Moving it backward keeps more
+  // messages and can push the window back over budget, which the caller reports as a hard error
+  // and then parks the session. Forward-only moves can only free budget, so the window always fits.
+  // A valid window must open on a `user` message. Opening on an assistant or on a bare tool
+  // result is rejected by chat templates that expect strict alternation.
+  let budget_keep_from = keep_from;
+  if !matches!(messages.get(keep_from).map(|m| m.role), Some(Role::User)) {
+    if let Some(next) = (keep_from..messages.len()).find(|ix| messages[*ix].role == Role::User) {
+      keep_from = next;
+    } else if let Some(prev) = (1..keep_from).rev().find(|ix| messages[*ix].role == Role::User) {
+      // May exceed the budget; the caller then refuses the request, which is the honest outcome.
+      keep_from = prev;
+    } else {
+      // No valid window fits. Report the over-budget one honestly instead of silently degrading
+      // to a bare system prompt that asks the model to continue with no conversation at all.
+      keep_from = budget_keep_from;
     }
   }
   if keep_from > 1 {
@@ -177,9 +260,6 @@ pub fn truncate_messages(
   (messages, total)
 }
 
-fn is_turn_start(m: &ChatMessage) -> bool {
-  matches!(m.role, Role::User | Role::Assistant)
-}
 
 #[cfg(test)]
 mod tests {
@@ -193,7 +273,7 @@ mod tests {
       msgs.push(ChatMessage::user(format!("user turn number {i} with some body text")));
       msgs.push(ChatMessage::assistant(format!("assistant answer number {i} with some body text")));
     }
-    let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
+    let counts: Vec<usize> = msgs.iter().map(|m| (estimate_chars(m) / 4) + 1).collect();
     let (small, small_sum) = truncate_messages(msgs.clone(), &counts, 30);
     assert_eq!(small[0].role, Role::System);
     assert!(small.len() < msgs.len(), "old turns dropped: {} -> {}",
@@ -219,7 +299,7 @@ mod tests {
       msgs.push(asst);
       msgs.push(ChatMessage::tool(call.id.clone(), "bash".to_string(), "out".to_string()));
     }
-    let counts: Vec<usize> = msgs.iter().map(|m| (msg_chars(m) / 4) + 1).collect();
+    let counts: Vec<usize> = msgs.iter().map(|m| (estimate_chars(m) / 4) + 1).collect();
     let (small, _) = truncate_messages(msgs.clone(), &counts, 6);
     assert!(matches!(small[1].role, Role::User | Role::Assistant));
     let has_call = small.iter().any(|m| m.tool_calls.is_some());

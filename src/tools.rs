@@ -6,18 +6,19 @@ use std::process::Stdio;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use crate::types::{FunctionDefinition, ToolDefinition, ToolResult};
+use crate::types::{FunctionDefinition, SessionConfig, ToolDefinition, ToolResult};
 
 const BASH_OUTPUT_CAP: usize = 30_000;
 const GREP_MATCH_CAP: usize = 500;
 const GREP_LINE_CAP: usize = 2_000;
 const FIND_FILE_CAP: usize = 2_000;
+const WALK_FILE_CAP: usize = 50_000;
 
 pub fn definitions() -> Vec<ToolDefinition> {
   vec![
     tool_def(
       "read",
-      "Read a file as numbered lines, optionally skipping ahead and capping how many lines are shown. Paths are resolved relative to the workdir and must stay inside it.",
+      "Read a file as numbered lines, optionally skipping ahead and capping how many lines are shown. Paths are resolved relative to the workdir and must stay inside it, except for your own context file, which is named in the system prompt and always readable.",
       json!({
           "type": "object",
           "properties": {
@@ -30,7 +31,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
     ),
     tool_def(
       "write",
-      "Create or overwrite a file. Parent directories are created as needed. Paths are resolved relative to the workdir and must stay inside it.",
+      "Create or overwrite a file. Parent directories are created as needed. Paths are resolved relative to the workdir and must stay inside it, except for your own context file, which you may rewrite to manage your context.",
       json!({
           "type": "object",
           "properties": {
@@ -42,7 +43,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
     ),
     tool_def(
       "edit",
-      "Replace the first occurrence of a text fragment in a file. Errors (with a line window of the file) if the fragment is not found.",
+      "Replace the first occurrence of a text fragment in a file. Errors (with a line window of the file) if the fragment is not found. Your own context file may be edited this way.",
       json!({
           "type": "object",
           "properties": {
@@ -168,15 +169,16 @@ pub async fn run(
   workdir: PathBuf,
   timeout_ms: u64,
   extra_read_roots: &[PathBuf],
+  context_file: Option<&Path>,
 ) -> ToolResult {
   let args: Value = match serde_json::from_str(arguments_json) {
     Ok(v) => v,
     Err(e) => return ToolResult::err(format!("bad arguments json: {e}")),
   };
   match name {
-    "read" => read(&workdir, extra_read_roots, &args),
-    "write" => write(&workdir, &args),
-    "edit" => edit(&workdir, &args),
+    "read" => read(&workdir, extra_read_roots, &args, context_file),
+    "write" => write(&workdir, &args, context_file),
+    "edit" => edit(&workdir, &args, context_file),
     "bash" => bash(&workdir, &args, timeout_ms).await,
     "grep" => grep(&workdir, &args),
     "find" => find(&workdir, &args),
@@ -185,6 +187,46 @@ pub async fn run(
     "solve" => ToolResult::err("solve is handled by the agent loop, not executed here"),
     other => ToolResult::err(format!("unknown tool: {other}")),
   }
+}
+
+/// The tool definitions this session is actually allowed to call. The daemon advertises exactly
+/// this list, so the model is never told about a tool that would come back disabled.
+pub fn advertised(config: &SessionConfig) -> Vec<ToolDefinition> {
+  definitions()
+    .into_iter()
+    .filter(|d| config.allows_tool(&d.function.name))
+    .collect()
+}
+
+fn targets_context_file(workdir: &Path, asked: &str, context_file: Option<&Path>) -> bool {
+  let Some(context_file) = context_file else {
+    return false;
+  };
+  let candidate = if Path::new(asked).is_absolute() {
+    PathBuf::from(asked)
+  } else {
+    workdir.join(asked)
+  };
+  match (
+    std::fs::canonicalize(&candidate),
+    std::fs::canonicalize(context_file),
+  ) {
+    (Ok(a), Ok(c)) => a == c,
+    _ => candidate == context_file,
+  }
+}
+
+fn resolve_target(
+  workdir: &Path,
+  asked: &str,
+  context_file: Option<&Path>,
+) -> Result<PathBuf, String> {
+  if !targets_context_file(workdir, asked, context_file) {
+    return resolve_in(workdir, asked);
+  }
+  let context_file = context_file.expect("checked by targets_context_file");
+  std::fs::canonicalize(context_file)
+    .map_err(|e| format!("cannot open the context file {asked}: {e}"))
 }
 
 fn str_arg<'a>(tool: &str, args: &'a Value, key: &str) -> Result<&'a str, ToolResult> {
@@ -211,43 +253,109 @@ macro_rules! path {
   };
 }
 
-fn read(workdir: &Path, extra_roots: &[PathBuf], args: &Value) -> ToolResult {
+fn read(
+  workdir: &Path,
+  extra_roots: &[PathBuf],
+  args: &Value,
+  context_file: Option<&Path>,
+) -> ToolResult {
   let path_str = arg!("read", args, "path");
   let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
   let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
-  let path = if extra_roots.is_empty() {
+  let is_context = targets_context_file(workdir, path_str, context_file);
+  let path = if is_context {
+    match resolve_target(workdir, path_str, context_file) {
+      Ok(p) => p,
+      Err(e) => return ToolResult::err(format!("read: {e}")),
+    }
+  } else if extra_roots.is_empty() {
     path!(workdir, path_str)
   } else {
-    match resolve_in(workdir, path_str) {
-      Ok(p) => p,
-      Err(_) => match extra_roots.iter().find_map(|root| resolve_in(root, path_str).ok()) {
-        Some(p) => p,
-        None => return ToolResult::err(format!("read: path escapes workdir: {path_str}")),
-      },
+    // The system prompt advertises `skills_dir` verbatim, so a relative extra root has to resolve
+    // even when the path is perfectly valid but simply does not exist under the workdir.
+    let in_workdir = resolve_in(workdir, path_str).ok();
+    let elsewhere = extra_roots
+      .iter()
+      .find_map(|root| resolve_in(root, path_str).ok());
+    match in_workdir
+      .filter(|p| p.exists())
+      .or_else(|| elsewhere)
+    {
+      Some(p) => p,
+      None => return ToolResult::err(format!("read: path escapes workdir: {path_str}")),
     }
   };
-  let content = match read_to_string(&path) {
+  // Read only the window the model asked for: a 200 MB file with limit 200 still cost 200 MB
+  // resident in the one process that hosts every session.
+  let content = match read_window(&path, offset, limit) {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("read: cannot read {path_str}: {e}")),
   };
-  if content.contains("<!-- slopfile") {
-    return ToolResult::err("read: refusing to read a slopfile transcript or daemon-owned file");
-  }
   let mut lines: Vec<&str> = content.split('\n').collect();
   if lines.last().is_some_and(|l| l.is_empty()) {
     lines.pop();
   }
   let mut out = String::new();
-  for (i, line) in lines.iter().enumerate().skip(offset).take(limit) {
-    out.push_str(&format!("{}: {line}\n", i + 1));
+  for (i, line) in lines.iter().enumerate() {
+    out.push_str(&format!("{}: {line}\n", i + 1 + offset));
+  }
+  // The line numbers must stay absolute, and one call must not permanently inflate the context of
+  // the whole session: it is re-sent in the body of every later request.
+  if out.len() > BASH_OUTPUT_CAP {
+    let cut = floor_char_boundary(&out, BASH_OUTPUT_CAP);
+    out.truncate(cut);
+    out.push_str(&format!(
+      "\n… [truncated at {BASH_OUTPUT_CAP} chars; ask for a narrower range to see more]"
+    ));
   }
   ToolResult::ok(out)
 }
 
-fn write(workdir: &Path, args: &Value) -> ToolResult {
+/// Read only `offset + limit` lines, streaming rather than slurping the whole file.
+fn read_window(path: &Path, offset: usize, limit: usize) -> std::io::Result<String> {
+  use std::io::{BufRead, BufReader};
+  let file = std::fs::File::open(path)?;
+  let mut reader = BufReader::with_capacity(64 * 1024, file);
+  let mut out = String::new();
+  let mut line = String::new();
+  let mut index = 0usize;
+  let mut emitted = 0usize;
+  loop {
+    line.clear();
+    if reader.read_line(&mut line)? == 0 {
+      break;
+    }
+    index += 1;
+    if index > offset {
+      out.push_str(&line);
+      emitted += 1;
+      if emitted >= limit || out.len() > BASH_OUTPUT_CAP {
+        break;
+      }
+    }
+  }
+  Ok(out)
+}
+
+fn write(workdir: &Path, args: &Value, context_file: Option<&Path>) -> ToolResult {
   let path_str = arg!("write", args, "path");
   let content = arg!("write", args, "content");
-  let path = path!(workdir, path_str);
+  let is_context = targets_context_file(workdir, path_str, context_file);
+  let path = if is_context {
+    match resolve_target(workdir, path_str, context_file) {
+      Ok(p) => p,
+      Err(e) => return ToolResult::err(format!("write: {e}")),
+    }
+  } else {
+    path!(workdir, path_str)
+  };
+  if is_context {
+    if let Err(why) = crate::context::check_edit(content) {
+      return ToolResult::err(format!(
+        "write: {path_str} is this session's context file and that rewrite was refused: {why}"
+      ));
+    }
+  }
   if let Some(parent) = path.parent()
     && let Err(e) = create_dir_all(parent)
   {
@@ -259,14 +367,22 @@ fn write(workdir: &Path, args: &Value) -> ToolResult {
   ToolResult::ok(format!("wrote {} bytes", content.len()))
 }
 
-fn edit(workdir: &Path, args: &Value) -> ToolResult {
+fn edit(workdir: &Path, args: &Value, context_file: Option<&Path>) -> ToolResult {
   let path_str = arg!("edit", args, "path");
   let old = arg!("edit", args, "old");
   let new = arg!("edit", args, "new");
   if old.is_empty() {
     return ToolResult::err("edit: old text must not be empty");
   }
-  let path = path!(workdir, path_str);
+  let is_context = targets_context_file(workdir, path_str, context_file);
+  let path = if is_context {
+    match resolve_target(workdir, path_str, context_file) {
+      Ok(p) => p,
+      Err(e) => return ToolResult::err(format!("edit: {e}")),
+    }
+  } else {
+    path!(workdir, path_str)
+  };
   let content = match read_to_string(&path) {
     Ok(c) => c,
     Err(e) => return ToolResult::err(format!("edit: cannot read {path_str}: {e}")),
@@ -282,6 +398,13 @@ fn edit(workdir: &Path, args: &Value) -> ToolResult {
   };
   let mut updated = content;
   updated.replace_range(idx..idx + old.len(), new);
+  if is_context {
+    if let Err(why) = crate::context::check_edit(&updated) {
+      return ToolResult::err(format!(
+        "edit: that change to {path_str} would break this session's context file, so it was refused: {why}"
+      ));
+    }
+  }
   if let Err(e) = std::fs::write(&path, updated) {
     return ToolResult::err(format!("edit: cannot write {path_str}: {e}"));
   }
@@ -309,12 +432,14 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
   let stdout = child.stdout.take().expect("stdout is piped");
   let stderr = child.stderr.take().expect("stderr is piped");
   let outcome = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
-    let (out, err) = tokio::join!(read_into(stdout), read_into(stderr));
+    let ((out, out_truncated), (err, err_truncated)) =
+      tokio::join!(read_into(stdout), read_into(stderr));
+    let truncated = out_truncated || err_truncated;
     let status = child
       .wait()
       .await
       .map_err(|e| format!("bash: wait failed: {e}"))?;
-    Ok::<_, String>((out, err, status))
+    Ok::<_, String>((out, err, status, truncated))
   })
   .await;
   match outcome {
@@ -332,7 +457,7 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
       ))
     }
     Ok(Err(e)) => ToolResult::err(e),
-    Ok(Ok((stdout_s, stderr_s, status))) => {
+    Ok(Ok((stdout_s, stderr_s, status, truncated))) => {
       let mut combined = stdout_s;
       if !stderr_s.is_empty() {
         if !combined.is_empty() {
@@ -341,6 +466,14 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
         combined.push_str(&stderr_s);
       }
       let combined = truncate(&combined);
+      // Dropping the pipe kills the writer with SIGPIPE, so a command we merely stopped reading
+      // looks exactly like a failed one. Reporting that as failure makes the model conclude the
+      // build broke, so say what actually happened instead.
+      if truncated {
+        return ToolResult::ok(format!(
+          "{combined}\n[output truncated at {BASH_OUTPUT_CAP} chars; the exit status is meaningless because the command was still writing when we stopped reading]"
+        ));
+      }
       if status.success() {
         ToolResult::ok(combined)
       } else {
@@ -488,6 +621,21 @@ fn resolve_in(workdir: &Path, p: &str) -> Result<PathBuf, String> {
         if !resolved.starts_with(&base) {
           return Err(format!("path escapes workdir: {p}"));
         }
+        // canonicalize() failed for every component above, so each re-appended name may still be a
+        // symlink the later open() would follow. A dangling link has no canonical form yet escapes
+        // the moment the file behind it is created, so refuse rather than re-check later.
+        let mut probe = base.clone();
+        if let Ok(rel) = resolved.strip_prefix(&base) {
+          for part in rel.components() {
+            probe.push(part);
+            if std::fs::symlink_metadata(&probe)
+              .map(|m| m.file_type().is_symlink())
+              .unwrap_or(false)
+            {
+              return Err(format!("path escapes workdir via symlink: {p}"));
+            }
+          }
+        }
         return Ok(resolved);
       }
       Err(_) => {
@@ -543,6 +691,11 @@ fn walk_files(workdir: &Path, root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, St
           .map(Path::to_path_buf)
           .unwrap_or_else(|_| path.clone());
         files.push((rel, path));
+        // The walk runs on the async runtime, so an unbounded tree both eats memory and stalls
+        // every other session's stream while it grinds.
+        if files.len() >= WALK_FILE_CAP {
+          return Ok(files);
+        }
       }
     }
   }
@@ -574,11 +727,37 @@ fn truncate(s: &str) -> String {
   out
 }
 
-async fn read_into(mut pipe: impl tokio::io::AsyncRead + Unpin) -> String {
+/// Read at most the output cap. Buffering the whole stream first and truncating afterwards turns
+/// one `yes` into gigabytes of resident memory, which takes the daemon and every session it hosts
+/// down with it.
+async fn read_into(pipe: impl tokio::io::AsyncRead + Unpin) -> (String, bool) {
   use tokio::io::AsyncReadExt;
   let mut buf = Vec::new();
-  let _ = pipe.read_to_end(&mut buf).await;
-  String::from_utf8_lossy(&buf).into_owned()
+  let read = pipe
+    .take((BASH_OUTPUT_CAP + 1) as u64)
+    .read_to_end(&mut buf)
+    .await
+    .unwrap_or(0);
+  let mut out = String::from_utf8_lossy(&buf).into_owned();
+  let mut truncated = false;
+  if read > BASH_OUTPUT_CAP {
+    truncated = true;
+    let cut = floor_char_boundary(&out, BASH_OUTPUT_CAP);
+    out.truncate(cut);
+    out.push_str(&format!(
+      "\n… [stopped reading at {BASH_OUTPUT_CAP} chars; the command was still producing output]"
+    ));
+  }
+  (out, truncated)
+}
+
+fn floor_char_boundary(text: &str, mut at: usize) -> usize {
+  let bytes = text.as_bytes();
+  at = at.min(bytes.len());
+  while at > 0 && !text.is_char_boundary(at) {
+    at -= 1;
+  }
+  at
 }
 
 #[cfg(test)]
@@ -597,20 +776,150 @@ mod tests {
   }
 
   async fn t(name: &str, args: Value, dir: PathBuf) -> ToolResult {
-    run(name, &args.to_string(), dir, 30_000, &[]).await
+    run(name, &args.to_string(), dir, 30_000, &[], None).await
+  }
+
+  const TRANSCRIPT: &str = "```toml\nmodel = \"m\"\nthinking = \"auto\"\n```\n<!-- slopfile:begin -->\n<!-- slopfile:system -->\nSys.\n<!-- /slopfile -->\n<!-- slopfile:turn -->\n<!-- slopfile:user -->\nhi\n<!-- /slopfile -->\n<!-- slopfile:assistant -->\nyo\n<!-- /slopfile -->\n<!-- /slopfile -->\n<!-- slopfile:input -->\n";
+
+  async fn ctx(name: &str, args: Value, wd: PathBuf, context: &Path) -> ToolResult {
+    run(name, &args.to_string(), wd, 30_000, &[], Some(context)).await
   }
 
   #[tokio::test]
-  async fn read_rejects_transcript_files() {
-    let wd = test_dir("read-transcript");
-    let content = "### You\nhi\n### Assistant\nhi\n<!-- slopfile:live {\"phase\":\"idle\"} -->";
-    let _ = t("write", json!({"path": "transcript.md", "content": content}), wd.clone()).await;
+  async fn context_file_is_readable_editable_and_writable() {
+    let wd = test_dir("ctx-access");
+    let outside = test_dir("ctx-access-outside");
+    let context = outside.join("s.md");
+    fs::write(&context, TRANSCRIPT).expect("seed transcript");
+
+    let read = ctx(
+      "read",
+      json!({"path": context.to_string_lossy()}),
+      wd.clone(),
+      &context,
+    )
+    .await;
+    assert!(
+      read.ok,
+      "own context file must be readable: {}",
+      read.output
+    );
+    assert!(read.output.contains("<!-- slopfile:user -->"), "{}", read.output);
+
+    let edit = ctx(
+      "edit",
+      json!({
+        "path": context.to_string_lossy(),
+        "old": "yo",
+        "new": "NOTES: kept"
+      }),
+      wd.clone(),
+      &context,
+    )
+    .await;
+    assert!(edit.ok, "context edit failed: {}", edit.output);
+    let after = fs::read_to_string(&context).unwrap();
+    assert!(after.contains("NOTES: kept"), "{after}");
+
+    let write = ctx(
+      "write",
+      json!({
+        "path": context.to_string_lossy(),
+        "content": "```toml\nmodel = \"m\"\n```\n<!-- slopfile:begin -->\n<!-- slopfile:system -->\nSys.\n<!-- /slopfile -->\n<!-- slopfile:input -->\n"
+      }),
+      wd.clone(),
+      &context,
+    )
+    .await;
+    assert!(write.ok, "context write failed: {}", write.output);
+
+    let sibling = ctx(
+      "write",
+      json!({"path": outside.join("other.md").to_string_lossy(), "content": "x"}),
+      wd.clone(),
+      &context,
+    )
+    .await;
+    assert!(
+      !sibling.ok,
+      "only the context file is exempt: {}",
+      sibling.output
+    );
+
+    let _ = fs::remove_dir_all(&wd);
+    let _ = fs::remove_dir_all(&outside);
+  }
+
+  #[tokio::test]
+  async fn context_edits_that_would_break_the_session_are_refused() {
+    let wd = test_dir("ctx-refuse");
+    let outside = test_dir("ctx-refuse-outside");
+    let context = outside.join("s.md");
+    fs::write(&context, TRANSCRIPT).expect("seed transcript");
+
+    let no_header = ctx(
+      "write",
+      json!({"path": context.to_string_lossy(), "content": "<!-- slopfile:user -->\nhi\n<!-- /slopfile -->\n"}),
+      wd.clone(),
+      &context,
+    )
+    .await;
+    assert!(!no_header.ok, "{}", no_header.output);
+    assert!(
+      no_header.output.contains("toml header"),
+      "{}",
+      no_header.output
+    );
+    assert_eq!(
+      fs::read_to_string(&context).unwrap(),
+      TRANSCRIPT,
+      "refused write must leave the context alone"
+    );
+
+    let no_turns = ctx(
+      "write",
+      json!({"path": context.to_string_lossy(), "content": "```toml\nmodel = \"m\"\n```\n<!-- slopfile:begin -->\n<!-- slopfile:input -->\n"}),
+      wd.clone(),
+      &context,
+    )
+    .await;
+    assert!(!no_turns.ok, "{}", no_turns.output);
+    assert!(
+      no_turns.output.contains("system"),
+      "{}",
+      no_turns.output
+    );
+
+    let header_killer = ctx(
+      "edit",
+      json!({"path": context.to_string_lossy(), "old": "```toml\nmodel = \"m\"", "new": "# S"}),
+      wd.clone(),
+      &context,
+    )
+    .await;
+    assert!(!header_killer.ok, "{}", header_killer.output);
+    assert!(
+      header_killer.output.contains("refused"),
+      "{}",
+      header_killer.output
+    );
+    assert!(fs::read_to_string(&context).unwrap().contains("```toml"));
+
+    let _ = fs::remove_dir_all(&wd);
+    let _ = fs::remove_dir_all(&outside);
+  }
+
+  #[tokio::test]
+  async fn reads_are_not_gated_on_file_contents() {
+    let wd = test_dir("read-any");
+    let transcript = "```toml\nmodel = \"m\"\n```\n<!-- slopfile:begin -->\n<!-- slopfile:input -->\n";
+    t("write", json!({"path": "transcript.md", "content": transcript}), wd.clone()).await;
     let w2 = t("write", json!({"path": "plain.md", "content": "just text\n"}), wd.clone()).await;
     assert!(w2.ok, "write plain failed: {}", w2.output);
 
     let r = t("read", json!({"path": "transcript.md"}), wd.clone()).await;
-    assert!(!r.ok, "transcript read should be refused");
-    assert!(r.output.contains("refusing"), "unexpected msg: {}", r.output);
+    assert!(r.ok, "a region file is ordinary text now: {}", r.output);
+    assert!(r.output.contains("slopfile:input"), "{}", r.output);
 
     let ok = t("read", json!({"path": "plain.md"}), wd.clone()).await;
     assert!(ok.ok, "plain read should succeed: {}", ok.output);
@@ -623,11 +932,19 @@ mod tests {
     fs::write(skills.join("skill.md"), "# Skill\nbody line\n").unwrap();
 
     let args = json!({"path": skills.join("skill.md").to_string_lossy()});
-    let refused = run("read", &args.to_string(), wd.clone(), 30_000, &[]).await;
+    let refused = run("read", &args.to_string(), wd.clone(), 30_000, &[], None).await;
     assert!(!refused.ok, "read outside workdir without extra root must fail");
 
     let allowed =
-      run("read", &args.to_string(), wd.clone(), 30_000, std::slice::from_ref(&skills)).await;
+      run(
+        "read",
+        &args.to_string(),
+        wd.clone(),
+        30_000,
+        std::slice::from_ref(&skills),
+        None,
+      )
+      .await;
     assert!(allowed.ok, "read with extra root should succeed: {}", allowed.output);
     assert!(allowed.output.contains("body line"), "{}", allowed.output);
 
@@ -637,6 +954,7 @@ mod tests {
       wd.clone(),
       30_000,
       std::slice::from_ref(&skills),
+      None,
     )
     .await;
     assert!(!escaped_write.ok, "write must never use extra roots: {}", escaped_write.output);
@@ -919,7 +1237,7 @@ mod tests {
   #[tokio::test]
   async fn bash_timeout_kills_the_child() {
     let wd = test_dir("bash-timeout");
-    let r = run("bash", "{\"command\":\"sleep 5\"}", wd.clone(), 200, &[]).await;
+    let r = run("bash", "{\"command\":\"sleep 5\"}", wd.clone(), 200, &[], None).await;
     assert!(!r.ok, "sleep 5 with 200ms timeout should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
     let _ = fs::remove_dir_all(&wd);
@@ -930,7 +1248,7 @@ mod tests {
     let wd = test_dir("bash-bgkill");
     let pid_file = wd.join("bg.pid");
     let cmd = format!("sleep 60 & echo $! > {}", pid_file.display());
-    let r = run("bash", &json!({ "command": cmd }).to_string(), wd.clone(), 200, &[]).await;
+    let r = run("bash", &json!({ "command": cmd }).to_string(), wd.clone(), 200, &[], None).await;
     assert!(!r.ok, "should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
     let bg_pid: i32 = fs::read_to_string(&pid_file)
@@ -1003,5 +1321,50 @@ mod tests {
         .as_object()
         .is_some()
     );
+  }
+}
+
+#[cfg(test)]
+mod output_cap_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn a_command_that_never_stops_does_not_buffer_without_bound() {
+    // `yes` used to be read to EOF before truncation: seconds of unbounded growth in a process
+    // that hosts every session.
+    let mut child = tokio::process::Command::new("sh")
+      .args(["-c", "yes abcdefghijklmnopqrstuvwxyz"])
+      .stdout(Stdio::piped())
+      .stderr(Stdio::null())
+      .spawn()
+      .expect("spawn");
+    let stdout = child.stdout.take().expect("piped");
+    let started = std::time::Instant::now();
+    let (out, _) = read_into(stdout).await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    assert!(
+      out.len() < BASH_OUTPUT_CAP + 200,
+      "buffered {} bytes",
+      out.len()
+    );
+    assert!(out.contains("still producing"), "{out}");
+    assert!(
+      started.elapsed() < std::time::Duration::from_secs(5),
+      "reading must stop at the cap, not at EOF"
+    );
+  }
+
+  #[tokio::test]
+  async fn output_under_the_cap_is_returned_verbatim() {
+    let mut child = tokio::process::Command::new("sh")
+      .args(["-c", "printf 'small output'"])
+      .stdout(Stdio::piped())
+      .stderr(Stdio::null())
+      .spawn()
+      .expect("spawn");
+    let (out, _) = read_into(child.stdout.take().expect("piped")).await;
+    let _ = child.wait().await;
+    assert_eq!(out, "small output");
   }
 }

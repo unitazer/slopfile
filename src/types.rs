@@ -235,15 +235,6 @@ pub enum Confirmations {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-  #[default]
-  Idle,
-  WaitingAnswer,
-  WaitingSubagents,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Thinking {
   #[default]
@@ -347,7 +338,7 @@ impl AppConfig {
   }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfig {
   #[serde(default)]
   pub model: Option<String>,
@@ -393,10 +384,4 @@ impl ToolResult {
       meta: Value::Null,
     }
   }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LiveStatus {
-  pub phase: Phase,
-  pub model: String,
 }

@@ -53,5 +53,8 @@ services:
       SLOPFILE_TRANSCRIPTS: /shared/transcripts
       SLOPFILE_SKILLS_DIR: /shared/skills
       SLOPFILE_WORKDIR: /workspace
+      SF_ADDR: 0.0.0.0:8787
       RUST_LOG: slopfile=info,warn
+    ports:
+      - "127.0.0.1:8787:8787"
     restart: unless-stopped

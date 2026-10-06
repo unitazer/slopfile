@@ -2,7 +2,7 @@ FROM rust:1-slim AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --release --bin slopfile
 
 FROM archlinux:base-devel
 ENV RUSTUP_HOME=/usr/lib/rustup \

@@ -1,10 +1,12 @@
 pub mod api;
+pub mod context;
+pub mod control;
 pub mod daemon;
 pub mod docker;
 pub mod flow;
-pub mod lex;
 pub mod questions;
 pub mod research;
+pub mod session;
 mod sse;
 pub mod stream;
 pub mod tokens;
@@ -13,7 +15,6 @@ pub mod transcript;
 pub mod types;
 
 use std::path::{Path, PathBuf};
-use std::process::exit;
 
 pub fn discover_repo_root() -> Option<PathBuf> {
   let mut candidates = Vec::new();
@@ -83,91 +84,10 @@ pub fn scan_transcripts(dir: &str) -> Result<Vec<PathBuf>, String> {
   Ok(out)
 }
 
-pub fn cmd_init(path: &str, cfg: &types::AppConfig) {
-  match init_template_for(path, cfg) {
-    Ok(content) => match std::fs::write(path, content) {
-      Ok(()) => println!("initialized {path}"),
-      Err(e) => {
-        eprintln!("slopfile init: cannot write {path}: {e}");
-        exit(1);
-      }
-    },
-    Err(e) => {
-      eprintln!("slopfile init: {e}");
-      exit(1);
-    }
-  }
-}
-
-fn init_template_for(path: &str, cfg: &types::AppConfig) -> Result<String, String> {
-  if Path::new(path)
-    .file_stem()
-    .is_some_and(|s| s.to_string_lossy().contains(".sub-"))
-  {
-    return Err(format!("{path}: transcript names must not contain '.sub-' (reserved for subagents)"));
-  }
-  if let Ok(existing) = std::fs::read_to_string(path)
-    && !existing.trim().is_empty()
-  {
-    return Err(format!("{path} exists and is not empty; refusing to overwrite"));
-  }
-  Ok(flow::session_template(cfg))
-}
-
-pub fn cmd_abort(path: &str) {
-  let content = match std::fs::read_to_string(path) {
-    Ok(c) => c,
-    Err(e) => {
-      eprintln!("slopfile abort: cannot read {path}: {e}");
-      exit(1);
-    }
-  };
-  if transcript::abort_marker_present(&content) {
-    println!("abort already requested on {path}");
-    return;
-  }
-  let mut out = content;
-  if !out.is_empty() && !out.ends_with('\n') {
-    out.push('\n');
-  }
-  out.push_str(transcript::ABORT_MARKER);
-  out.push('\n');
-  if let Err(e) = std::fs::write(path, out) {
-    eprintln!("slopfile abort: cannot write {path}: {e}");
-    exit(1);
-  }
-  println!("abort requested on {path}; the daemon stops the turn on its next sweep");
-}
-
-pub async fn cmd_tokens(path: &str, cfg: &types::AppConfig) {
-  let text = match std::fs::read_to_string(path) {
-    Ok(t) => t,
-    Err(e) => {
-      eprintln!("slopfile tokens: cannot read {path}: {e}");
-      exit(1);
-    }
-  };
-  let pf = transcript::parse_file(&text);
-  let client = api::LlamaClient::new(&cfg.api_base);
-  let plan = match tokens::build_request_messages(&text, &pf, cfg, client.rest()).await {
-    Ok(v) => v,
-    Err(e) => {
-      eprintln!("slopfile tokens: {e}");
-      exit(1);
-    }
-  };
-  let context_budget = pf
-    .config
-    .max_context_tokens
-    .unwrap_or(cfg.max_context_tokens);
-
-  let headroom = context_budget.saturating_sub(plan.token_count as u32);
-
-  println!("tokens: {path}");
-  println!("  messages:    {} sent ({} oldest dropped to fit budget)", plan.messages.len(), plan.dropped);
-  println!("  model tokens: {}  (via llama-server /tokenize, content only)", plan.token_count);
-  println!("  context budget: {context_budget}  output allowance: {}", context_budget / 4);
-  println!("  input headroom: {headroom}");
+pub fn cmd_init(path: &str, cfg: &types::AppConfig) -> Result<(), String> {
+  control::create_session(Path::new(path), cfg, &[])?;
+  println!("initialized {path}");
+  Ok(())
 }
 
 #[cfg(test)]

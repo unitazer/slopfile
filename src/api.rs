@@ -42,6 +42,8 @@ impl From<SseError> for ApiError {
     }
 }
 
+pub const MAX_TOOL_CALLS: usize = 64;
+
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallAccumulator {
     calls: Vec<SseToolCallDelta>,
@@ -49,7 +51,10 @@ pub struct ToolCallAccumulator {
 
 impl ToolCallAccumulator {
     pub fn accumulate(&mut self, delta: &SseToolCallDelta) {
-        let idx = delta.index.unwrap_or(0);
+        // A single frame decides how big this Vec gets, and the endpoint is not trusted to be
+        // sane: `index: 10000000` would otherwise allocate gigabytes.
+        let idx = delta.index.unwrap_or(0) as usize;
+        let idx = idx.min(MAX_TOOL_CALLS - 1);
         while self.calls.len() <= idx {
             self.calls.push(SseToolCallDelta {
                 index: Some(self.calls.len()),
@@ -80,14 +85,27 @@ impl ToolCallAccumulator {
     }
 
     pub fn assemble(&self) -> Vec<ToolCall> {
+        let mut taken: Vec<String> = Vec::new();
         self.calls
             .iter()
-            .filter_map(|c| {
+            .enumerate()
+            .filter_map(|(ix, c)| {
                 let name = c.function.as_ref()?.name.clone()?;
+                // An endpoint that omits ids would otherwise pair two results with the same empty
+                // `tool_call_id`, and the model cannot tell which output belongs to which call.
+                let mut id = c.id.clone().unwrap_or_default();
+                if id.trim().is_empty() || taken.contains(&id) {
+                    id = format!("{name}-{ix}");
+                }
+                taken.push(id.clone());
                 Some(ToolCall::new(
-                    c.id.clone().unwrap_or_default(),
+                    id,
                     name,
-                    c.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default(),
+                    c
+                        .function
+                        .as_ref()
+                        .and_then(|f| f.arguments.clone())
+                        .unwrap_or_default(),
                 ))
             })
             .collect()
@@ -114,7 +132,7 @@ impl LlamaClient {
         self
     }
 
-    pub(crate) fn rest(&self) -> &reqwest::Client {
+    pub fn rest(&self) -> &reqwest::Client {
         &self.client
     }
 
@@ -138,7 +156,7 @@ impl LlamaClient {
         messages: &[ChatMessage],
         tools: Option<&[ToolDefinition]>,
         max_new_tokens: u32,
-        on_event: impl FnMut(StreamEvent) -> bool,
+        on_event: impl FnMut(StreamEvent),
         keep_going: impl FnMut() -> bool,
     ) -> Result<StreamResult, ApiError> {
         let body = serde_json::json!({
@@ -175,7 +193,7 @@ impl LlamaClient {
     pub async fn consume_stream<S>(
         &self,
         raw: S,
-        mut on_event: impl FnMut(StreamEvent) -> bool,
+        mut on_event: impl FnMut(StreamEvent),
         mut keep_going: impl FnMut() -> bool,
     ) -> Result<StreamResult, ApiError>
     where
@@ -190,12 +208,18 @@ impl LlamaClient {
             tokio::select! {
                 chunk = chunk_stream.next() => {
                     let Some(chunk) = chunk else { break; };
+                    // An abort must be honored as soon as the next chunk lands, not only when the
+                    // idle poll happens to fire.
+                    if !keep_going() {
+                        result.aborted = true;
+                        self.cancel_generation().await;
+                        break;
+                    }
                     let chunk = chunk.map_err(ApiError::from)?;
                     last_data = Instant::now();
                     if let Some(usage) = &chunk.usage {
                         result.usage = Some(usage.clone());
                     }
-                    let mut cont = true;
                     for choice in &chunk.choices {
                         if let Some(fr) = &choice.finish_reason {
                             result.finish_reason = Some(fr.clone());
@@ -203,32 +227,18 @@ impl LlamaClient {
                         let d = &choice.delta;
                         if let Some(text) = &d.content {
                             result.content.push_str(text);
-                            cont &= on_event(StreamEvent::Text(text.clone()));
-                        }
-                        if !cont {
-                            break;
+                            on_event(StreamEvent::Text(text.clone()));
                         }
                         if let Some(r) = &d.reasoning_content {
                             result.reasoning.push_str(r);
-                            cont &= on_event(StreamEvent::Reasoning(r.clone()));
-                        }
-                        if !cont {
-                            break;
+                            on_event(StreamEvent::Reasoning(r.clone()));
                         }
                         if let Some(tools) = &d.tool_calls {
                             for t in tools {
                                 acc.accumulate(t);
-                                cont &= on_event(StreamEvent::ToolCallFragment(t.clone()));
-                                if !cont {
-                                    break;
-                                }
+                                on_event(StreamEvent::ToolCallFragment(t.clone()));
                             }
                         }
-                    }
-                    if !cont {
-                        result.aborted = true;
-                        self.cancel_generation().await;
-                        break;
                     }
                 }
                 _ = tokio::time::sleep(KEEP_GOING_INTERVAL) => {
@@ -360,7 +370,6 @@ use super::*;
         let result = client
             .consume_stream(fake_bytes_stream(sse), |e| {
                 events.push(e);
-                true
             }, || true)
             .await
             .expect("stream");
@@ -386,7 +395,7 @@ use super::*;
             "data: [DONE]\n\n",
         ];
         let result = client
-            .consume_stream(fake_bytes_stream(sse), |_| true, || true)
+            .consume_stream(fake_bytes_stream(sse), |_| {}, || true)
             .await
             .expect("stream");
         assert_eq!(result.content, "Hi there");
@@ -395,7 +404,7 @@ use super::*;
     }
 
     #[tokio::test]
-    async fn returning_false_from_callback_aborts_the_stream() {
+    async fn keep_going_returning_false_aborts_the_stream() {
         let client = LlamaClient::new("http://localhost:9");
         let sse = vec![
             "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
@@ -403,20 +412,16 @@ use super::*;
             "data: {\"choices\":[{\"delta\":{\"content\":\" three\"}}]}\n\n",
             "data: [DONE]\n\n",
         ];
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen2 = seen.clone();
         let result = client
-            .consume_stream(fake_bytes_stream(sse), move |e| {
-                if let StreamEvent::Text(t) = &e {
-                    seen2.lock().unwrap().push(t.clone());
-                }
-                seen2.lock().unwrap().len() < 2
-            }, || true)
+            .consume_stream(fake_bytes_stream(sse), |_| {}, || false)
             .await
             .expect("stream");
-        assert!(result.aborted, "stream was aborted mid-flight");
-        assert_eq!(result.content, "one two");
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(result.aborted, "keep_going is what stops the stream now");
+        assert!(
+            !result.content.contains(" three"),
+            "the stream stops early: {:?}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -432,7 +437,7 @@ use super::*;
         let result = client
             .consume_stream(
                 SlowBytesStream::new(sse),
-                |_| true,
+                |_| {},
                 || {
                     if stop.get() {
                         return false;
@@ -459,7 +464,7 @@ use super::*;
             LlamaClient::new("http://localhost:9").with_idle_timeout(Duration::from_millis(150));
         let sse = vec!["data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"];
         let result = client
-            .consume_stream(SlowBytesStream::new(sse), |_| true, || true)
+            .consume_stream(SlowBytesStream::new(sse), |_| {}, || true)
             .await;
         assert!(
             matches!(result, Err(ApiError::Timeout(_))),
@@ -510,4 +515,47 @@ use super::*;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments, "{\"a\":1}");
     }
+}
+
+#[cfg(test)]
+mod accumulator_robustness_tests {
+  use super::*;
+  use crate::types::SseFunctionDelta;
+
+  #[test]
+  fn an_absurd_tool_call_index_cannot_size_the_accumulator() {
+    let mut acc = ToolCallAccumulator::default();
+    acc.accumulate(&SseToolCallDelta {
+      index: Some(10_000_000),
+      id: Some("a".into()),
+      r#type: None,
+      function: Some(SseFunctionDelta {
+        name: Some("bash".into()),
+        arguments: Some("{}".into()),
+      }),
+    });
+    let calls = acc.assemble();
+    assert_eq!(calls.len(), 1, "the index is bounded: {calls:?}");
+    assert_eq!(calls[0].name, "bash");
+  }
+
+  #[test]
+  fn parallel_calls_without_ids_still_get_distinct_ids() {
+    let mut acc = ToolCallAccumulator::default();
+    for (ix, name) in ["ls", "bash"].into_iter().enumerate() {
+      acc.accumulate(&SseToolCallDelta {
+        index: Some(ix),
+        id: None,
+        r#type: None,
+        function: Some(SseFunctionDelta {
+          name: Some(name.into()),
+          arguments: Some("{}".into()),
+        }),
+      });
+    }
+    let calls = acc.assemble();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_ne!(calls[0].id, calls[1].id, "ids must be distinct: {calls:?}");
+    assert!(!calls[0].id.is_empty());
+  }
 }

@@ -1,3 +1,6 @@
+use crate::control::{self, Cmd, Req};
+use crate::session::{self, Session};
+use crate::transcript;
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +18,7 @@ const EVAL_OUTPUT_CAP: usize = 4_000;
 
 #[derive(Debug, Clone)]
 pub struct ResearchOpts {
+  pub addr: String,
   pub workdir: PathBuf,
   pub transcripts_dir: PathBuf,
   pub model: String,
@@ -29,6 +33,7 @@ pub struct ResearchOpts {
 impl Default for ResearchOpts {
   fn default() -> Self {
     Self {
+      addr: control::DEFAULT_ADDR.to_string(),
       workdir: PathBuf::from("."),
       transcripts_dir: PathBuf::from("transcripts"),
       model: String::new(),
@@ -75,8 +80,11 @@ pub async fn run(opts: ResearchOpts) -> Result<(), String> {
     let journal = std::fs::read_to_string(opts.workdir.join(JOURNAL_FILE)).unwrap_or_default();
     let path = seed_transcript(&opts, &agents_md, &journal, best, iter)?;
     info!("→ seeded {} (iter {iter})", path.display());
+    // Seeding only writes the prompt. Nothing runs until the session is armed over the control
+    // channel, so a driver that forgot this would just wait out the iteration timeout.
+    arm(&opts.addr, &path).await?;
 
-    let outcome = wait_for_iteration(&path, opts.poll_ms, opts.iter_timeout_secs).await?;
+    let outcome = wait_for_iteration(&path, &opts.addr, opts.poll_ms, opts.iter_timeout_secs).await?;
     if outcome.aborted {
       warn!("✗ iter {iter}: session was aborted");
     }
@@ -337,15 +345,22 @@ Rules:\n\
   )
 }
 
-pub fn research_session_template(model: &str, seed_prompt: &str) -> String {
-  let mut tools = crate::flow::DEFAULT_TOOLS.to_vec();
-  tools.retain(|t| *t != "subagent");
-  tools.push("solve");
-  format!(
-    "{}# Session\n{RESEARCH_SYSTEM_PROMPT}\n\n### You\n{seed_prompt}\n{}\n",
-    crate::flow::session_header(model, &tools, &["question".to_string()]),
-    crate::transcript::SEND_MARKER
-  )
+pub fn research_session_template(model: &str, seed_prompt: &str) -> Session {
+  let tools: Vec<String> = crate::flow::DEFAULT_TOOLS
+    .iter()
+    .filter(|t| **t != "subagent")
+    .map(|t| t.to_string())
+    .chain(std::iter::once("solve".to_string()))
+    .collect();
+  let config = session::SessionConfig {
+    model: Some(model.to_string()),
+    tools: Some(tools),
+    tools_excluded: vec!["question".to_string()],
+    ..Default::default()
+  };
+  let mut session = Session::new(config, RESEARCH_SYSTEM_PROMPT);
+  session.input = seed_prompt.to_string();
+  session
 }
 
 pub fn seed_transcript(
@@ -357,8 +372,7 @@ pub fn seed_transcript(
 ) -> Result<PathBuf, String> {
   let prompt = seed_prompt(iter, agents_md, journal, best, opts.maximize, &opts.eval_cmd);
   let path = opts.transcripts_dir.join(format!("research-{iter:03}.md"));
-  std::fs::write(&path, research_session_template(&opts.model, &prompt))
-    .map_err(|e| format!("write {}: {e}", path.display()))?;
+  transcript::save(&path, &research_session_template(&opts.model, &prompt))?;
   Ok(path)
 }
 
@@ -382,28 +396,83 @@ pub fn next_iter_number(transcripts_dir: &Path) -> u32 {
   max + 1
 }
 
+async fn arm(addr: &str, path: &Path) -> Result<(), String> {
+  let session = path
+    .file_stem()
+    .map(|s| s.to_string_lossy().into_owned())
+    .unwrap_or_default();
+  let resp = control::send_command(
+    addr,
+    &Req {
+      cmd: Cmd::Send,
+      session,
+      answers: vec![],
+    },
+  )
+  .await
+  .map_err(|e| format!("cannot arm {}: {e}", path.display()))?;
+  if !resp.ok {
+    return Err(format!(
+      "cannot arm {}: {}",
+      path.display(),
+      resp.error.unwrap_or_else(|| "command failed".into())
+    ));
+  }
+  Ok(())
+}
+
+async fn ask_status(addr: &str, session: &str) -> Result<control::Status, String> {
+  let resp = control::send_command(
+    addr,
+    &Req {
+      cmd: Cmd::Status,
+      session: format!("{session}.md"),
+      answers: vec![],
+    },
+  )
+  .await
+  .map_err(|e| e.to_string())?;
+  if !resp.ok {
+    return Err(resp.error.unwrap_or_else(|| "status failed".to_string()));
+  }
+  resp
+    .status
+    .ok_or_else(|| "daemon sent no status".to_string())
+}
+
 async fn wait_for_iteration(
   path: &Path,
+  addr: &str,
   poll_ms: u64,
   timeout_secs: u64,
 ) -> Result<IterationResult, String> {
   let started = std::time::Instant::now();
+  let session = control::session_name(path);
   loop {
     tokio::time::sleep(Duration::from_millis(poll_ms)).await;
-    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    if text.contains(crate::lex::SOLVED_MARKER) {
+    // This driver is a separate process from the daemon, so campaign state has to be asked for
+    // over the control channel rather than read out of this process's own registry.
+    let status = match ask_status(addr, &session).await {
+      Ok(status) => status,
+      Err(e) => {
+        warn!("{}: cannot reach the daemon ({e}); assuming the iteration is still running", path.display());
+        control::Status {
+          session: session.clone(),
+          ..Default::default()
+        }
+      }
+    };
+    if status.solved {
       return Ok(IterationResult { solved: true, aborted: false });
     }
-    if text.contains(crate::lex::ABORTED_MARKER) {
-      return Ok(IterationResult { solved: false, aborted: true });
-    }
-    if text.contains(crate::lex::CONTEXT_FULL_PREFIX) {
+    if status.context_full {
       warn!(
         "{}: model exhausted its context mid-iteration; discarding this attempt",
         path.display()
       );
       return Ok(IterationResult { solved: false, aborted: false });
     }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     if iteration_finished(&text) {
       return Ok(IterationResult { solved: false, aborted: false });
     }
@@ -412,11 +481,18 @@ async fn wait_for_iteration(
         "{}: iteration exceeded {timeout_secs}s; requesting abort",
         path.display()
       );
-      let (body, live) = crate::transcript::strip_live_line(&text);
-      crate::transcript::write_file(
-        path,
-        crate::transcript::reassemble(&body, &format!("{}\n", crate::lex::ABORT_MARKER), live.as_deref()),
-      )?;
+      let req = Req {
+        cmd: Cmd::Abort,
+        session: path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+        answers: vec![],
+      };
+      if let Err(e) = control::send_command(addr, &req).await {
+        error!(
+          "{}: abort request failed ({e}); the iteration is still running",
+          path.display()
+        );
+        continue;
+      }
       return Ok(IterationResult { solved: false, aborted: true });
     }
   }
@@ -435,7 +511,8 @@ async fn wait_until_settled(path: &Path, poll_ms: u64) {
 }
 
 pub fn iteration_finished(text: &str) -> bool {
-  crate::transcript::turn_cycle_complete(text)
+  let (session, report) = session::parse(text);
+  report.is_clean() && session.is_finished() && session.turns.iter().any(session::Turn::has_output)
 }
 
 #[derive(Serialize)]
@@ -655,37 +732,50 @@ mod tests {
     assert!(text.contains("--- BEGIN AGENTS.md ---\nmake it fast"), "{text}");
     assert!(text.contains("(JOURNAL.md does not exist yet"), "{text}");
     assert!(text.contains("No baseline exists yet"), "{text}");
-    assert!(text.ends_with("<!-- slopfile:send -->\n"), "armed immediately: {text}");
+    let input_at = text.rfind("<!-- slopfile:input -->").expect("input region");
+    let seed_at = text.find("--- BEGIN AGENTS.md ---").expect("seed");
+    assert!(seed_at > input_at, "the seed prompt is the input region: {text}");
+    assert!(!text.contains("<!-- slopfile:user -->"), "nothing promoted yet");
 
-    assert!(!iteration_finished(&text));
+    assert!(!iteration_finished(&text), "seeded input is not finished");
 
-    let done = format!(
-      "```toml\nmodel = \"m\"\n```\n# Session\nsys\n\n### You\ngo\n\n### Assistant\ntried a thing\n{}\n",
-      crate::lex::DONE_MARKER
-    );
-    assert!(iteration_finished(&done));
+    let mut done = seed_session(&text);
+    done.input.clear();
+    done.promote_input();
+    done.begin_round();
+    done.push_text("tried a thing");
+    done.close_turn();
+    assert!(iteration_finished(&done.render()));
 
-    let dangling = "```toml\nmodel = \"m\"\n```\n# Session\nsys\n\n### You\ngo\n\n### Assistant\npartial thought".to_string();
-    assert!(!iteration_finished(&dangling));
+    let mut dangling = seed_session(&text);
+    dangling.input.clear();
+    dangling.promote_input();
+    dangling.begin_round();
+    dangling.push_text("partial thought");
+    assert!(!iteration_finished(&dangling.render()), "open section: still running");
 
-    let queued = format!("{done}\ncome back\n");
-    assert!(!iteration_finished(&queued));
+    let mut queued = done.clone();
+    queued.input = "come back\n".into();
+    assert!(!iteration_finished(&queued.render()), "queued input: not finished");
 
     std::fs::remove_dir_all(&dir).ok();
   }
 
   #[test]
-  fn solve_marker_is_daemon_owned_and_never_a_draft() {
-    use crate::lex::{lex, TokKind};
-    let text = format!(
-      "### Assistant\ndone deal\n{}\n{}\n",
-      crate::lex::SOLVED_MARKER,
-      crate::lex::DONE_MARKER
-    );
-    let kinds: Vec<TokKind> = lex(&text).into_iter().map(|t| t.kind).collect();
-    assert!(kinds.contains(&TokKind::Solved), "marker lexed as Solved: {kinds:?}");
-    assert!(crate::transcript::tail_user_text(&text).is_none(), "solved marker is not user text");
-    assert!(crate::transcript::draft_tail(&text).is_none(), "solved marker is not a draft");
+  fn a_solved_iteration_is_finished() {
+    let mut s = seed_session("x");
+    s.input.clear();
+    s.promote_input();
+    s.begin_round();
+    s.push_text("done deal");
+    s.close_turn();
+    assert!(iteration_finished(&s.render()));
+  }
+
+  fn seed_session(text: &str) -> Session {
+    let (session, report) = session::parse(text);
+    assert!(report.is_clean(), "{report:?}");
+    session
   }
 
   #[test]
@@ -725,21 +815,30 @@ mod tests {
   }
 
   #[test]
-  fn research_session_template_arms_with_send_marker() {
+  fn research_session_template_seeds_the_input_region() {
     let tpl = research_session_template("qwen", "do the thing\nsecond line\n");
-    assert!(tpl.contains("model = \"qwen\""));
-    assert!(tpl.contains(RESEARCH_SYSTEM_PROMPT));
+    assert_eq!(tpl.config.model.as_deref(), Some("qwen"));
+    assert_eq!(tpl.system, RESEARCH_SYSTEM_PROMPT);
+    assert_eq!(tpl.input, "do the thing\nsecond line\n");
+    let text = tpl.render();
     assert!(
-      tpl.ends_with("### You\ndo the thing\nsecond line\n\n<!-- slopfile:send -->\n"),
-      "tail: {}", &tpl[tpl.len().saturating_sub(120)..]
+      text.ends_with("<!-- slopfile:input -->\ndo the thing\nsecond line\n"),
+      "tail: {}",
+      &text[text.len().saturating_sub(120)..]
+    );
+    assert!(
+      tpl.config.tools.as_ref().unwrap().contains(&"solve".to_string())
+        && !tpl.config.tools.as_ref().unwrap().contains(&"subagent".to_string()),
+      "{:?}",
+      tpl.config.tools
     );
 
-    let pf = crate::transcript::parse_file(&tpl);
-    assert_eq!(pf.history.len(), 2, "system + seeded user turn: {:?}", pf.history);
-    assert_eq!(pf.history[0].role, crate::types::Role::System);
-    assert_eq!(pf.history[1].role, crate::types::Role::User);
+    let messages = tpl.request_messages();
+    assert_eq!(messages.len(), 2, "system + seeded input: {messages:?}");
+    assert_eq!(messages[0].role, crate::types::Role::System);
+    assert_eq!(messages[1].role, crate::types::Role::User);
     assert!(
-      pf.history[1]
+      messages[1]
         .content
         .as_deref()
         .is_some_and(|c| c.contains("do the thing")),

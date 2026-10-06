@@ -15,6 +15,8 @@
         packages = with pkgs; [
           rustc
           cargo
+          rustfmt
+          rust-analyzer
           docker
           docker-compose
           neovim
