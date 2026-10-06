@@ -7,10 +7,18 @@ use tracing::warn;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
+fn fingerprint(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+  let md = std::fs::metadata(path).ok()?;
+  Some((md.modified().ok()?, md.len()))
+}
+
 pub struct StreamWriter {
   path: PathBuf,
   session: Session,
   last_flush: Instant,
+  /// (mtime, len) of the file as of our own last write, so the common case costs one `stat`
+  /// instead of a full re-read and re-parse twenty times a second.
+  last_written: Option<(std::time::SystemTime, u64)>,
 }
 
 impl StreamWriter {
@@ -19,6 +27,7 @@ impl StreamWriter {
       path: path.to_path_buf(),
       session,
       last_flush: Instant::now(),
+      last_written: fingerprint(path),
     }
   }
 
@@ -83,8 +92,10 @@ impl StreamWriter {
     }
     self.last_flush = Instant::now();
     self.absorb_user_input();
-    if let Err(e) = transcript::write_file(&self.path, self.session.render()) {
-      warn!("stream write failed: {e}");
+    let rendered = self.session.render();
+    match transcript::write_file(&self.path, rendered) {
+      Ok(()) => self.last_written = fingerprint(&self.path),
+      Err(e) => warn!("stream write failed: {e}"),
     }
   }
 
@@ -92,6 +103,12 @@ impl StreamWriter {
   /// saved into the file while the answer streams is missing from it. Carry that forward before
   /// rendering, or the next flush silently deletes the words they just typed.
   fn absorb_user_input(&mut self) {
+    // Our own write is the overwhelmingly common case; only re-read when the file is not exactly
+    // what we last left there, which means the human saved something.
+    let now = fingerprint(&self.path);
+    if now.is_none() || now == self.last_written {
+      return;
+    }
     let Ok(on_disk) = transcript::load(&self.path) else {
       return;
     };

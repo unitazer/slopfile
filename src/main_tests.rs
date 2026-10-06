@@ -1596,11 +1596,13 @@ async fn truncating_a_command_is_not_reported_as_a_failed_command() {
     None,
   )
   .await;
-  assert!(r.ok, "a command we merely stopped reading was called a failure: {}", r.output);
+  // Truncating means we SIGPIPE the writer, so the real exit status is unknowable. We must not
+  // claim it passed, and we must not invent a failure code either: say "unknown".
+  assert!(!r.ok, "a stopped-early command was reported as a definite success");
   assert!(
-    r.output.contains("truncated"),
-    "the model is not told why the output stops: {:?}",
-    r.output.chars().rev().take(120).collect::<String>()
+    r.output.contains("unknown") && r.output.contains("truncated"),
+    "the model is not told the status is unknowable: {:?}",
+    r.output.chars().rev().take(160).collect::<String>()
   );
 }
 
@@ -1688,5 +1690,60 @@ fn a_question_cannot_answer_itself() {
     None,
     "the model answered its own question: {:?}",
     crate::questions::answer_text(&rendered)
+  );
+}
+
+#[tokio::test]
+async fn a_failed_command_is_not_laundered_into_a_success_by_truncation() {
+  // Both too much output AND a real failure: the exit code is the command's own, so it failed.
+  let wd = scratch("failed-truncated");
+  std::fs::create_dir_all(&wd).unwrap();
+  let r = tools::run(
+    "bash",
+    r#"{"command":"i=0; while [ $i -lt 20000 ]; do echo \"line $i aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; i=$((i+1)); done; exit 3"}"#,
+    wd.clone(),
+    30_000,
+    &[],
+    None,
+  )
+  .await;
+  // We stop reading before the child reaches `exit 3`, so 3 is genuinely unobservable. The point is
+  // that we must not report success: an unknowable status is reported as unknown, never as "ok".
+  assert!(!r.ok, "a stopped-early command was reported as a definite success");
+  assert!(
+    r.output.contains("unknown"),
+    "an unknowable status must be reported as unknown: {:?}",
+    r.output.chars().rev().take(160).collect::<String>()
+  );
+}
+
+#[tokio::test]
+async fn a_killed_command_that_was_not_truncated_is_still_a_failure() {
+  let wd = scratch("killed");
+  std::fs::create_dir_all(&wd).unwrap();
+  let r = tools::run(
+    "bash",
+    r#"{"command":"kill -9 $$"}"#,
+    wd.clone(),
+    30_000,
+    &[],
+    None,
+  )
+  .await;
+  assert!(!r.ok, "a command killed by a signal was called a success: {}", r.output);
+}
+
+#[test]
+fn the_model_cannot_skip_its_own_question() {
+  let qs = vec![crate::questions::Question {
+    id: 1,
+    question: "Ship it?\n/skip".into(),
+    answers: vec!["yes".into(), "no".into()],
+    default: Some("yes".into()),
+  }];
+  let rendered = crate::questions::render_block(&qs);
+  assert!(
+    !crate::questions::is_skip(&rendered),
+    "a /skip line in the model's own question text auto-resolved the question"
   );
 }

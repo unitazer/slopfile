@@ -466,22 +466,30 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
         combined.push_str(&stderr_s);
       }
       let combined = truncate(&combined);
-      // Dropping the pipe kills the writer with SIGPIPE, so a command we merely stopped reading
-      // looks exactly like a failed one. Reporting that as failure makes the model conclude the
-      // build broke, so say what actually happened instead.
-      if truncated {
-        return ToolResult::ok(format!(
-          "{combined}\n[output truncated at {BASH_OUTPUT_CAP} chars; the exit status is meaningless because the command was still writing when we stopped reading]"
-        ));
-      }
-      if status.success() {
-        ToolResult::ok(combined)
+      let real_code = status.code();
+      let note = if truncated {
+        format!(
+          "\n[output truncated at {BASH_OUTPUT_CAP} chars; the command was still writing when we stopped reading, so its exit status is unknown — re-run with the output redirected to a file to see whether it succeeded]"
+        )
       } else {
-        let code = status
-          .code()
-          .map(|c| c.to_string())
-          .unwrap_or_else(|| "signal".to_string());
-        ToolResult::err(format!("bash: exit {code}:\n{combined}"))
+        String::new()
+      };
+      match (status.success(), real_code, truncated) {
+        // We watched it exit cleanly, so it succeeded even if we cut the output short.
+        (true, _, true) => return ToolResult::ok(format!("{combined}{note}")),
+        (true, _, false) => return ToolResult::ok(combined),
+        // A real exit code is the command's own verdict, truncation or not: it failed.
+        (false, Some(code), _) => {
+          return ToolResult::err(format!("bash: exit {code}:\n{combined}{note}"));
+        }
+        // Signal death *because we truncated* means we killed it, so we cannot claim it passed.
+        (false, None, true) => {
+          return ToolResult::err(format!(
+            "bash: the command produced more than {BASH_OUTPUT_CAP} chars and was stopped while still writing, so whether it succeeded is unknown:\n{combined}{note}"
+          ));
+        }
+        // A signal death we did not cause is a genuine crash.
+        (false, None, false) => return ToolResult::err(format!("bash: killed by signal:\n{combined}")),
       }
     }
   }

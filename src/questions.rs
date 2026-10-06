@@ -67,13 +67,18 @@ pub fn render_block(qs: &[Question]) -> String {
     out
 }
 
+/// Everything at or after the answer prompt, which is the part only the human writes.
+fn after_answer_prompt(input: &str) -> &str {
+  match input.rfind(ANSWER_PROMPT) {
+    Some(at) => &input[at + ANSWER_PROMPT.len()..],
+    None => input,
+  }
+}
+
 pub fn answer_text(input: &str) -> Option<String> {
   // Anything at or after the answer prompt was written by the human; the model only ever writes
   // above it, so a "> 1" line inside its own question text cannot pass for an answer.
-  let body = match input.rfind(ANSWER_PROMPT) {
-    Some(at) => &input[at + ANSWER_PROMPT.len()..],
-    None => input,
-  };
+  let body = after_answer_prompt(input);
   let mut found = None;
   for line in body.lines() {
     let t = line.trim();
@@ -92,7 +97,9 @@ pub fn answer_text(input: &str) -> Option<String> {
 }
 
 pub fn is_skip(input: &str) -> bool {
-  input.lines().any(|l| {
+  // Only the human's half of the region counts. A "/skip" line inside the model's own question
+  // text would otherwise auto-resolve the question it just asked, with the defaults.
+  after_answer_prompt(input).lines().any(|l| {
     let t = l.trim();
     t == SKIP || t.strip_prefix('>').map(str::trim) == Some(SKIP)
   })
