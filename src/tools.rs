@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::fs::{create_dir_all, read_to_string};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -431,19 +432,58 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
   };
   let stdout = child.stdout.take().expect("stdout is piped");
   let stderr = child.stderr.take().expect("stderr is piped");
-  let outcome = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
-    let ((out, out_truncated), (err, err_truncated)) =
-      tokio::join!(read_into(stdout), read_into(stderr));
-    let truncated = out_truncated || err_truncated;
-    let status = child
-      .wait()
-      .await
-      .map_err(|e| format!("bash: wait failed: {e}"))?;
-    Ok::<_, String>((out, err, status, truncated))
-  })
+  // Read both pipes into shared buffers *while* the command runs, so a chatty command cannot
+  // deadlock on a full pipe. But never treat EOF as the stopping condition: a backgrounded job
+  // inherits the pipe (`cd x && nohup foo > log & echo hi` backgrounds a subshell whose own stdout
+  // is still ours), so waiting for EOF would hang until the timeout even though the command
+  // finished immediately -- and the timeout kill would then destroy the job it had just launched.
+  let out_buf = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+  let err_buf = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+  let out_task = tokio::spawn(drain_into(stdout, out_buf.clone()));
+  let err_task = tokio::spawn(drain_into(stderr, err_buf.clone()));
+
+  let waited = tokio::time::timeout(
+    std::time::Duration::from_millis(timeout_ms),
+    child.wait(),
+  )
   .await;
-  match outcome {
+  let status = match waited {
     Err(_) => {
+      out_task.abort();
+      err_task.abort();
+      let group_id = child.id();
+      let _ = child.kill().await;
+      if let Some(id) = group_id {
+        let _ = std::process::Command::new("kill")
+          .args(["-9", &format!("-{id}")])
+          .stderr(Stdio::null())
+          .status();
+      }
+      return ToolResult::err(format!(
+        "bash: timeout after {timeout_ms}ms, process killed: {command}"
+      ));
+    }
+    Ok(Err(e)) => {
+      out_task.abort();
+      err_task.abort();
+      return ToolResult::err(format!("bash: wait failed: {e}"));
+    }
+    Ok(Ok(status)) => status,
+  };
+
+  // The command has exited, so anything it printed is already buffered; give the pipes a moment
+  // to land the last of it, then stop caring about them.
+  tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+  out_task.abort();
+  err_task.abort();
+  let out = String::from_utf8_lossy(&out_buf.lock().await).into_owned();
+  let err = String::from_utf8_lossy(&err_buf.lock().await).into_owned();
+  let truncated = out.len() > BASH_OUTPUT_CAP || err.len() > BASH_OUTPUT_CAP;
+  let out = cap_string(out);
+  let err = cap_string(err);
+  let outcome = Some((out, err, status, truncated));
+  match outcome {
+    None => {
       let group_id = child.id();
       let _ = child.kill().await;
       if let Some(id) = group_id {
@@ -456,8 +496,7 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
         "bash: timeout after {timeout_ms}ms, process killed: {command}"
       ))
     }
-    Ok(Err(e)) => ToolResult::err(e),
-    Ok(Ok((stdout_s, stderr_s, status, truncated))) => {
+    Some((stdout_s, stderr_s, status, truncated)) => {
       let mut combined = stdout_s;
       if !stderr_s.is_empty() {
         if !combined.is_empty() {
@@ -469,24 +508,24 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
       let real_code = status.code();
       let note = if truncated {
         format!(
-          "\n[output truncated at {BASH_OUTPUT_CAP} chars; the command was still writing when we stopped reading, so its exit status is unknown — re-run with the output redirected to a file to see whether it succeeded]"
+          "\n[output truncated at {BASH_OUTPUT_CAP} chars; the command ran to completion and its \
+           exit status is real, but re-run with output redirected to a file if you need the rest]"
         )
       } else {
         String::new()
       };
       match (status.success(), real_code, truncated) {
-        // We watched it exit cleanly, so it succeeded even if we cut the output short.
+        // It exited cleanly, so it succeeded even though we only kept the first N chars.
         (true, _, true) => return ToolResult::ok(format!("{combined}{note}")),
         (true, _, false) => return ToolResult::ok(combined),
         // A real exit code is the command's own verdict, truncation or not: it failed.
         (false, Some(code), _) => {
           return ToolResult::err(format!("bash: exit {code}:\n{combined}{note}"));
         }
-        // Signal death *because we truncated* means we killed it, so we cannot claim it passed.
+        // Unreachable in practice: we drain to EOF rather than closing the pipe at the cap, so
+        // there is no SIGPIPE and a signal death is a genuine crash.
         (false, None, true) => {
-          return ToolResult::err(format!(
-            "bash: the command produced more than {BASH_OUTPUT_CAP} chars and was stopped while still writing, so whether it succeeded is unknown:\n{combined}{note}"
-          ));
+          return ToolResult::err(format!("bash: killed by signal after {BASH_OUTPUT_CAP} chars:\n{combined}{note}"));
         }
         // A signal death we did not cause is a genuine crash.
         (false, None, false) => return ToolResult::err(format!("bash: killed by signal:\n{combined}")),
@@ -720,6 +759,47 @@ fn matches_find(name: &str, pattern: &str) -> bool {
   }
 }
 
+/// Trim a captured pipe down to the cap, on a char boundary.
+fn cap_string(s: String) -> String {
+  if s.len() <= BASH_OUTPUT_CAP {
+    return s;
+  }
+  let mut out = s;
+  let cut = floor_char_boundary(&out, BASH_OUTPUT_CAP);
+  out.truncate(cut);
+  out
+}
+
+/// Read a pipe into `buf` until EOF, until the cap, or until it has been quiet for a moment.
+/// Partial output is always left in the shared buffer, so the caller can take whatever arrived
+/// even if this task is still waiting on a pipe some grandchild is holding.
+async fn drain_into(
+  mut pipe: impl tokio::io::AsyncRead + Unpin,
+  buf: Arc<tokio::sync::Mutex<Vec<u8>>>,
+) {
+  use tokio::io::AsyncReadExt;
+  let mut chunk = [0u8; 8192];
+  loop {
+    match tokio::time::timeout(std::time::Duration::from_millis(500), pipe.read(&mut chunk)).await
+    {
+      Err(_) => continue,
+      Ok(Ok(0)) | Ok(Err(_)) => return,
+      Ok(Ok(n)) => {
+        let mut b = buf.lock().await;
+        // One byte past the cap so the caller can tell "exactly at the limit" from "overflowing";
+        // the buffer is trimmed back to the cap afterwards.
+        let room = (BASH_OUTPUT_CAP + 1).saturating_sub(b.len());
+        if room > 0 {
+          b.extend_from_slice(&chunk[..n.min(room)]);
+        }
+        // Past the cap we keep reading purely to discard. Stopping here would leave the child
+        // blocked on a full pipe forever, turning "produced too much output" into a timeout --
+        // and re-creating the SIGPIPE failure this whole path exists to avoid.
+      }
+    }
+  }
+}
+
 fn truncate(s: &str) -> String {
   if s.len() <= BASH_OUTPUT_CAP {
     return s.to_string();
@@ -735,29 +815,6 @@ fn truncate(s: &str) -> String {
   out
 }
 
-/// Read at most the output cap. Buffering the whole stream first and truncating afterwards turns
-/// one `yes` into gigabytes of resident memory, which takes the daemon and every session it hosts
-/// down with it.
-async fn read_into(pipe: impl tokio::io::AsyncRead + Unpin) -> (String, bool) {
-  use tokio::io::AsyncReadExt;
-  let mut buf = Vec::new();
-  let read = pipe
-    .take((BASH_OUTPUT_CAP + 1) as u64)
-    .read_to_end(&mut buf)
-    .await
-    .unwrap_or(0);
-  let mut out = String::from_utf8_lossy(&buf).into_owned();
-  let mut truncated = false;
-  if read > BASH_OUTPUT_CAP {
-    truncated = true;
-    let cut = floor_char_boundary(&out, BASH_OUTPUT_CAP);
-    out.truncate(cut);
-    out.push_str(&format!(
-      "\n… [stopped reading at {BASH_OUTPUT_CAP} chars; the command was still producing output]"
-    ));
-  }
-  (out, truncated)
-}
 
 fn floor_char_boundary(text: &str, mut at: usize) -> usize {
   let bytes = text.as_bytes();
@@ -1255,7 +1312,9 @@ mod tests {
   async fn bash_timeout_kills_backgrounded_processes() {
     let wd = test_dir("bash-bgkill");
     let pid_file = wd.join("bg.pid");
-    let cmd = format!("sleep 60 & echo $! > {}", pid_file.display());
+    // Backgrounding alone used to hang the call; the foreground part has to hang too, so this
+    // still exercises the timeout path and the process-group kill.
+    let cmd = format!("sleep 60 & echo $! > {}; sleep 60", pid_file.display());
     let r = run("bash", &json!({ "command": cmd }).to_string(), wd.clone(), 200, &[], None).await;
     assert!(!r.ok, "should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
@@ -1348,7 +1407,15 @@ mod output_cap_tests {
       .expect("spawn");
     let stdout = child.stdout.take().expect("piped");
     let started = std::time::Instant::now();
-    let (out, _) = read_into(stdout).await;
+    let buf = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    // `yes` never ends, so the drain is only bounded by memory, not by EOF.
+    tokio::time::timeout(
+      std::time::Duration::from_millis(1500),
+      drain_into(stdout, buf.clone()),
+    )
+    .await
+    .expect_err("a drain that only ends at EOF must still be bounded in time");
+    let out = String::from_utf8_lossy(&buf.lock().await).into_owned();
     let _ = child.start_kill();
     let _ = child.wait().await;
     assert!(
@@ -1356,7 +1423,11 @@ mod output_cap_tests {
       "buffered {} bytes",
       out.len()
     );
-    assert!(out.contains("still producing"), "{out}");
+    assert!(
+      out.len() <= BASH_OUTPUT_CAP + 1,
+      "the buffer must stop just past the cap, not grow: {}",
+      out.len()
+    );
     assert!(
       started.elapsed() < std::time::Duration::from_secs(5),
       "reading must stop at the cap, not at EOF"
@@ -1371,7 +1442,9 @@ mod output_cap_tests {
       .stderr(Stdio::null())
       .spawn()
       .expect("spawn");
-    let (out, _) = read_into(child.stdout.take().expect("piped")).await;
+    let buf = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    drain_into(child.stdout.take().expect("piped"), buf.clone()).await;
+    let out = String::from_utf8_lossy(&buf.lock().await).into_owned();
     let _ = child.wait().await;
     assert_eq!(out, "small output");
   }

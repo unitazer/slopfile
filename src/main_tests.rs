@@ -1596,12 +1596,12 @@ async fn truncating_a_command_is_not_reported_as_a_failed_command() {
     None,
   )
   .await;
-  // Truncating means we SIGPIPE the writer, so the real exit status is unknowable. We must not
-  // claim it passed, and we must not invent a failure code either: say "unknown".
-  assert!(!r.ok, "a stopped-early command was reported as a definite success");
+  // We drain to EOF rather than closing the pipe at the cap, so the command runs to completion
+  // and its exit status is genuine: this one really did succeed.
+  assert!(r.ok, "a successful command was reported as a failure: {}", r.output);
   assert!(
-    r.output.contains("unknown") && r.output.contains("truncated"),
-    "the model is not told the status is unknowable: {:?}",
+    r.output.contains("truncated"),
+    "the model is not told the output was cut: {:?}",
     r.output.chars().rev().take(160).collect::<String>()
   );
 }
@@ -1707,12 +1707,11 @@ async fn a_failed_command_is_not_laundered_into_a_success_by_truncation() {
     None,
   )
   .await;
-  // We stop reading before the child reaches `exit 3`, so 3 is genuinely unobservable. The point is
-  // that we must not report success: an unknowable status is reported as unknown, never as "ok".
-  assert!(!r.ok, "a stopped-early command was reported as a definite success");
+  // Truncation must not launder a real failure: the command exits 3, so it failed.
+  assert!(!r.ok, "a command that exited 3 was reported as success");
   assert!(
-    r.output.contains("unknown"),
-    "an unknowable status must be reported as unknown: {:?}",
+    r.output.contains("exit 3"),
+    "the real exit code is missing: {:?}",
     r.output.chars().rev().take(160).collect::<String>()
   );
 }
@@ -1870,4 +1869,98 @@ fn a_subagent_is_never_offered_the_question_tool() {
   // And a parent session keeps it.
   let parent = flow::session_template(&cfg, &[]);
   assert!(crate::tools::advertised(&parent.config).iter().any(|t| t.function.name == "question"));
+}
+
+// ---- backgrounding a job must not hang the call
+
+#[tokio::test]
+async fn backgrounding_a_long_job_returns_immediately_with_its_output() {
+  let wd = scratch("bg-job");
+  std::fs::create_dir_all(&wd).unwrap();
+  // `A && B & C` backgrounds a *subshell* whose stdout is still ours, so waiting for pipe EOF
+  // hung this call until the timeout and then the group kill destroyed the job.
+  let r = tools::run(
+    "bash",
+    &json!({
+      "command": format!("cd {} && nohup sleep 120 > bg.log 2>&1 & echo \"started pid $!\"", wd.display())
+    })
+    .to_string(),
+    wd.clone(),
+    20_000,
+    &[],
+    None,
+  )
+  .await;
+  assert!(r.ok, "backgrounding a job should succeed: {}", r.output);
+  assert!(
+    r.output.contains("started pid"),
+    "the foreground output was thrown away: {:?}",
+    r.output
+  );
+  let pid: i32 = r
+    .output
+    .split_whitespace()
+    .nth(2)
+    .and_then(|p| p.parse().ok())
+    .expect("a pid in the output");
+  let alive = std::process::Command::new("kill")
+    .args(["-0", &pid.to_string()])
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false);
+  assert!(alive, "the harness killed the job it had just launched (pid {pid})");
+  let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
+#[tokio::test]
+async fn a_hung_foreground_command_still_times_out_and_kills_its_children() {
+  let wd = scratch("bg-hang");
+  std::fs::create_dir_all(&wd).unwrap();
+  let pid_file = wd.join("bg.pid");
+  let r = tools::run(
+    "bash",
+    &json!({ "command": format!("sleep 120 & echo $! > {}; sleep 120", pid_file.display()) }).to_string(),
+    wd.clone(),
+    400,
+    &[],
+    None,
+  )
+  .await;
+  assert!(!r.ok, "a hung command must time out");
+  assert!(r.output.contains("timeout"), "{}", r.output);
+  let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+  tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+  let alive = std::process::Command::new("kill")
+    .args(["-0", &pid.to_string()])
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false);
+  assert!(!alive, "the process-group kill missed the background child {pid}");
+}
+
+#[tokio::test]
+async fn a_command_producing_too_much_output_still_runs_to_completion() {
+  let wd = scratch("cap-complete");
+  std::fs::create_dir_all(&wd).unwrap();
+  let started = std::time::Instant::now();
+  let r = tools::run(
+    "bash",
+    r#"{"command":"seq 1 20000; echo TAILMARKER"}"#,
+    wd.clone(),
+    20_000,
+    &[],
+    None,
+  )
+  .await;
+  assert!(
+    started.elapsed() < std::time::Duration::from_secs(10),
+    "stopping the read at the cap blocks the child on a full pipe: {:?}",
+    started.elapsed()
+  );
+  assert!(r.ok, "a successful command was called a failure: {}", r.output);
+  assert!(
+    !r.output.contains("TAILMARKER"),
+    "the tail should have been cut, proving truncation happened"
+  );
+  assert!(r.output.contains("truncated"), "no truncation note: {:?}", &r.output[..80]);
 }
