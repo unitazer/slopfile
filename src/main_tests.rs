@@ -2067,3 +2067,31 @@ a reply, but not inside an assistant
   assert!(err.contains("assistant"), "the error must say where `text` belongs: {err}");
   assert!(err.contains("invent"), "the error must say invented roles are allowed: {err}");
 }
+
+#[test]
+fn a_fence_that_is_valid_toml_but_names_an_unknown_value_is_not_rewritten() {
+  // The sibling of `a_hand_edited_fence_survives_a_save_even_behind_prose`: that one covers TOML
+  // that does not parse at all, this one covers TOML that parses but carries a value we reject.
+  // The second is the sharper edge, because `thinking = "meduim"` is well-formed TOML, so the
+  // "leave the fence alone" branch that catches the first case does not fire on its own.
+  let content = "\
+```toml
+model = \"special-model\"
+thinking = \"meduim\"
+```
+<!-- slopfile:begin -->
+<!-- slopfile:system -->
+sys
+<!-- /slopfile -->
+<!-- slopfile:input -->
+";
+  let p = scratch("fence-bad-value").join("s.md");
+  std::fs::write(&p, content).unwrap();
+  let s = transcript::load(&p).expect("a bad fence value is a warning, not a refusal");
+  let out = s.render();
+  assert!(
+    out.contains("thinking = \"meduim\""),
+    "the rejected value was silently rewritten to our default:\n{out}"
+  );
+  assert!(out.contains("model = \"special-model\""), "the other settings were lost:\n{out}");
+}

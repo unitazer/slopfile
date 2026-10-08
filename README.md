@@ -81,7 +81,10 @@ type your next request here                          <- everything below is your
 ```
 
 - **The fence** — the first ` ```toml ` block. Per-session settings (model,
-  tools, limits); overrides the app config. Human lines around it are kept.
+  `thinking`, tools, limits); overrides the app config. Human lines around it are
+  kept. A fence that does not parse is left **exactly as written** and warned
+  about, never rewritten: regenerating it would overwrite your settings with
+  defaults slopfile merely guessed at.
 - **`system`** — the system prompt. Required; the daemon refuses edits that drop it.
 - **`turn`** — one exchange. It is **finished exactly when its region is closed**,
   which is how the daemon knows a turn ended: no `@done` marker, no `### Assistant`
@@ -98,6 +101,38 @@ type your next request here                          <- everything below is your
   deliberate: a model that keeps its own `scratchpad` or `ledger` is the point of
   the whole design, so the harness refuses to invent names on its behalf. A
   misplaced *known* region is still refused, with the grammar in the error.
+
+#### `thinking` — how hard the model reasons
+
+`thinking` is sent as the OpenAI-compatible `reasoning_effort` on every request.
+Whether it *does* anything is up to the model's chat template, and for
+Qwen3.8-27B the levels are not all equal. Measured with
+`POST /apply-template` (renders the prompt without generating):
+
+| `thinking` | sent as | effect on this model |
+|---|---|---|
+| `auto` (default) | *field omitted* | same as `xhigh` — the template's own default |
+| `low` | `low` | injects "keep your thinking brief and focused" |
+| `medium` | `medium` | **accepted but injects nothing** — the template has `xhigh` and `low` branches and none for `medium`, so it behaves like no instruction at all |
+| `high` | `high` | template aliases it to `xhigh` |
+| `xhigh` | `xhigh` | injects "think carefully, validate assumptions, consider alternatives" |
+| `none` | `none` | `enable_thinking=false`: no thinking at all |
+| anything else | — | **HTTP 500** — the template raises on an unknown level |
+
+So on this model `auto`/`high`/`xhigh` are one setting, `low` and `none` are
+distinct, and `medium` is currently indistinguishable from unset. A rejected
+level is loud, which is the point: the knob used to be a single `Auto` variant
+behind `#[serde(other)]`, so `thinking = "meduim"` parsed fine, did nothing, and
+looked correct.
+
+Two server-side facts this depends on, both of which can change under you:
+
+- llama-server forwards `reasoning_effort` into the chat template as a kwarg,
+  and special-cases `none` into `enable_thinking=false`. A model whose template
+  does not read the kwarg **ignores the request silently**.
+- Qwen's own API docs add `thinking_budget` (low 4096 / medium 16384 /
+  xhigh 262144). llama-server also has `--reasoning-budget`, but that is a
+  *separate* mechanism and is not what this sets.
 
 Anything the daemon writes into a body is escaped: a literal `<` is wrapped as
 `<!--slopfile:ESC[<<!--/slopfile:ESC-->`. Both wrapper delimiters start with
@@ -370,7 +405,7 @@ llama_container = "clanker-llama"              # container to restart on abort
 
 ## Things that must be kept in sync by hand
 
-Nothing enforces these three. All of them have bitten already, so check them
+Nothing enforces these four. All of them have bitten already, so check them
 whenever you touch either side.
 
 ### 1. `max_context_tokens` must equal the server's `ctx-size`
@@ -424,7 +459,20 @@ Note the escaped form on disk is
 script keys markers off `<!-- slopfile:` *with* the space: the escaped form has
 no space after `<!--`, so the two can never be confused.
 
-### 3. The context paragraph in `src/context.rs` vs. what the parser accepts
+### 3. `thinking` vs. what the model's chat template accepts
+
+The level names slopfile sends are **not** the set the model accepts — that is
+the template's, and it can change with the weights. `src/types.rs::Thinking` and
+the Qwen3.8 template currently agree, and `medium` is the sharp edge: slopfile
+offers it, the template validates it, and then ignores it.
+
+llama-server is the middleman: it forwards `reasoning_effort` to the template
+and maps `none` to `enable_thinking=false`. If the template stops reading the
+kwarg, `thinking` goes back to being inert with no error anywhere — so after
+changing weights, check with `POST /apply-template` that the level still
+changes the prompt, and check the table in `thinking` above still matches.
+
+### 4. The context paragraph in `src/context.rs` vs. what the parser accepts
 
 The managed block tells the model things like "keep a running `note` region".
 When that text and the grammar disagree, the model writes something valid-looking

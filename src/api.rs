@@ -1,6 +1,6 @@
 use crate::sse::{stream_chunks, SseError};
 use crate::types::{
-    ChatMessage, Role, SseToolCallDelta, StreamEvent, StreamResult, ToolCall, ToolDefinition,
+  ChatMessage, Role, SseToolCallDelta, StreamEvent, StreamResult, Thinking, ToolCall, ToolDefinition,
 };
 use futures_util::StreamExt;
 use std::error::Error;
@@ -156,6 +156,7 @@ impl LlamaClient {
         messages: &[ChatMessage],
         tools: Option<&[ToolDefinition]>,
         max_new_tokens: u32,
+        thinking: Thinking,
         on_event: impl FnMut(StreamEvent),
         keep_going: impl FnMut() -> bool,
     ) -> Result<StreamResult, ApiError> {
@@ -170,6 +171,12 @@ impl LlamaClient {
             body["tools"] = serde_json::to_value(tools).map_err(|e| {
                 ApiError::Sse(SseError::Io(format!("tool serialization: {e}")))
             })?;
+        }
+        // Omitted for `Auto` so the server keeps its own default. Sent otherwise: llama-server
+        // forwards it to the chat template as `reasoning_effort`, and maps `none` to
+        // enable_thinking=false.
+        if let Some(effort) = thinking.wire_value() {
+            body["reasoning_effort"] = serde_json::Value::from(effort);
         }
 
         let url = format!("{}/v1/chat/completions", self.base);
@@ -557,5 +564,75 @@ mod accumulator_robustness_tests {
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert_ne!(calls[0].id, calls[1].id, "ids must be distinct: {calls:?}");
     assert!(!calls[0].id.is_empty());
+  }
+
+  /// Reads one HTTP request, hands back the body, and replies with a minimal SSE stream.
+  async fn capture_request_body(
+    reply: &'static str,
+  ) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+      let (mut sock, _) = listener.accept().await.unwrap();
+      let mut buf = vec![0u8; 64 * 1024];
+      let n = sock.read(&mut buf).await.unwrap();
+      let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+      let body = head
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+      let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+        reply.len(),
+        reply
+      );
+      sock.write_all(response.as_bytes()).await.unwrap();
+      body
+    });
+    (format!("http://{addr}"), handle)
+  }
+
+  const DONE_SSE: &str =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+  async fn reasoning_effort_sent(thinking: Thinking) -> Option<String> {
+    let (base, handle) = capture_request_body(DONE_SSE).await;
+    let client = LlamaClient::new(&base);
+    let _ = client
+      .chat_stream(
+        "m",
+        &[ChatMessage::user("hi")],
+        None,
+        16,
+        thinking,
+        |_| {},
+        || true,
+      )
+      .await;
+    let body: serde_json::Value = serde_json::from_str(&handle.await.unwrap()).unwrap();
+    body.get("reasoning_effort")
+      .map(|v| v.as_str().unwrap().to_string())
+  }
+
+  #[tokio::test]
+  async fn reasoning_effort_reaches_the_request_body() {
+    // Auto omits the field entirely so the server keeps its own default, rather than
+    // pinning the value slopfile guessed at.
+    assert_eq!(reasoning_effort_sent(Thinking::Auto).await, None);
+    for (t, want) in [
+      (Thinking::None, "none"),
+      (Thinking::Low, "low"),
+      (Thinking::Medium, "medium"),
+      (Thinking::High, "high"),
+      (Thinking::Xhigh, "xhigh"),
+    ] {
+      assert_eq!(
+        reasoning_effort_sent(t).await.as_deref(),
+        Some(want),
+        "{t:?} must serialize as {want:?}"
+      );
+    }
   }
 }

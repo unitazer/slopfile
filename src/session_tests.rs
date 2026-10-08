@@ -1180,3 +1180,68 @@ fn rewinding_a_round_drops_its_calls_too() {
     );
   }
 }
+
+#[test]
+fn every_thinking_level_round_trips_through_the_fence() {
+  for want in [
+    Thinking::Auto,
+    Thinking::None,
+    Thinking::Low,
+    Thinking::Medium,
+    Thinking::High,
+    Thinking::Xhigh,
+  ] {
+    let file =
+      format!("```toml\nthinking = \"{want}\"\n```\n{BEGIN_LINE}<!-- slopfile:input -->\n");
+    let (session, report) = parse(&file);
+    assert!(report.is_clean(), "{want:?} should parse clean: {report:?}");
+    assert_eq!(session.thinking(), want);
+    // And the fence keeps saying what the session is actually using, instead of
+    // re-stamping a hardcoded value that would lie after a hand edit.
+    assert!(
+      session.render().contains(&format!("thinking = \"{want}\"")),
+      "{want:?} must survive render: {}",
+      session.render()
+    );
+  }
+}
+
+#[test]
+fn an_unknown_thinking_level_is_rejected_and_names_the_valid_ones() {
+  // The regression guard for the knob being silently inert: `Thinking` used to be
+  // `#[serde(other)]`, so "meduim" quietly became `auto` and nobody ever found out.
+  let err = toml::from_str::<SessionConfig>("thinking = \"meduim\"")
+    .expect_err("a typo must not be swallowed");
+  let text = err.to_string();
+  for valid in ["auto", "none", "low", "medium", "high", "xhigh"] {
+    assert!(text.contains(valid), "the error should list {valid}: {text}");
+  }
+}
+
+#[test]
+fn an_unparseable_fence_falls_back_without_bricking_the_session() {
+  // Hand-edited fences are TOML-ish prose. They must stay driveable -- that is what
+  // `a_hand_edited_fence_survives_a_save_even_behind_prose` protects -- and the settings in them
+  // are simply ignored, loudly, by the warning in parse().
+  let file = format!(
+    "```toml\nthinking = \"meduim\"\n```\n{BEGIN_LINE}<!-- slopfile:system -->\nsys\n\
+     <!-- /slopfile -->\n<!-- slopfile:input -->\n"
+  );
+  let (session, report) = parse(&file);
+  assert!(report.is_clean(), "a bad fence is a warning, not a refusal: {report:?}");
+  assert_eq!(session.thinking(), Thinking::Auto);
+  assert!(
+    session.render().contains("thinking = \"meduim\""),
+    "the hand-edited fence must survive verbatim: {}",
+    session.render()
+  );
+}
+
+#[test]
+fn a_session_with_no_thinking_key_is_auto_and_sends_nothing() {
+  let file = format!("```toml\nmodel = \"m\"\n```\n{BEGIN_LINE}<!-- slopfile:input -->\n");
+  let (session, report) = parse(&file);
+  assert!(report.is_clean(), "{report:?}");
+  assert_eq!(session.thinking(), Thinking::Auto);
+  assert_eq!(Thinking::Auto.wire_value(), None);
+}

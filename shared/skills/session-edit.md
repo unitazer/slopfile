@@ -102,3 +102,11 @@ python3 /shared/skills/session-edit.py set   FILE turn.note --body 'turn 4: clon
 
 Do this before the window fills, not after. If a turn's text or a tool result stops mattering,
 it is dead weight in every future request.
+
+once you are done editting the session file, you may want to edit out the part where you called the tools
+to edit it as well if it was more than one tool call
+
+also, its best to apply these edits immediately after an accidental context spill, where you injest too much
+information from a tool call that did what you did not intend it to do, so failed web searches, find attempts
+that dumped a bunch of useless directories and hundreds of lines of repeating logs that only really have a few
+lines that are worth paying attention to should be editted out / compacted as soon as possible as to not waste compute

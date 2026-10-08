@@ -234,12 +234,59 @@ pub enum Confirmations {
   Ask,
 }
 
+/// How hard the model should think, sent as the OpenAI-compatible `reasoning_effort`.
+///
+/// llama-server passes this straight into the chat template as a kwarg
+/// (`reasoning_effort`), except `none`, which it turns into `enable_thinking=false`.
+/// So whether it does anything at all is up to the model's template: a model not
+/// trained with it ignores the kwarg silently. Qwen3.8's template accepts
+/// `low`/`medium`/`xhigh` (aliasing `high` to `xhigh`) and **raises an exception**
+/// on anything else, which surfaces as an HTTP error rather than a silent no-op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Thinking {
+  /// Omit the field and let the server decide (Qwen3.8 defaults to `xhigh`).
   #[default]
-  #[serde(other)]
   Auto,
+  /// No thinking at all. Sent as `none`, which llama-server turns into
+  /// `enable_thinking=false`.
+  None,
+  Low,
+  Medium,
+  /// Not a Qwen level, but OpenAI's; Qwen's template aliases it to `xhigh`.
+  High,
+  Xhigh,
+}
+
+impl Thinking {
+  /// The value to put in the request, or `None` to omit the field entirely.
+  pub fn wire_value(self) -> Option<&'static str> {
+    match self {
+      Thinking::Auto => None,
+      Thinking::None => Some("none"),
+      Thinking::Low => Some("low"),
+      Thinking::Medium => Some("medium"),
+      Thinking::High => Some("high"),
+      Thinking::Xhigh => Some("xhigh"),
+    }
+  }
+
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Thinking::Auto => "auto",
+      Thinking::None => "none",
+      Thinking::Low => "low",
+      Thinking::Medium => "medium",
+      Thinking::High => "high",
+      Thinking::Xhigh => "xhigh",
+    }
+  }
+}
+
+impl std::fmt::Display for Thinking {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.as_str())
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

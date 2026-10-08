@@ -1,6 +1,6 @@
 use crate::questions::Question;
 pub use crate::types::SessionConfig;
-use crate::types::{ChatMessage, Role, ToolCall};
+use crate::types::{ChatMessage, Role, Thinking, ToolCall};
 use serde::{Deserialize, Serialize};
 
 pub const BEGIN: &str = "begin";
@@ -311,7 +311,7 @@ pub fn toml_fence(config: &SessionConfig) -> String {
   if let Some(model) = &config.model {
     out.push_str(&format!("model = \"{model}\"\n"));
   }
-  out.push_str("thinking = \"auto\"\n");
+  out.push_str(&format!("thinking = \"{}\"\n", config.thinking));
   if let Some(tools) = &config.tools {
     let list = tools.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
     out.push_str(&format!("tools = [{list}]\n"));
@@ -384,6 +384,13 @@ pub fn fence_bounds(preamble: &str) -> Option<(usize, usize)> {
 }
 
 fn merged_fence(preamble: &str, config: &SessionConfig) -> String {
+  // A fence we could not parse into a config is left exactly as written. Regenerating it would
+  // overwrite the human's settings with defaults we only guessed at, and `extra` below cannot
+  // save them: `thinking = "meduim"` is perfectly good TOML, so the table parses, the key
+  // matches one we render, and it gets silently dropped.
+  if fence_config(preamble).is_err() {
+    return String::new();
+  }
   let fence = toml_fence(config);
   if fence_body(preamble).as_deref() == fence_body(&fence).as_deref() {
     return fence;
@@ -438,17 +445,20 @@ pub fn fence_body(preamble: &str) -> Option<String> {
 }
 
 pub fn config_from_fence(preamble: &str) -> SessionConfig {
-  fence_config(preamble).unwrap_or_default()
+  fence_config(preamble).ok().flatten().unwrap_or_default()
 }
 
-/// `None` means the fence is present but does not parse, which the caller must not paper over by
-/// regenerating the fence: that would silently delete the human's settings.
-fn fence_config(preamble: &str) -> Option<SessionConfig> {
-  let body = fence_body(preamble)?;
+/// `Ok(None)` means there is no fence at all. `Err` means a fence is present but does not parse,
+/// which the caller must not paper over by regenerating the fence: that would silently delete the
+/// human's settings.
+fn fence_config(preamble: &str) -> Result<Option<SessionConfig>, toml::de::Error> {
+  let Some(body) = fence_body(preamble) else {
+    return Ok(None);
+  };
   if body.trim().is_empty() {
-    return Some(SessionConfig::default());
+    return Ok(Some(SessionConfig::default()));
   }
-  toml::from_str(&body).ok()
+  toml::from_str(&body).map(Some)
 }
 
 pub fn parse(text: &str) -> (Session, ParseReport) {
@@ -563,13 +573,27 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
     attach(&mut stack, &mut roots, node);
   }
 
+  let mut payload_problems = Vec::new();
+  // A fence that does not parse must not silently become defaults, but it also must not be fatal:
+  // a human can hand-edit it, and the point of keeping it verbatim is that the session stays
+  // driveable so the model can repair it. So warn loudly and fall back, rather than either
+  // resetting the settings silently or refusing the file.
+  let config = match fence_config(&preamble) {
+    Ok(Some(config)) => config,
+    Ok(None) => SessionConfig::default(),
+    Err(e) => {
+      tracing::warn!(
+        "the ```toml fence does not parse, so every setting in it is being ignored: {e}"
+      );
+      SessionConfig::default()
+    }
+  };
   let mut session = Session {
     preamble: preamble.clone(),
-    config: config_from_fence(&preamble),
+    config,
     open,
     ..Session::default()
   };
-  let mut payload_problems = Vec::new();
   for root in roots.iter() {
     let root_path = vec![root.name.clone()];
     match root.name.as_str() {
@@ -1243,6 +1267,10 @@ impl Session {
 
   pub fn model(&self) -> Option<&str> {
     self.config.model.as_deref()
+  }
+
+  pub fn thinking(&self) -> Thinking {
+    self.config.thinking
   }
 }
 

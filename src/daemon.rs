@@ -211,6 +211,8 @@ async fn run_generation_turn(
     .map(str::to_string)
     .unwrap_or_else(|| cfg.model.clone());
 
+  let thinking = work.thinking();
+
   // Build the request first, then measure it: the context paragraph is part of what gets sent, so
   // counting before adding it would under-count by a thousand characters.
   let mut messages = work.request_messages();
@@ -234,7 +236,7 @@ async fn run_generation_turn(
 
   let mut active = StreamWriter::new(path, work);
   info!(
-    "→ {path:?}: generating (model={model}, messages={}, tokens={}, dropped={})",
+    "→ {path:?}: generating (model={model}, thinking={thinking}, messages={}, tokens={}, dropped={})",
     messages.len(),
     plan.token_count,
     plan.dropped
@@ -253,9 +255,10 @@ async fn run_generation_turn(
       .chat_stream(
         &model,
         &messages,
-        (!tool_defs.is_empty()).then_some(tool_defs.as_slice()),
-        max_tokens,
-        |ev| active.handle(&ev),
+(!tool_defs.is_empty()).then_some(tool_defs.as_slice()),
+      max_tokens,
+      thinking,
+      |ev| active.handle(&ev),
         || !control::update(name, |s| s.take_abort()),
       )
       .await
