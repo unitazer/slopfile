@@ -2,29 +2,67 @@ use crate::session::{self, Session};
 use crate::types::{ChatMessage, Role};
 use std::path::Path;
 
-const SENTINEL: &str = "Context file:";
-
 pub const CONTEXT_FULL_NOTE: &str =
   "the model hit the token cap mid-response; this session file is your context, so edit it now to \
    drop or compress the useless old turns above, then write your next message below this note";
 
-pub fn context_file_paragraph(path: &Path) -> String {
+/// Plain-text fences, not region markers: this text is written into the `system` region, and any
+/// `<` in a body gets escaped on render. Fences made of `<` would litter the file with escape
+/// wrappers, so the managed block is delimited by something a human can read and a parser can
+/// strip deterministically.
+pub const CONTEXT_BEGIN: &str = "--- context (managed by slopfile) ---";
+pub const CONTEXT_END: &str = "--- end context ---";
+
+pub fn context_paragraph(path: &Path) -> String {
   format!(
-    "\n\n{SENTINEL} {}\n\
-     This conversation is that file, and keeping it usable is your job, not the harness's. Edit it \
-     with the `edit`/`write` tools or with bash (sed, python, heredocs) to drop dead tool output, \
-     compress turns you have finished with, keep a running notes region, or delete whole turns. \
-     Nothing is summarized behind your back: whatever you leave in the file is exactly what you \
-     get as context on the next call, so prune before the context fills up.\n\
-     The file is a stack of regions. `<!-- slopfile:NAME -->` opens one, `<!-- /slopfile -->` \
-     closes it, and everything between is the body, copied out verbatim. Keep the ```toml fence and \
-     the `system` region; drop or rewrite anything else. A turn counts as finished when its \
-     `turn` region is closed, so close the ones you are done with.\n\
-     If your own text needs to contain one of those markers, wrap it so it stays text: \
-     `<!--slopfile:ESC[<!-- /slopfile -->]-->` keeps a literal close marker inside a body. An edit \
-     that would leave the file unparseable is rolled back and the tool result tells you why.",
-    path.display()
+    "{CONTEXT_BEGIN}
+Context file: {path}
+
+This conversation is that file, and keeping it usable is your job, not the harness's. Edit it with \
+the `edit`/`write` tools or with bash (sed, python, heredocs) to drop dead tool output, compress \
+turns you have finished with, keep a running notes region, or delete whole turns. Nothing is \
+summarized behind your back: whatever you leave in the file is exactly what you get as context on \
+the next call, so prune before the context fills up.
+
+The file is a stack of regions. `<!-- slopfile:NAME -->` opens one, `<!-- /slopfile -->` closes it, \
+and everything between is the body, copied out verbatim. Keep the ```toml fence and the `system` \
+region; drop or rewrite anything else. A turn counts as finished when its `turn` region is closed, \
+so close the ones you are done with.
+
+If your own text needs to contain one of those markers, wrap it so it stays text: \
+`<!--slopfile:ESC[<<!-- /slopfile -->]-->` keeps a literal close marker inside a body. An edit that \
+would leave the file unparseable is rolled back and the tool result tells you why.
+{CONTEXT_END}",
+    path = path.display()
   )
+}
+
+/// Drop any previously written managed block and append a freshly rendered one. Called on every
+/// request so the path in the file is always the path we are actually serving, even if the
+/// transcript was moved, and called once at creation so the file explains itself to a human too.
+pub fn refresh_paragraph(system: &str, path: &Path) -> String {
+  let mut kept = String::with_capacity(system.len());
+  let mut rest = system;
+  while let Some(start) = rest.find(CONTEXT_BEGIN) {
+    kept.push_str(&rest[..start]);
+    rest = &rest[start..];
+    match rest.find(CONTEXT_END) {
+      // Drop through the end fence and the newline that followed it.
+      Some(end) => rest = rest[end + CONTEXT_END.len()..].trim_start_matches('\n'),
+      // A truncated block (the model was mid-edit) still counts as ours to replace.
+      None => {
+        rest = "";
+        break;
+      }
+    }
+  }
+  kept.push_str(rest);
+  let base = kept.trim_end();
+  if base.is_empty() {
+    context_paragraph(path)
+  } else {
+    format!("{base}\n\n{}", context_paragraph(path))
+  }
 }
 
 pub fn attach_context_file(messages: &mut [ChatMessage], path: &Path) {
@@ -34,11 +72,8 @@ pub fn attach_context_file(messages: &mut [ChatMessage], path: &Path) {
   else {
     return;
   };
-  let content = system.content.as_deref().unwrap_or_default();
-  if content.contains(SENTINEL) {
-    return;
-  }
-  system.content = Some(format!("{content}{}", context_file_paragraph(path)));
+  let current = system.content.as_deref().unwrap_or_default().to_string();
+  system.content = Some(refresh_paragraph(&current, path));
 }
 
 /// Validate a model-authored edit and hand back the session it describes. Returns the reason the
@@ -80,12 +115,42 @@ mod tests {
 
   #[test]
   fn paragraph_names_the_path_and_the_region_rules() {
-    let p = context_file_paragraph(Path::new("/t/shared/transcripts/1.md"));
+    let p = context_paragraph(Path::new("/t/shared/transcripts/1.md"));
     assert!(p.contains("Context file: /t/shared/transcripts/1.md"), "{p}");
     assert!(p.contains("prune before the context fills up"), "{p}");
     assert!(p.contains("<!-- /slopfile -->"), "{p}");
     assert!(p.contains("<!--slopfile:ESC["), "{p}");
     assert!(p.contains("rolled back"), "{p}");
+  }
+
+  #[test]
+  fn refreshing_replaces_the_block_instead_of_stacking_it() {
+    let path = Path::new("/t/1.md");
+    let once = refresh_paragraph("be helpful", path);
+    let twice = refresh_paragraph(&once, path);
+    assert_eq!(once, twice, "the managed block must be idempotent");
+    assert_eq!(
+      twice.matches(CONTEXT_BEGIN).count(),
+      1,
+      "the block was stacked: {twice}"
+    );
+  }
+
+  #[test]
+  fn refreshing_repoints_a_moved_transcript_at_its_new_path() {
+    let first = refresh_paragraph("base", Path::new("/old/1.md"));
+    let moved = refresh_paragraph(&first, Path::new("/new/1.md"));
+    assert!(moved.contains("/new/1.md"), "{moved}");
+    assert!(!moved.contains("/old/1.md"), "a stale path survived: {moved}");
+    assert!(moved.starts_with("base"), "the model-authored part was lost: {moved}");
+  }
+
+  #[test]
+  fn refreshing_recovers_from_a_truncated_block() {
+    let half = format!("base\n{}\nsome text the model was writing", CONTEXT_BEGIN);
+    let fixed = refresh_paragraph(&half, Path::new("/t/1.md"));
+    assert_eq!(fixed.matches(CONTEXT_BEGIN).count(), 1, "{fixed}");
+    assert!(!fixed.contains("some text the model was writing"), "{fixed}");
   }
 
   #[test]

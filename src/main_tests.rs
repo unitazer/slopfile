@@ -1767,3 +1767,23 @@ fn a_container_style_path_in_the_shared_config_resolves_on_the_host() {
   assert_eq!(crate::repo_relative("/tmp/mine", root), "/tmp/mine");
   assert_eq!(crate::repo_relative("workspace", root), "workspace");
 }
+
+#[test]
+fn a_freshly_created_transcript_explains_itself_and_survives_a_round_trip() {
+  let p = scratch("self-describing").join("s.md");
+  let cfg = crate::load_app_config();
+  crate::control::create_session(&p, &cfg, &[]).expect("create");
+
+  let text = std::fs::read_to_string(&p).unwrap();
+  assert!(
+    text.contains(crate::context::CONTEXT_BEGIN) && text.contains("This conversation is that file"),
+    "the file the user opens says nothing about editing itself:\n{text}"
+  );
+  assert!(text.contains(&format!("Context file: {}", p.display())));
+
+  // The managed block contains literal `<`, so it is escaped on render. It must come back
+  // byte-identical, or the model would read a corrupted copy of its own instructions.
+  let s = transcript::load(&p).expect("parse");
+  assert_eq!(s.render(), text, "the managed block did not survive parse->render");
+  assert!(s.system.contains("<!-- slopfile:NAME -->"), "markers came back escaped");
+}
