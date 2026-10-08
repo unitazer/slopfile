@@ -1964,3 +1964,27 @@ async fn a_command_producing_too_much_output_still_runs_to_completion() {
   );
   assert!(r.output.contains("truncated"), "no truncation note: {:?}", &r.output[..80]);
 }
+
+#[test]
+fn the_burst_cap_is_reported_in_the_transcript_not_silently() {
+  // Going quiet looks identical to "the model finished", which leaves the user guessing why
+  // nothing happens until they send again by hand.
+  assert!(daemon::MAX_TURNS_PER_BURST > 0);
+  let note = format!(
+    "[harness] stopped this burst after {} turns without being asked to. Anything you had not \
+     finished is still below; continue, but do it in fewer turns — run long jobs in the background \
+     instead of polling them, and batch work up.",
+    daemon::MAX_TURNS_PER_BURST
+  );
+  let mut s = Session::default();
+  s.system = "sys".into();
+  s.add_note(session::NoteBy::Harness, &note);
+  let rendered = s.render();
+  assert!(rendered.contains("[harness] stopped this burst"), "{rendered}");
+  // and it must come back as a message, so the model actually reads it next turn
+  let msgs = s.request_messages();
+  assert!(
+    msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("[harness] stopped"))),
+    "the note must reach the model: {msgs:?}"
+  );
+}

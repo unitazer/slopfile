@@ -21,6 +21,11 @@ fn delivery_lock() -> &'static AsyncMutex<()> {
   LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
+/// One `sf send` opens a burst that runs until the model stops calling tools. The cap exists so a
+/// wedged model cannot spin forever, but it is a per-burst budget, so a long task has to fit inside
+/// it -- which is why hitting it is reported in the transcript rather than silently.
+pub const MAX_TURNS_PER_BURST: usize = 20;
+
 pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
   let name = control::session_name(path);
   let is_sub = flow::is_subagent_path(path);
@@ -29,8 +34,20 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
   let token_at_entry = control::update(&name, |s| s.arm_token());
   loop {
     turns += 1;
-    if turns > 20 {
-      warn!("{path:?}: giving up after {turns} turns");
+    if turns > MAX_TURNS_PER_BURST {
+      // Say so in the file. Going quiet looks identical to "the model decided it was done", so
+      // the user is left sending `sf send` to find out whether anything is actually wrong.
+      let mut s = transcript::load(path).unwrap_or_else(|_| Session::default());
+      s.add_note(
+        session::NoteBy::Harness,
+        format!(
+          "[harness] stopped this burst after {MAX_TURNS_PER_BURST} turns without being asked to. \
+           Anything you had not finished is still below; continue, but do it in fewer turns — \
+           run long jobs in the background instead of polling them, and batch work up."
+        ),
+      );
+      let _ = transcript::save(path, &s);
+      warn!("{path:?}: giving up after {turns} turns (noted in the transcript)");
       if is_sub {
         deliver_subagent_result(path, SubagentReport::TurnCap).await?;
       }
