@@ -24,13 +24,7 @@ fn delivery_lock() -> &'static AsyncMutex<()> {
 pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
   let name = control::session_name(path);
   let is_sub = flow::is_subagent_path(path);
-  let eff_cfg = if is_sub {
-    let mut c = cfg.clone();
-    c.confirmations = Confirmations::Yolo;
-    c
-  } else {
-    cfg.clone()
-  };
+  let eff_cfg = cfg.clone();
   let mut turns = 0;
   let token_at_entry = control::update(&name, |s| s.arm_token());
   loop {
@@ -87,7 +81,10 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       }
       s.pending_questions = session.pending_question().map_or(0, |q| q.questions.len());
       s.armed
-    }) || eff_cfg.confirmations == Confirmations::Yolo;
+    // A subagent is autonomous: nobody is watching it and nobody will ever run `sf send` on it,
+    // so waiting for an armed flag would wedge it after one round and hang the parent that is
+    // blocked on its report. This is about liveness, not about answering questions for it.
+    }) || is_sub || eff_cfg.confirmations == Confirmations::Yolo;
 
     match next_action(&session, &eff_cfg, armed) {
       Action::Idle => {
@@ -200,10 +197,18 @@ async fn run_generation_turn(
   // Build the request first, then measure it: the context paragraph is part of what gets sent, so
   // counting before adding it would under-count by a thousand characters.
   let mut messages = work.request_messages();
-  crate::context::attach_context_file(&mut messages, path);
+  // First pass with no fill level: the paragraph must be counted, but the count does not exist yet.
+  crate::context::attach_context_file(&mut messages, path, None);
   let plan = tokens::build_request_messages(&work, messages, cfg, client.rest()).await?;
   let mut messages = plan.messages;
-  crate::context::attach_context_file(&mut messages, path);
+  // Second pass with the real number, so the model knows how much room it has before it decides
+  // whether to spend a turn compacting. The line itself costs ~40 tokens, which is noise here.
+  let budget = tokens::context_budget(&work, cfg);
+  crate::context::attach_context_file(
+    &mut messages,
+    path,
+    Some(crate::context::Window { used: plan.token_count, budget }),
+  );
 
   let max_tokens = tokens::output_allowance(tokens::context_budget(&work, cfg));
   let tool_defs = crate::tools::advertised(&work.config);
@@ -295,6 +300,24 @@ async fn run_generation_turn(
       .collect();
     if let Some(at) = result.tool_calls.iter().position(|c| c.name == "question") {
       let question = &result.tool_calls[at];
+      // `question` is not advertised to subagents, so reaching here means the model invented it.
+      // Recording a default answer would put a decision in the report that nobody ever made.
+      if flow::is_subagent_path(path) {
+        let (mut outcomes, _) = run_calls(&streamed, &result.tool_calls[..at], cfg, path).await?;
+        outcomes.push(ToolOutcome {
+          id: question.id.clone(),
+          name: "question".to_string(),
+          ok: false,
+          ms: 0,
+          output: "refused: you cannot ask the user a question. This is a subagent and nobody is \
+                   watching it, so there is no one to answer. State the assumption in your final \
+                   report instead, or pick a concrete option and say which one and why."
+            .to_string(),
+        });
+        streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
+        transcript::save(path, &streamed)?;
+        return Ok(TurnOutcome::Done);
+      }
       // Calls that shared the message with the question still have to happen, or the model is
       // later shown an answer with no record that it ever asked for them.
       // Calls that shared the message with the question still run; the question itself is recorded

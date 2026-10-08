@@ -422,9 +422,20 @@ pub fn render_question(session: &mut Session, call: &ToolCall) -> Result<(), Str
     warn!("question call arrived with unpromoted input; replacing it with the answer block");
   }
   session.input = questions::render_block(&questions);
+  // The round's ids are already the short ones the file will keep, so the waiting result and the
+  // recorded question have to agree with them. Using the caller's original id leaves an orphan that
+  // pairing then invents a second placeholder for.
+  let current_id = session
+    .last_round()
+    .assistant
+    .calls
+    .iter()
+    .find(|c| c.name == "question" && c.arguments == call.arguments)
+    .map(|c| c.id.clone())
+    .unwrap_or_else(|| call.id.clone());
   session.set_question(PendingQuestion {
     call: session::Call {
-      id: call.id.clone(),
+      id: current_id.clone(),
       name: call.name.clone(),
       arguments: call.arguments.clone(),
     },

@@ -13,10 +13,53 @@ pub const CONTEXT_FULL_NOTE: &str =
 pub const CONTEXT_BEGIN: &str = "--- context (managed by slopfile) ---";
 pub const CONTEXT_END: &str = "--- end context ---";
 
+/// Fill level at which the model is told to prune. Below this the paragraph stays quiet: nagging
+/// about headroom it does not need trains the model to ignore the line, and the paper's whole point
+/// is that compaction timing should be the model's call, not a reflex triggered by noise.
+pub const PRUNE_THRESHOLD_PCT: u32 = 70;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+  pub used: usize,
+  pub budget: u32,
+}
+
+impl Window {
+  fn percent(&self) -> u32 {
+    if self.budget == 0 {
+      return 0;
+    }
+    (self.used as u64 * 100 / u64::from(self.budget)) as u32
+  }
+}
+
+/// The one line that gives the model a reason to act. It is asked to prune "before the context
+/// fills up" but has no way to know how full it is, and the only other signal it gets arrives
+/// mid-response once the answer is already truncated.
+fn pressure_line(window: Option<Window>) -> String {
+  let Some(w) = window else {
+    return String::new();
+  };
+  let pct = w.percent();
+  if pct < PRUNE_THRESHOLD_PCT {
+    return String::new();
+  }
+  format!(
+    "\nWindow: {} tokens, about {} used ({}%). Prune before you continue: drop dead tool \
+     output, compress turns you have finished with, and delete anything you have already used. \
+     Whatever you leave in this file is what you get back, so make room for the work ahead.\n",
+    w.budget, w.used, pct
+  )
+}
+
 pub fn context_paragraph(path: &Path) -> String {
+  context_paragraph_with(path, None)
+}
+
+pub fn context_paragraph_with(path: &Path, window: Option<Window>) -> String {
   format!(
     "{CONTEXT_BEGIN}
-Context file: {path}
+Context file: {path}{pressure}
 
 This conversation is that file, and keeping it usable is your job, not the harness's. Edit it with \
 the `edit`/`write` tools or with bash (sed, python, heredocs) to drop dead tool output, compress \
@@ -33,14 +76,15 @@ If your own text needs to contain one of those markers, wrap it so it stays text
 `<!--slopfile:ESC[<<!-- /slopfile -->]-->` keeps a literal close marker inside a body. An edit that \
 would leave the file unparseable is rolled back and the tool result tells you why.
 {CONTEXT_END}",
-    path = path.display()
+    path = path.display(),
+    pressure = pressure_line(window),
   )
 }
 
 /// Drop any previously written managed block and append a freshly rendered one. Called on every
 /// request so the path in the file is always the path we are actually serving, even if the
 /// transcript was moved, and called once at creation so the file explains itself to a human too.
-pub fn refresh_paragraph(system: &str, path: &Path) -> String {
+pub fn refresh_paragraph(system: &str, path: &Path, window: Option<Window>) -> String {
   let mut kept = String::with_capacity(system.len());
   let mut rest = system;
   while let Some(start) = rest.find(CONTEXT_BEGIN) {
@@ -58,14 +102,15 @@ pub fn refresh_paragraph(system: &str, path: &Path) -> String {
   }
   kept.push_str(rest);
   let base = kept.trim_end();
+  let block = context_paragraph_with(path, window);
   if base.is_empty() {
-    context_paragraph(path)
+    block
   } else {
-    format!("{base}\n\n{}", context_paragraph(path))
+    format!("{base}\n\n{block}")
   }
 }
 
-pub fn attach_context_file(messages: &mut [ChatMessage], path: &Path) {
+pub fn attach_context_file(messages: &mut [ChatMessage], path: &Path, window: Option<Window>) {
   let Some(system) = messages
     .iter_mut()
     .find(|m| m.role == Role::System && m.content.as_deref().is_some_and(|c| !c.is_empty()))
@@ -73,7 +118,7 @@ pub fn attach_context_file(messages: &mut [ChatMessage], path: &Path) {
     return;
   };
   let current = system.content.as_deref().unwrap_or_default().to_string();
-  system.content = Some(refresh_paragraph(&current, path));
+  system.content = Some(refresh_paragraph(&current, path, window));
 }
 
 /// Validate a model-authored edit and hand back the session it describes. Returns the reason the
@@ -126,8 +171,8 @@ mod tests {
   #[test]
   fn refreshing_replaces_the_block_instead_of_stacking_it() {
     let path = Path::new("/t/1.md");
-    let once = refresh_paragraph("be helpful", path);
-    let twice = refresh_paragraph(&once, path);
+    let once = refresh_paragraph("be helpful", path, None);
+    let twice = refresh_paragraph(&once, path, None);
     assert_eq!(once, twice, "the managed block must be idempotent");
     assert_eq!(
       twice.matches(CONTEXT_BEGIN).count(),
@@ -138,8 +183,8 @@ mod tests {
 
   #[test]
   fn refreshing_repoints_a_moved_transcript_at_its_new_path() {
-    let first = refresh_paragraph("base", Path::new("/old/1.md"));
-    let moved = refresh_paragraph(&first, Path::new("/new/1.md"));
+    let first = refresh_paragraph("base", Path::new("/old/1.md"), None);
+    let moved = refresh_paragraph(&first, Path::new("/new/1.md"), None);
     assert!(moved.contains("/new/1.md"), "{moved}");
     assert!(!moved.contains("/old/1.md"), "a stale path survived: {moved}");
     assert!(moved.starts_with("base"), "the model-authored part was lost: {moved}");
@@ -148,7 +193,7 @@ mod tests {
   #[test]
   fn refreshing_recovers_from_a_truncated_block() {
     let half = format!("base\n{}\nsome text the model was writing", CONTEXT_BEGIN);
-    let fixed = refresh_paragraph(&half, Path::new("/t/1.md"));
+    let fixed = refresh_paragraph(&half, Path::new("/t/1.md"), None);
     assert_eq!(fixed.matches(CONTEXT_BEGIN).count(), 1, "{fixed}");
     assert!(!fixed.contains("some text the model was writing"), "{fixed}");
   }
@@ -156,20 +201,20 @@ mod tests {
   #[test]
   fn attach_extends_the_system_message_once() {
     let mut msgs = vec![ChatMessage::system("be helpful"), ChatMessage::user("hi")];
-    attach_context_file(&mut msgs, Path::new("/t/1.md"));
+    attach_context_file(&mut msgs, Path::new("/t/1.md"), None);
     let system = msgs[0].content.clone().unwrap();
     assert!(system.starts_with("be helpful"));
     assert!(system.contains("Context file: /t/1.md"), "{system}");
     assert_eq!(msgs[1].content.as_deref(), Some("hi"));
 
-    attach_context_file(&mut msgs, Path::new("/t/1.md"));
+    attach_context_file(&mut msgs, Path::new("/t/1.md"), None);
     assert_eq!(msgs[0].content.as_deref().unwrap(), system);
   }
 
   #[test]
   fn attach_is_a_noop_without_a_system_message() {
     let mut msgs = vec![ChatMessage::user("hi")];
-    attach_context_file(&mut msgs, Path::new("/t/1.md"));
+    attach_context_file(&mut msgs, Path::new("/t/1.md"), None);
     assert_eq!(msgs[0].content.as_deref(), Some("hi"));
   }
 

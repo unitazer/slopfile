@@ -839,6 +839,7 @@ impl Session {
   /// A copy in which every round has one unique id per call and exactly one result per call.
   pub fn paired(&self) -> Session {
     let mut s = self.clone();
+    s.shorten_ids();
     for turn in &mut s.turns {
       for round in &mut turn.rounds {
         let (calls, results) =
@@ -1034,7 +1035,7 @@ impl Session {
     }
   }
 
-  fn last_round(&mut self) -> &mut Round {
+  pub fn last_round(&mut self) -> &mut Round {
     if self.turns.is_empty() {
       self.turns.push(Turn::default());
     }
@@ -1056,8 +1057,30 @@ impl Session {
     let (calls, results) = pair_calls_with_results(calls, results);
     round.assistant.calls = calls;
     round.results = results;
+    let _ = round;
+    self.shorten_ids();
     self.close_section();
     self.open = None;
+  }
+
+  /// Replace the model's tool-call ids with short per-round sequential ones.
+  ///
+  /// Ids only ever have to pair a call with its result *inside one round*, and the request is
+  /// rebuilt from this file every turn, so the model's 28-char ids buy nothing while costing
+  /// about a quarter of every tool round (and they are stored twice, once per side). Renumbering
+  /// here and in `paired()` keeps the file and the request in agreement.
+  pub fn shorten_ids(&mut self) {
+    for turn in &mut self.turns {
+      for round in &mut turn.rounds {
+        let mut map: Vec<(String, String)> = Vec::new();
+        for call in &mut round.assistant.calls {
+          call.id = intern_id(&call.id, &mut map);
+        }
+        for result in &mut round.results {
+          result.id = intern_id(&result.id, &mut map);
+        }
+      }
+    }
   }
 
   pub fn close_turn(&mut self) {
@@ -1186,6 +1209,17 @@ fn open_of(stack: &[Node]) -> Vec<String> {
 /// Every call must get exactly one result, with a unique id. A model that omits ids, repeats one,
 /// or (via an early `break` such as `solve`) leaves calls unexecuted would otherwise produce a
 /// message stream the server rejects.
+/// Map an id onto `c1`, `c2`, ... within a round, reusing the mapping for ids already seen so a
+/// call and its result keep agreeing.
+fn intern_id(id: &str, map: &mut Vec<(String, String)>) -> String {
+  if let Some((_, short)) = map.iter().find(|(orig, _)| orig == id) {
+    return short.clone();
+  }
+  let short = format!("c{}", map.len() + 1);
+  map.push((id.to_string(), short.clone()));
+  short
+}
+
 fn pair_calls_with_results(
   calls: Vec<Call>,
   results: Vec<ToolOutcome>,

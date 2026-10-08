@@ -1047,8 +1047,8 @@ async fn tool_calls_next_to_a_question_are_still_executed_and_recorded() {
     .collect();
   assert_eq!(
     ids,
-    vec!["a1", "a2", "a3"],
-    "results follow the call order, one each"
+    vec!["c1", "c2", "c3"],
+    "results follow the call order, one each, with short ids"
   );
   let call_ids: Vec<String> = messages
     .iter()
@@ -1056,7 +1056,7 @@ async fn tool_calls_next_to_a_question_are_still_executed_and_recorded() {
     .flatten()
     .map(|c| c.id.clone())
     .collect();
-  assert_eq!(call_ids, vec!["a1", "a2", "a3"]);
+  assert_eq!(call_ids, vec!["c1", "c2", "c3"]);
   assert!(
     messages
       .iter()
@@ -1786,4 +1786,88 @@ fn a_freshly_created_transcript_explains_itself_and_survives_a_round_trip() {
   let s = transcript::load(&p).expect("parse");
   assert_eq!(s.render(), text, "the managed block did not survive parse->render");
   assert!(s.system.contains("<!-- slopfile:NAME -->"), "markers came back escaped");
+}
+
+// ---- short tool-call ids
+
+#[test]
+fn ids_are_shortened_per_round_and_still_pair() {
+  let mut s = Session::default();
+  s.turns.push(session::Turn::default());
+  s.begin_round();
+  s.push_text("calling");
+  let long = "k4gU87g6xuj5cokczZ2Fq6BqxGdfosGX";
+  s.finish_round(
+    vec![
+      crate::session::Call { id: long.into(), name: "bash".into(), arguments: "{}".into() },
+      crate::session::Call { id: "BvPQlIyfPvWQm7P0l7RqaSxrAMfbjHte".into(), name: "read".into(), arguments: "{}".into() },
+    ],
+    vec![crate::session::ToolOutcome { id: long.into(), name: "bash".into(), ok: true, ms: 1, output: "a".into() }],
+  );
+  let round = &s.turns[0].rounds[0];
+  assert_eq!(round.assistant.calls[0].id, "c1");
+  assert_eq!(round.results[0].id, "c1", "a result must keep its call's id");
+  assert_eq!(round.assistant.calls[1].id, "c2", "an unanswered call still gets its own id");
+  let ids: Vec<&str> = round.assistant.calls.iter().map(|c| c.id.as_str()).collect();
+  assert_eq!(ids, vec!["c1", "c2"], "ids are short and sequential");
+}
+
+#[test]
+fn shortening_is_stable_across_repeated_passes() {
+  let mut s = Session::default();
+  s.turns.push(session::Turn::default());
+  s.begin_round();
+  s.finish_round(
+    vec![crate::session::Call { id: "call_abc123".into(), name: "bash".into(), arguments: "{}".into() }],
+    vec![crate::session::ToolOutcome { id: "call_abc123".into(), name: "bash".into(), ok: true, ms: 1, output: "x".into() }],
+  );
+  let once = s.render();
+  s.shorten_ids();
+  s.shorten_ids();
+  assert_eq!(s.render(), once, "shortening twice must not renumber c1 -> c2");
+}
+
+// ---- context fill pressure
+
+#[test]
+fn the_window_line_appears_only_past_the_threshold() {
+  use crate::context::{refresh_paragraph, Window, PRUNE_THRESHOLD_PCT};
+  let path = std::path::Path::new("/t/1.md");
+  let at = |pct: u32| {
+    let budget = 100_000u32;
+    refresh_paragraph("base", path, Some(Window { used: (budget as usize * pct as usize) / 100, budget }))
+  };
+  assert!(!at(0).contains("Window:"), "a fresh session must not be nagged");
+  assert!(!at(PRUNE_THRESHOLD_PCT - 1).contains("Window:"), "one below the threshold must be quiet");
+  let hot = at(PRUNE_THRESHOLD_PCT);
+  assert!(hot.contains("Window:"), "the threshold itself must trigger: {hot}");
+  assert!(hot.contains("70%"), "the number must be stated: {hot}");
+  assert!(hot.contains("Prune"), "it must say what to do: {hot}");
+  assert_eq!(hot.matches("Window:").count(), 1);
+}
+
+#[test]
+fn a_zero_budget_does_not_divide_by_zero() {
+  use crate::context::{refresh_paragraph, Window};
+  let out = refresh_paragraph("base", std::path::Path::new("/t/1.md"), Some(Window { used: 999, budget: 0 }));
+  assert!(!out.contains("Window:"), "{out}");
+}
+
+#[test]
+fn a_subagent_is_never_offered_the_question_tool() {
+  use crate::flow;
+  let cfg = AppConfig::default();
+  // `question` is excluded when a subagent transcript is created, so the model can only reach the
+  // name by inventing it; the daemon refuses that rather than answering on the user's behalf.
+  let child = flow::subagent_task_template(&cfg, &["question".to_string()], "do the thing");
+  assert!(
+    !crate::tools::advertised(&child.config).iter().any(|t| t.function.name == "question"),
+    "question must not be offered to a subagent"
+  );
+  let path = scratch("subagent-question").join("parent.sub-01.md");
+  std::fs::write(&path, child.render()).unwrap();
+  assert!(flow::is_subagent_path(&path), "{} must look like a subagent", path.display());
+  // And a parent session keeps it.
+  let parent = flow::session_template(&cfg, &[]);
+  assert!(crate::tools::advertised(&parent.config).iter().any(|t| t.function.name == "question"));
 }

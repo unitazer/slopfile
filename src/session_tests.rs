@@ -461,9 +461,10 @@ fn request_messages_synthesizes_a_call_for_an_orphan_result() {
     question: None,
   });
   let messages = session.request_messages();
-  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "orphan");
+  // ids are renumbered to short per-round ones on the way out
+  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "c1");
   assert_eq!(messages[2].role, Role::Tool);
-  assert_eq!(messages[2].tool_call_id.as_deref(), Some("orphan"));
+  assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
 }
 
 #[test]
@@ -569,14 +570,14 @@ fn question_round_trip_and_answer() {
   assert_eq!(parsed.pending_question().expect("pending").questions, questions);
   let messages = parsed.request_messages();
   assert_eq!(messages.len(), 3);
-  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "q1");
+  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "c1");
   assert_eq!(messages[2].role, Role::Tool);
   assert_eq!(messages[2].content.as_deref(), Some(AWAITING_ANSWER));
 
   parsed.answer_question(vec![(1, "blue".to_string())]).expect("answer");
   assert!(parsed.pending_question().is_none());
   let messages = parsed.request_messages();
-  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "q1");
+  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "c1");
   assert!(
     messages[2].content.as_deref().unwrap().contains("\"answer\":\"blue\""),
     "{:?}",
@@ -759,7 +760,7 @@ fn finish_round_records_calls_and_results() {
   assert!(parsed.open.is_none(), "the turn closed");
   let round = &parsed.turns[0].rounds[0];
   assert_eq!(round.assistant.text.as_deref(), Some("calling"));
-  assert_eq!(round.assistant.calls[0].id, "c9");
+  assert_eq!(round.assistant.calls[0].id, "c1", "ids are shortened on write");
   assert_eq!(round.results[0].output, "boom");
   assert!(!round.results[0].ok);
   assert_eq!(parsed.render(), rendered);
@@ -951,7 +952,7 @@ fn answering_a_question_in_a_round_less_turn_does_not_panic() {
     .expect("a question without an assistant region is still answerable");
   let messages = session.request_messages();
   assert_eq!(messages.len(), 3, "{messages:?}");
-  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "q1");
+  assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "c1");
   assert!(messages[2].content.as_deref().unwrap().contains("yes"));
   assert!(session.answer_question(vec![]).is_err(), "nothing left to answer");
 }
