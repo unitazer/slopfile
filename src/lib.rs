@@ -27,6 +27,20 @@ pub fn discover_repo_root() -> Option<PathBuf> {
   candidates.into_iter().find(|d| d.join("shared").is_dir() && d.join("Cargo.toml").is_file())
 }
 
+/// Re-point a `shared/...` config value at the repo we were launched from. `/shared/transcripts`
+/// (what the container wants) and `shared/transcripts` (what the host wants) are the same directory
+/// bind-mounted, so the leading slash is the only difference. Anything else is left untouched.
+pub fn repo_relative(value: &str, root: &std::path::Path) -> String {
+  let trimmed = value.trim_start_matches('/');
+  if trimmed != value && !trimmed.starts_with("shared/") {
+    return value.to_string();
+  }
+  if trimmed == value && !value.starts_with("shared/") {
+    return value.to_string();
+  }
+  root.join(trimmed).to_string_lossy().into()
+}
+
 pub fn load_app_config() -> types::AppConfig {
   use std::env::var;
   use tracing::warn;
@@ -43,12 +57,11 @@ pub fn load_app_config() -> types::AppConfig {
     if cfg.workdir == "workspace" && root.join("workspace").is_dir() {
       cfg.workdir = root.join("workspace").to_string_lossy().into();
     }
-    if cfg.transcripts_dir == "shared/transcripts" && root.join("shared/transcripts").is_dir() {
-      cfg.transcripts_dir = root.join("shared/transcripts").to_string_lossy().into();
-    }
-    if cfg.skills_dir == "shared/skills" && root.join("shared/skills").is_dir() {
-      cfg.skills_dir = root.join("shared/skills").to_string_lossy().into();
-    }
+    // The one config file serves both sides: the daemon sees it as `/shared/transcripts` inside the
+    // container, while `sf` runs on the host where that path does not exist (and is not writable).
+    // Re-point any `shared/...` value at the repo we were actually run from, leading slash or not.
+    cfg.transcripts_dir = repo_relative(&cfg.transcripts_dir, &root);
+    cfg.skills_dir = repo_relative(&cfg.skills_dir, &root);
   }
   if let Ok(v) = var("SLOPFILE_API_BASE") {
     cfg.api_base = v;

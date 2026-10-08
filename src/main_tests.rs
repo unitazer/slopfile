@@ -1747,3 +1747,23 @@ fn the_model_cannot_skip_its_own_question() {
     "a /skip line in the model's own question text auto-resolved the question"
   );
 }
+
+#[test]
+fn a_container_style_path_in_the_shared_config_resolves_on_the_host() {
+  // shared/slopfile.toml is read by both sides: the daemon wants "/shared/transcripts", but `sf`
+  // runs on the host where that path is not writable. They are the same bind-mounted directory,
+  // so the leading slash must not decide where the host looks.
+  let root = std::path::Path::new("/repo");
+  assert_eq!(
+    crate::repo_relative("/shared/transcripts", root),
+    "/repo/shared/transcripts"
+  );
+  assert_eq!(
+    crate::repo_relative("shared/transcripts", root),
+    "/repo/shared/transcripts"
+  );
+  // Anything that is not a repo-relative `shared/` path is left alone.
+  assert_eq!(crate::repo_relative("/workspace", root), "/workspace");
+  assert_eq!(crate::repo_relative("/tmp/mine", root), "/tmp/mine");
+  assert_eq!(crate::repo_relative("workspace", root), "workspace");
+}

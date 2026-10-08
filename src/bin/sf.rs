@@ -98,6 +98,22 @@ async fn remote(
   session: &str,
   answers: Vec<String>,
 ) -> Result<(), String> {
+  with_timeout(remote_inner(addr, cmd, session, answers)).await
+}
+
+async fn with_timeout<F: std::future::Future<Output = Result<(), String>>>(f: F) -> Result<(), String> {
+  match tokio::time::timeout(std::time::Duration::from_secs(10), f).await {
+    Ok(r) => r,
+    Err(_) => Err("control: the daemon did not reply within 10s (is it running?)".to_string()),
+  }
+}
+
+async fn remote_inner(
+  addr: &str,
+  cmd: Cmd,
+  session: &str,
+  answers: Vec<String>,
+) -> Result<(), String> {
   let req = Req {
     cmd,
     session: session.to_string(),
@@ -126,6 +142,9 @@ fn cmd_name(cmd: Cmd) -> &'static str {
   }
 }
 
+
+/// Creating a session is pure local file work, and must work with no daemon running. The only hard
+/// part is finding the transcripts directory, which `load_app_config` now resolves for the host.
 fn init(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(), String> {
   let path = local_path(session, transcripts);
   if let Some(dir) = path.parent()
