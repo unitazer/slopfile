@@ -8,12 +8,14 @@ the code's definitely questionable at places but if it doesnt work just throw a 
 `slopfile` is a small daemon that turns a single Markdown file into a whole
 coding-agent session. You type a request at the bottom of the file, a daemon
 streams a `llama-server` response back into the same file — including tool
-calls (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `question`) —
+calls (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `question`,
+`subagent`) —
 and marks completion inline. No TUI, no database: the `.md` file *is* the UI.
 
 ```
 clanker/slopfile/            # the single git repo (source + docker + weights)
-├── src/  docs/  nvim/  tests/   # the Rust project
+├── src/                         # the Rust project (tests live beside the code, in-crate)
+├── nvim/plugin/slopfile.lua     # editor plugin, shells out to sf
 ├── docker/                    # compose stack + run.sh wrappers
 │   ├── docker-compose.yml
 │   ├── Dockerfile.slopfile
@@ -43,11 +45,18 @@ model writes can turn into structure.
 ```toml
 model = "qwen3.8-27b"
 thinking = "auto"
-tools = ["read", "write", "edit", "bash", "grep", "find", "ls"]
+tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent"]
 ```
 <!-- slopfile:begin -->
 <!-- slopfile:system -->
 You are an expert software engineering assistant…     <- the system prompt
+--- context (managed by slopfile) ---                 <- written by the harness, refreshed
+Context file: /shared/transcripts/1.md                  every request: the model is told
+…                                                     <- its path and that this file is
+                                                         its context. Past 70% full it also
+                                                         gets a "Window: … about N used (M%)"
+                                                         line telling it to go prune.
+--- end context ---
 <!-- /slopfile -->
 <!-- slopfile:turn -->                                 <- one user turn
 <!-- slopfile:user -->
@@ -84,6 +93,11 @@ type your next request here                          <- everything below is your
   is rendered into the `input` region below.
 - **`input`** — the only opaque region: it runs to the end of the file, so
   whatever you type there can never become structure.
+- **Any name you invent** inside a `turn` or an `assistant` is kept verbatim,
+  rendered back in place, and handed to the model under its own name. This is
+  deliberate: a model that keeps its own `scratchpad` or `ledger` is the point of
+  the whole design, so the harness refuses to invent names on its behalf. A
+  misplaced *known* region is still refused, with the grammar in the error.
 
 Anything the daemon writes into a body is escaped: a literal `<` is wrapped as
 `<!--slopfile:ESC[<<!--/slopfile:ESC-->`. Both wrapper delimiters start with
@@ -102,12 +116,56 @@ send again.
 2. The daemon promotes that text to a `user` region, opens an `assistant`
    region, and streams `reasoning` / `text` into it as tokens arrive.
 3. Tool calls land as `call` + `result` regions; the daemon loops until the
-   model stops asking for tools.
+   model stops asking for tools. One `sf send` opens a **burst** capped at 20
+   turns; hitting it writes a `note` into the file saying so, because going
+   quiet is indistinguishable from the model having finished.
 4. On clean completion the `turn` region is closed.
 5. `question` → the daemon renders a `QUESTIONS` table into `input` and waits.
    Answer below the `>` line (indices, comma separated, or free text) and
    `sf question <session> <answers…>`; `/skip` takes the defaults. In
    `confirmations = "yolo"` they auto-resolve.
+
+## Skills — capability as a file, not as code
+
+`shared/skills/*.md` is indexed into the system prompt (name + one-line
+description), and the model reads a file fully when a task matches it. This is
+the paper's design choice: keep as little as possible hard-coded at the harness
+level, so tools can be defined, added or revised at inference time. Adding a
+skill is adding a file — no rebuild, no tool schema in every request.
+
+| skill | what it is |
+|---|---|
+| `web-search.md` + `websearch.py` | key-free web search and page reading (DuckDuckGo lite + HTML→text) |
+| `session-edit.md` + `session-edit.py` | address regions of your own context file by name, never typing a marker |
+| `caveman.md`, `susycore.md`, `thermo-nuclear-…md` | yours |
+
+A skill may ship a helper script next to it; the model runs it with `bash`, so
+no new tool is registered.
+
+**They have to be chosen.** A skill the model does not decide to read does not
+happen, which is the cost of this design. The descriptions carry the trigger
+words for a reason.
+
+## The research driver (`research`)
+
+An unattended campaign driver on top of the same daemon: one LLM iteration per
+fresh transcript, a numeric score deciding commit-or-restore, so a long run
+cannot be poisoned by a single bad turn.
+
+```bash
+research --workdir /workspace \
+         --eval-cmd 'cargo run --release --bin eval' \
+         --max-iters 100 --maximize
+```
+
+Each iteration seeds a fresh transcript with the task, the `AGENTS.md` journal
+and the best score so far, then arms it over the control channel. It stops on
+`solve`, on `context_full`, or at the iteration cap. `--iter-timeout-secs`
+(default 2h) bounds a single wedged iteration.
+
+Note it is a **separate process** from the daemon and cannot see the daemon's
+in-memory state — it asks over the control channel instead. (Getting that wrong
+once made its stop condition dead code.)
 
 ## Run 1 — host (quick, no Docker for the daemon)
 
@@ -138,6 +196,8 @@ SLOPFILE_API_BASE=http://127.0.0.1:8080           \
 SLOPFILE_TRANSCRIPTS=/path/to/transcripts         \
 SLOPFILE_WORKDIR=/path/to/workspace               \
 SLOPFILE_ABORT_RESTART=1                          \
+SLOPFILE_SKILLS_DIR=/path/to/skills               \
+SLOPFILE_LLAMA_CONTAINER=clanker-llama            \
 slopfile
 ```
 
@@ -190,8 +250,9 @@ sf tokens <session>                    # token footprint vs the context budget
 
 `<session>` is a bare name (`1`, `1.md`) resolved inside the daemon's
 transcripts dir; path separators are refused. `--addr` (or `SF_ADDR`, default
-`127.0.0.1:8787`) points at the daemon, `--transcripts` (or
+`SLOPFILE_ADDR`) points at the daemon, `--transcripts` (or
 `SLOPFILE_TRANSCRIPTS`) at the local session dir used by `init` and `tokens`.
+The client has a 10s deadline, so it errors rather than hanging on a dead daemon.
 
 The wire is newline-delimited JSON, one request per TCP connection, on
 `127.0.0.1:8787` inside the container's compose network — see the
@@ -225,8 +286,10 @@ paths below so they work inside the compose network):
 | `SLOPFILE_API_BASE`      | `http://llama-server:8080` | talks to the `llama-server` service by name |
 | `SLOPFILE_TRANSCRIPTS`   | `/shared/transcripts`    | session files, on the shared volume |
 | `SLOPFILE_WORKDIR`       | `/workspace`    | where tool calls run/edit |
-```
-Then `workdir` in the compose env matches the `workspace/` bind mount.
+| `SLOPFILE_SKILLS_DIR`    | `/shared/skills` | `*.md` here are indexed into the system prompt |
+| `SF_ADDR`                | `0.0.0.0:8787`  | control port, published as `127.0.0.1:8787` on the host |
+
+`SLOPFILE_WORKDIR` matches the `workspace/` bind mount.
 
 `shared/` is mounted read-write in both containers; `models/` is read-only in
 `llama-server`.
@@ -287,16 +350,86 @@ demand and the daemon best-effort preloads it before streaming.
 ## App config reference (`slopfile.toml`)
 
 ```toml
-confirmations = "ask"          # "ask" waits for your answer; "yolo" auto-resolves questions
+confirmations = "ask"          # questions only: "ask" waits for you, "yolo" auto-resolves with
+                               # the question's default. It does NOT gate any tool -- nothing here
+                               # asks before running bash. An unrecognized value silently
+                               # becomes "ask", so check for typos.
 api_base = "http://127.0.0.1:8080"
 workdir = "/home/unitazer/things/clanker"      # tool-call root; edits are restricted to it
 transcripts_dir = ".../shared/transcripts"     # session files the daemon watches
 sweep_interval_ms = 250                        # poll cadence
 model = "qwen3.8-27b"                          # served model name
 tool_timeout_ms = 30000                        # per-tool bash timeout
+max_context_tokens = 65536                     # must equal ctx-size in presets.ini (see below)
 abort_restart_server = true                    # docker restart llama-server on abort
 llama_container = "clanker-llama"              # container to restart on abort
 ```
+
+`max_context_tokens` is the slopfile-side half of a pair — see
+[Things that must be kept in sync](#things-that-must-be-kept-in-sync-by-hand).
+
+## Things that must be kept in sync by hand
+
+Nothing enforces these three. All of them have bitten already, so check them
+whenever you touch either side.
+
+### 1. `max_context_tokens` must equal the server's `ctx-size`
+
+```diff
+  # shared/slopfile.toml
+  max_context_tokens = 65536
+
+  # shared/models/presets.ini
+  [qwen3.8-27b]
+  ctx-size = 65536
+```
+
+These are independent numbers in two different files, and slopfile's is only its
+*guess* at how much room the request has. The server's is authoritative.
+
+- **toml too high** — slopfile thinks it has room, builds a prompt that overflows
+  the real KV cache, and the server rejects it. This is the dangerous direction:
+  it fails at request time on whatever long session happens to hit it, with no
+  clue why.
+- **toml too low** — slopfile truncates history early and leaves the server's
+  context unused. Silent waste, no error.
+
+`ctx-size` only applies when the model loads, so a preset change needs the
+llama-server container restarted. Sessions that already carry a
+`max_context_tokens` line in their own ` ```toml ` fence override the app value,
+so those files need editing too.
+
+### 2. `shared/skills/session-edit.py` must match the Rust parser
+
+The skill parses the marker format independently of `src/session.rs`. Nothing
+keeps them in agreement except this note, so changing one without the other
+means the model writes edits the harness then refuses.
+
+Shared between them:
+
+| what | where |
+|---|---|
+| marker delimiters `<!-- slopfile:NAME -->` / `<!-- /slopfile -->` | `TOKEN_OPEN`/`TOKEN_CLOSE` in `src/session.rs`, `OPEN`/`CLOSE` in the script |
+| `<` escaping (`ESC_OPEN` + `<` + `ESC_CLOSE`) | `src/session.rs`, `escape()` in the script |
+| the grammar: `system`/`turn`/`input` at the top level, `user`/`note`/`assistant` in a turn, `reasoning`/`text`/`call` in an assistant | `LEAF_REGIONS`/`CONTAINER_REGIONS` in `src/session.rs`, `TOP_LEVEL`/`IN_TURN`/`IN_ASSISTANT` in the script |
+| `begin` and `input` being legitimately left open | both |
+| which names are reserved vs. model-invented roles | `RESERVED` in `src/session.rs`, `KNOWN` in the script |
+
+The script's `check` deliberately duplicates the placement rules so it refuses a
+bad edit *before* writing, instead of writing one the daemon rolls back. If you
+add a region to the Rust grammar, add it to both.
+
+Note the escaped form on disk is
+`<!--slopfile:ESC[<<!--/slopfile:ESC-->!-- slopfile:note -->`, which is why the
+script keys markers off `<!-- slopfile:` *with* the space: the escaped form has
+no space after `<!--`, so the two can never be confused.
+
+### 3. The context paragraph in `src/context.rs` vs. what the parser accepts
+
+The managed block tells the model things like "keep a running `note` region".
+When that text and the grammar disagree, the model writes something valid-looking
+that gets refused — which is how the word `notes` (plural) ended up in a session
+that only accepts `note`. When you change one, re-read the other.
 
 ## The model owns its own context
 
@@ -309,7 +442,13 @@ rewritten behind the model's back.
 
 - Compress a long turn, delete a dead tool round, keep a running `note` region, or
   wipe whole turns — whatever it leaves in the file is what it gets back.
-- Subagents get their own file, so they manage their own context too.
+- Subagents (`subagent` tool) get their own file named `<parent>.sub-NN.md`, so
+  they manage their own context too, and their final reply is delivered back into
+  the parent automatically. They are **not** offered the `question` tool — nobody
+  is watching a worker — and if the model invents the call anyway it gets a
+  refusal rather than a default answer invented on your behalf. A subagent is
+  also never `sf send`-able, so it runs autonomously until it stops calling
+  tools; the parent blocks on its report.
 - If the model fills the context mid-response, a harness `note` tells it to prune
   the file itself; if it doesn't, the usual drop-oldest truncation keeps the
   request inside the budget.
@@ -328,7 +467,19 @@ rewritten behind the model's back.
 - **The model never starts** — nothing arms a session on its own. `sf send` (or
   `:Send`) is what sets `armed`, and arming does not survive a daemon restart.
 - **`failed to parse session file`** — the daemon refuses to drive a file whose
-  regions are broken; the message names the region. Fix it by hand, then send.
+  regions are broken; the message names the region and states the grammar. Note
+  that an unknown name is only an error at the *top level* — inside a `turn` or
+  an `assistant` it is kept as a role you invented. Fix it by hand, then send.
+- **`stopped this burst after 20 turns`** — the model used its whole burst
+  budget, usually by polling a long job instead of backgrounding it. `bash` now
+  returns immediately for `nohup … &`, so this usually means a turn that is
+  making no progress; consider stopping it.
+- **`refusing to write`** from `session-edit.py` — the edit would not parse or
+  put a region where it has no meaning. It never wrote anything, so the
+  transcript is untouched; use `session-edit.py list` to get the real path.
+- **`context_full`** — the model hit the token cap. It is told to prune its own
+  file; if it does not, the harness drops old turns. Consider `max_context_tokens`
+  (see the sync section above).
 - **"waiting_answer"** — the model asked a question; answer below the `> `
   line and `:Send`, or add ` /skip`.
 - **Abort does nothing / can't restart server** — the container can't reach
@@ -337,4 +488,6 @@ rewritten behind the model's back.
 - **Empty buffer gets clobbered** — `slopfile init` refuses to touch a
   non-empty file; the nvim plugin never overwrites unsaved text.
 - **Daemon ignoring a file** — errors are throttled: a failing session is
-  skipped for 5s. Check `logs slopfile`.
+  skipped briefly, and after 5 consecutive failures it is *parked* until the
+  file changes on disk. `sf status` shows `parked=true`; edit the file to unpark.
+  Check `logs slopfile`.
