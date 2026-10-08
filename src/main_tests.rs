@@ -53,10 +53,12 @@ fn load(path: &Path) -> Session {
 fn with_question(input_tail: &str) -> Session {
   let mut session = session_template(&yolo_cfg(), &[]);
   session.turns.push(session::Turn {
+    custom: Vec::new(),
     user: Some("pick one".to_string()),
     notes: vec![],
     rounds: vec![session::Round {
       assistant: session::Assistant {
+        custom: Vec::new(),
         reasoning: None,
         text: Some("which?".to_string()),
         calls: vec![],
@@ -1987,4 +1989,81 @@ fn the_burst_cap_is_reported_in_the_transcript_not_silently() {
     msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("[harness] stopped"))),
     "the note must reach the model: {msgs:?}"
   );
+}
+
+// ---- model-invented roles (the paper's Figure 3b behavior)
+
+#[test]
+fn a_role_the_model_invents_is_kept_and_handed_back() {
+  // Exactly what the model tried: its own `notes` region, plus a `text` it put straight into a
+  // turn. The invented role must survive; the misplaced one must still be refused, but with an
+  // error that states the grammar instead of leaving the model to guess.
+  let raw = "\
+```toml
+model = \"qwen3.8-27b\"
+```
+<!-- slopfile:begin -->
+<!-- slopfile:system -->
+sys
+<!-- /slopfile -->
+<!-- slopfile:turn -->
+<!-- slopfile:user -->
+source the mods
+<!-- /slopfile -->
+<!-- slopfile:notes -->
+7 repos verified. Search running in background.
+<!-- /slopfile -->
+<!-- slopfile:assistant -->
+<!-- slopfile:scratchpad -->
+next: clone with --depth 1
+<!-- /slopfile -->
+<!-- /slopfile -->
+<!-- slopfile:input -->
+";
+  let p = scratch("custom-role").join("s.md");
+  std::fs::write(&p, raw).unwrap();
+  let s = transcript::load(&p).expect("an invented role must not be a parse error");
+  assert_eq!(s.turns[0].custom.len(), 1);
+  assert_eq!(s.turns[0].custom[0].0, "notes");
+  assert!(s.turns[0].custom[0].1.contains("7 repos verified"));
+  assert_eq!(s.turns[0].rounds[0].assistant.custom[0].0, "scratchpad");
+
+  // Round-trips, so the model finds its own role still there (the fence gains the harness's
+  // default `thinking`, which is expected and unrelated).
+  let again = s.render();
+  assert!(again.contains("<!-- slopfile:notes -->\n7 repos verified. Search running in background.\n<!-- /slopfile -->"), "{again}");
+  assert!(again.contains("<!-- slopfile:scratchpad -->\nnext: clone with --depth 1\n<!-- /slopfile -->"), "{again}");
+  let reparsed = transcript::load_str(&again);
+  assert_eq!(reparsed.turns[0].custom[0].0, "notes", "{again}");
+
+  // And comes back as context under its own name.
+  let msgs = s.request_messages();
+  assert!(
+    msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("7 repos verified"))),
+    "the invented role must reach the model: {msgs:?}"
+  );
+}
+
+#[test]
+fn a_misplaced_builtin_says_where_it_goes() {
+  let raw = "\
+```toml
+model = \"qwen3.8-27b\"
+```
+<!-- slopfile:begin -->
+<!-- slopfile:system -->
+sys
+<!-- /slopfile -->
+<!-- slopfile:turn -->
+<!-- slopfile:text -->
+a reply, but not inside an assistant
+<!-- /slopfile -->
+<!-- /slopfile -->
+<!-- slopfile:input -->
+";
+  let p = scratch("misplaced").join("s.md");
+  std::fs::write(&p, raw).unwrap();
+  let err = transcript::load(&p).expect_err("text straight into a turn is still wrong");
+  assert!(err.contains("assistant"), "the error must say where `text` belongs: {err}");
+  assert!(err.contains("invent"), "the error must say invented roles are allowed: {err}");
 }

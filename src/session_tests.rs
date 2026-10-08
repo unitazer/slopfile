@@ -83,6 +83,7 @@ fn sample_session() -> Session {
   };
   let mut session = Session::new(config, "you are helpful\nsecond line");
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("hi".to_string()),
     notes: vec![Note {
       by: NoteBy::Model,
@@ -90,6 +91,7 @@ fn sample_session() -> Session {
     }],
     rounds: vec![Round {
       assistant: Assistant {
+        custom: Vec::new(),
         reasoning: Some("look around first".to_string()),
         text: Some("on it".to_string()),
         calls: vec![Call {
@@ -109,10 +111,12 @@ fn sample_session() -> Session {
     question: None,
   });
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("now compress that".to_string()),
     notes: vec![],
     rounds: vec![Round {
       assistant: Assistant {
+        custom: Vec::new(),
         reasoning: None,
         text: Some("done".to_string()),
         calls: vec![],
@@ -446,6 +450,7 @@ fn request_messages_pairs_tool_calls_with_results() {
 fn request_messages_synthesizes_a_call_for_an_orphan_result() {
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("go".to_string()),
     notes: vec![],
     rounds: vec![Round {
@@ -471,6 +476,7 @@ fn request_messages_synthesizes_a_call_for_an_orphan_result() {
 fn multi_round_turn_keeps_each_assistant_with_its_own_results() {
   let round = |id: &str, text: &str, out: &str| Round {
     assistant: Assistant {
+    custom: Vec::new(),
       reasoning: None,
       text: Some(text.to_string()),
       calls: vec![Call {
@@ -489,6 +495,7 @@ fn multi_round_turn_keeps_each_assistant_with_its_own_results() {
   };
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("go".to_string()),
     notes: vec![],
     rounds: vec![round("a", "first", "one"), round("b", "second", "two")],
@@ -550,10 +557,12 @@ fn question_round_trip_and_answer() {
   };
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("pick".to_string()),
     notes: vec![],
     rounds: vec![Round {
       assistant: Assistant {
+        custom: Vec::new(),
         reasoning: None,
         text: Some("which?".to_string()),
         calls: vec![],
@@ -930,6 +939,7 @@ fn an_unreadable_fence_is_preserved_verbatim() {
 fn answering_a_question_in_a_round_less_turn_does_not_panic() {
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("pick".to_string()),
     notes: vec![],
     rounds: vec![],
@@ -962,6 +972,7 @@ fn promoting_input_never_overwrites_an_earlier_user_message() {
   // An abort before the first token leaves a turn holding a user message and an empty round.
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("first request".to_string()),
     notes: vec![],
     rounds: vec![Round::default()],
@@ -998,6 +1009,7 @@ fn every_call_gets_exactly_one_result() {
   };
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("go".into()),
     ..Turn::default()
   });
@@ -1035,6 +1047,7 @@ fn a_call_the_harness_skips_still_gets_a_result() {
   // `solve` stops the round early, so later calls have no outcome of their own.
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("go".into()),
     ..Turn::default()
   });
@@ -1111,6 +1124,7 @@ fn regions_out_of_place_are_reported_not_dropped() {
 fn a_model_note_never_produces_two_adjacent_assistant_messages() {
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: None,
     notes: vec![Note {
       by: NoteBy::Model,
@@ -1118,6 +1132,7 @@ fn a_model_note_never_produces_two_adjacent_assistant_messages() {
     }],
     rounds: vec![Round {
       assistant: Assistant {
+        custom: Vec::new(),
         reasoning: None,
         text: Some("Understood.".to_string()),
         calls: vec![],
@@ -1137,6 +1152,7 @@ fn a_model_note_never_produces_two_adjacent_assistant_messages() {
 fn rewinding_a_round_drops_its_calls_too() {
   let mut session = Session::default();
   session.turns.push(Turn {
+    custom: Vec::new(),
     user: Some("go".into()),
     ..Turn::default()
   });

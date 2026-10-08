@@ -32,18 +32,23 @@ pub fn save(path: &Path, session: &Session) -> Result<(), String> {
   write_file(path, session.render())
 }
 
+/// Parse a transcript we already hold in memory, applying the same refusal as `load`.
+pub fn load_str(text: &str) -> Session {
+  transcript_load_checked(text).expect("re-parsing our own render must stay clean")
+}
+
+fn transcript_load_checked(text: &str) -> Result<Session, String> {
+  let (session, report) = session::parse(text);
+  if !report.is_clean() {
+    return Err(report.problems().join("; "));
+  }
+  Ok(session)
+}
+
 /// Parse and refuse anything the model would have to fix by hand, with one canonical message.
 pub fn load(path: &Path) -> Result<Session, String> {
   let text = read_file(path)?;
-  let (session, report) = session::parse(&text);
-  if !report.is_clean() {
-    return Err(format!(
-      "failed to parse session file `{}`: {}",
-      path.display(),
-      report.problems().join("; ")
-    ));
-  }
-  Ok(session)
+  transcript_load_checked(&text).map_err(|why| format!("failed to parse session file `{}`: {why}", path.display()))
 }
 
 pub fn load_lenient(path: &Path) -> Result<(Session, ParseReport), String> {

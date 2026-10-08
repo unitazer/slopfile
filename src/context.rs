@@ -63,7 +63,7 @@ Context file: {path}{pressure}
 
 This conversation is that file, and keeping it usable is your job, not the harness's. Edit it with \
 the `edit`/`write` tools or with bash (sed, python, heredocs) to drop dead tool output, compress \
-turns you have finished with, keep a running notes region, or delete whole turns. Nothing is \
+turns you have finished with, keep a running `note` region, or invent a role of your own for it, or delete whole turns. Nothing is \
 summarized behind your back: whatever you leave in the file is exactly what you get as context on \
 the next call, so prune before the context fills up.
 
@@ -71,6 +71,12 @@ The file is a stack of regions. `<!-- slopfile:NAME -->` opens one, `<!-- /slopf
 and everything between is the body, copied out verbatim. Keep the ```toml fence and the `system` \
 region; drop or rewrite anything else. A turn counts as finished when its `turn` region is closed, \
 so close the ones you are done with.
+
+The grammar is: top level takes `system`, `turn` and `input`; a `turn` takes `user`, `note`, \
+`assistant`; an `assistant` takes `reasoning`, `text` and `call`. Anything else you name inside a \
+`turn` or an `assistant` is kept as your own role and handed back to you under that name, so you \
+can invent a `scratchpad` or a `ledger` and write in it as long as you like. `text` goes inside an \
+`assistant`, never straight into a `turn`.
 
 If your own text needs to contain one of those markers, wrap it so it stays text: \
 `<!--slopfile:ESC[<<!-- /slopfile -->]-->` keeps a literal close marker inside a body. An edit that \

@@ -16,6 +16,12 @@ pub const RESULT: &str = "result";
 pub const QUESTION: &str = "question";
 pub const INPUT: &str = "input";
 
+/// Names the harness gives meaning to. Anything else inside a `turn` or an `assistant` is a role
+/// the model invented, and is preserved rather than rejected.
+pub const RESERVED: &[&str] = &[
+  SYSTEM, TURN, USER, NOTE, ASSISTANT, REASONING, TEXT, CALL, RESULT, QUESTION, INPUT,
+];
+
 const TOKEN_OPEN: &str = "<!-- slopfile:";
 const TOKEN_CLOSE: &str = "<!-- /slopfile -->";
 const ESC_OPEN: &str = "<!--slopfile:ESC[";
@@ -121,11 +127,15 @@ pub struct Assistant {
   pub reasoning: Option<String>,
   pub text: Option<String>,
   pub calls: Vec<Call>,
+  /// Regions the model invented for itself, kept verbatim and handed back to it. The paper's
+  /// Figure 3b shows a CLM creating its own `notes` role; refusing unknown names made that
+  /// impossible and left the model rewriting the file blindly.
+  pub custom: Vec<(String, String)>,
 }
 
 impl Assistant {
   pub fn has_output(&self) -> bool {
-    self.reasoning.is_some() || self.text.is_some() || !self.calls.is_empty()
+    self.reasoning.is_some() || self.text.is_some() || !self.calls.is_empty() || !self.custom.is_empty()
   }
 }
 
@@ -174,6 +184,8 @@ pub struct Turn {
   pub notes: Vec<Note>,
   pub rounds: Vec<Round>,
   pub question: Option<PendingQuestion>,
+  /// Roles the model invented, kept verbatim in the order it wrote them.
+  pub custom: Vec<(String, String)>,
 }
 
 impl Turn {
@@ -523,7 +535,10 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
         open = Some(open_path(&stack, ""));
         break;
       }
-      if !CONTAINER_REGIONS.contains(&name) && !LEAF_REGIONS.contains(&name) {
+      if !CONTAINER_REGIONS.contains(&name)
+        && !LEAF_REGIONS.contains(&name)
+        && !matches!(stack.last().map(|n| n.name.as_str()), Some(ASSISTANT) | Some(TURN))
+      {
         report.unknown_regions.push(name.to_string());
       }
       stack.push(Node {
@@ -565,7 +580,9 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
         &mut payload_problems,
         name,
         &root_path,
-        "only `system`, `turn` and `input` may sit at the top level",
+        "top level holds only `system`, `turn`, `input`; a `turn` holds `user`, `note`, `assistant` \
+       (and any role you invent for yourself); an `assistant` holds `reasoning`, `text`, `call` \
+       (and any role you invent). `text` belongs inside `assistant`, not directly in a `turn`.",
       ),
     }
   }
@@ -629,7 +646,17 @@ fn turn_of(node: &Node, path: &[String], problems: &mut Vec<String>) -> Turn {
           problems,
         );
       }
-      name => misplaced(problems, name, path, "it does not belong inside a `turn`"),
+      name if !RESERVED.contains(&name) => {
+        // A role the model made up for itself. Kept as-is rather than refused.
+        turn.custom.push((name.to_string(), unescape(&child.body())));
+      }
+      name => misplaced(
+        problems,
+        name,
+        path,
+        "a `turn` holds `user`, `note` and `assistant` (plus any role you invent); `text` belongs \
+         inside an `assistant`, not straight into a `turn`",
+      ),
     }
   }
   if let Some(round) = current {
@@ -658,7 +685,16 @@ fn assistant_of(node: &Node, path: &[String], problems: &mut Vec<String>) -> Ass
           assistant.calls.push(call);
         }
       }
-      name => misplaced(problems, name, path, "it does not belong inside an `assistant`"),
+      name if !RESERVED.contains(&name) => {
+        assistant.custom.push((name.to_string(), unescape(&child.body())));
+      }
+      name => misplaced(
+        problems,
+        name,
+        path,
+        "an `assistant` holds `reasoning`, `text` and `call` (plus any role you invent); `user` and \
+         `note` belong directly in the `turn`",
+      ),
     }
   }
   assistant
@@ -736,6 +772,9 @@ impl Session {
         };
         out.push_str(&leaf(&note.text, NOTE, payload));
       }
+      for (name, body) in &turn.custom {
+        out.push_str(&leaf(body, name, None));
+      }
       for (ri, round) in turn.rounds.iter().enumerate() {
         let open_asst = open_here && open_assistant && ri + 1 == turn.rounds.len();
         out.push_str(&open_line(ASSISTANT, None));
@@ -758,6 +797,9 @@ impl Session {
         for call in &round.assistant.calls {
           out.push_str(&open_line(CALL, Some(&json(call))));
           out.push_str(&close_line());
+        }
+        for (name, body) in &round.assistant.custom {
+          out.push_str(&leaf_inner(body, name, None, false));
         }
         if !open_asst {
           out.push_str(&close_line());
@@ -876,6 +918,14 @@ impl Session {
           NoteBy::Harness => ChatMessage::user(text),
           NoteBy::Model => assistant_message(Some(text), None, Vec::new()),
         });
+      }
+      // A role the model gave itself comes back to it under its own name, so the thing it asked
+      // for is still the thing it can see.
+      for (_name, body) in &turn.custom {
+        let text = body.trim();
+        if !text.is_empty() {
+          out.push(assistant_message(Some(text), None, Vec::new()));
+        }
       }
       for round in turn.rounds.iter() {
         let mut calls = round.assistant.calls.clone();
