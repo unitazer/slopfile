@@ -4,11 +4,11 @@ use serde_json::json;
 
 use super::*;
 use crate::control::{self, Cmd, Req, SessionState};
-use crate::daemon::{next_action, run_calls, settle_tool_round, Action};
+use crate::daemon::{Action, next_action, run_calls, settle_tool_round};
 use crate::docker::restart_llama_server;
 use crate::flow::{
-  execute_tool_calls, has_report, questions_resolvable, resolve_questions, session_template,
-  spawn_subagent, subagent_depth, ToolPass,
+  ToolPass, execute_tool_calls, has_report, questions_resolvable, resolve_questions,
+  session_template, spawn_subagent, subagent_depth,
 };
 use crate::session::{self, Session};
 use crate::stream::StreamWriter;
@@ -201,7 +201,10 @@ fn docker_restart_speaks_the_docker_api_over_a_unix_socket() {
       .unwrap();
   });
   let err = restart_llama_server(path2.to_str().unwrap(), "ghost").unwrap_err();
-  assert!(err.contains("404"), "error must surface the status line: {err}");
+  assert!(
+    err.contains("404"),
+    "error must surface the status line: {err}"
+  );
   server2.join().unwrap();
   std::fs::remove_dir_all(&dir).ok();
 }
@@ -218,7 +221,11 @@ fn yolo_resolves_questions_with_the_first_option() {
   write_session(&path, &session);
 
   let after = load(&path);
-  assert!(after.input.is_empty(), "answer block consumed: {:?}", after.input);
+  assert!(
+    after.input.is_empty(),
+    "answer block consumed: {:?}",
+    after.input
+  );
   assert!(after.pending_question().is_none());
   let messages = after.request_messages();
   assert_eq!(messages.last().unwrap().role, Role::Tool);
@@ -297,7 +304,10 @@ fn skip_resolves_with_defaults() {
     confirmations: Confirmations::Ask,
     ..yolo_cfg()
   };
-  assert!(questions_resolvable(&session, &cfg), "/skip resolves in ask mode");
+  assert!(
+    questions_resolvable(&session, &cfg),
+    "/skip resolves in ask mode"
+  );
   resolve_questions(&mut session, &cfg).expect("resolve");
   assert!(session.input.is_empty());
   assert!(
@@ -354,7 +364,10 @@ fn stream_translates_raw_think_tags_and_drops_orphans() {
   w.finish_section();
 
   let after = read_to_string(&path).unwrap();
-  assert!(!after.contains("<think>") && !after.contains("</think>"), "{after}");
+  assert!(
+    !after.contains("<think>") && !after.contains("</think>"),
+    "{after}"
+  );
   assert!(after.contains("answer text"), "{after}");
   assert!(after.contains("ignored open"), "{after}");
   let parsed = load(&path);
@@ -476,7 +489,10 @@ fn session_template_has_default_header_and_prompt() {
   assert!(text.contains("<!-- slopfile:system -->"), "{text}");
   assert!(text.ends_with("<!-- slopfile:input -->\n"), "{text}");
   assert!(!text.contains("# Session"), "{text}");
-  assert!(text.contains("- read: Read files as numbered lines"), "{text}");
+  assert!(
+    text.contains("- read: Read files as numbered lines"),
+    "{text}"
+  );
   assert!(text.contains("Current working directory: /tmp"), "{text}");
 
   let messages = tpl.request_messages();
@@ -484,7 +500,10 @@ fn session_template_has_default_header_and_prompt() {
   assert_eq!(messages[0].role, Role::System);
   let prompt = messages[0].content.as_deref().unwrap();
   assert!(prompt.contains("expert software engineering assistant"));
-  assert!(!prompt.contains("# Session"), "heading stripped from prompt");
+  assert!(
+    !prompt.contains("# Session"),
+    "heading stripped from prompt"
+  );
 }
 
 #[test]
@@ -501,10 +520,16 @@ fn session_template_lists_skills() {
   let mut cfg = yolo_cfg();
   cfg.skills_dir = dir.to_string_lossy().into_owned();
   let text = session_template(&cfg, &[]).render();
-  assert!(text.contains("Skills available in"), "index missing: {text}");
+  assert!(
+    text.contains("Skills available in"),
+    "index missing: {text}"
+  );
   assert!(text.contains("- a-style.md: Use tabs"), "{text}");
   assert!(text.contains("- b-deploy.md: Always run the tests before shipping."));
-  assert!(!text.contains("notes.txt"), "non-md must be skipped: {text}");
+  assert!(
+    !text.contains("notes.txt"),
+    "non-md must be skipped: {text}"
+  );
 
   std::fs::write(
     dir.join("c-front.md"),
@@ -523,7 +548,10 @@ fn session_template_lists_skills() {
   )
   .unwrap();
   let text3 = session_template(&cfg, &[]).render();
-  assert!(!text3.contains("d-manual.md"), "disabled skill skipped: {text3}");
+  assert!(
+    !text3.contains("d-manual.md"),
+    "disabled skill skipped: {text3}"
+  );
   assert!(text3.contains("- c-front.md:"), "other skills still listed");
 }
 
@@ -554,8 +582,7 @@ fn subagent_depth_and_spawn_filtering() {
     "depth-2 child loses the subagent tool"
   );
   assert!(
-    t2.system.contains("nobody will answer")
-      && !t2.system.contains("call the `question` tool"),
+    t2.system.contains("nobody will answer") && !t2.system.contains("call the `question` tool"),
     "prompt adapts to a missing question tool"
   );
   assert!(
@@ -710,7 +737,11 @@ fn unfinished_subagents_block_the_parent() {
   ));
   assert!(has_report(&with_report, "01"));
   let waiting = crate::daemon::unfinished_subagents(&parent, &with_report).unwrap();
-  assert_eq!(waiting.len(), 1, "a reported child stops blocking: {waiting:?}");
+  assert_eq!(
+    waiting.len(),
+    1,
+    "a reported child stops blocking: {waiting:?}"
+  );
 
   assert!(
     !flow::inject_subagent_report(&mut with_report, "01", "all done", true),
@@ -742,13 +773,22 @@ async fn deliver_subagent_result_injects_once() {
     parent_text.contains("[system] Subagent '01' finished."),
     "{parent_text}"
   );
-  assert!(parent_text.contains("the full final report"), "{parent_text}");
+  assert!(
+    parent_text.contains("the full final report"),
+    "{parent_text}"
+  );
 
   let loaded = load(&parent);
   let messages = loaded.request_messages();
   assert_eq!(messages.len(), 2, "system + report turn: {messages:?}");
   assert_eq!(messages[1].role, Role::User);
-  assert!(messages[1].content.as_deref().unwrap().contains("the full final report"));
+  assert!(
+    messages[1]
+      .content
+      .as_deref()
+      .unwrap()
+      .contains("the full final report")
+  );
 
   crate::daemon::deliver_subagent_result(&child, crate::daemon::SubagentReport::FromTranscript)
     .await
@@ -789,11 +829,18 @@ fn creating_a_session_refuses_nonempty_and_reserved_names() {
   std::fs::write(&empty, "").unwrap();
   control::create_session(&empty, &cfg, &[]).expect("empty file initializes");
   let created = load(&empty);
-  assert!(created.system.contains("expert software engineering assistant"));
+  assert!(
+    created
+      .system
+      .contains("expert software engineering assistant")
+  );
   assert!(created.input.is_empty(), "a fresh session waits for input");
 
   let err = control::create_session(&empty, &cfg, &[]).unwrap_err();
-  assert!(err.contains("not empty"), "a second init must not clobber: {err}");
+  assert!(
+    err.contains("not empty"),
+    "a second init must not clobber: {err}"
+  );
 }
 
 #[tokio::test]
@@ -852,7 +899,10 @@ async fn control_round_trips_over_tcp() {
 
   let missing = ask(Cmd::Status, "no-such-task").await;
   assert!(!missing.ok, "a task with no file is an error: {missing:?}");
-  assert_eq!(missing.error.as_deref(), Some("no such task `no-such-task`"));
+  assert_eq!(
+    missing.error.as_deref(),
+    Some("no such task `no-such-task`")
+  );
 }
 
 #[tokio::test]
@@ -921,23 +971,28 @@ async fn answering_a_question_over_tcp_is_strict() {
   let after = load(&dir.join("pq.md"));
   assert!(after.pending_question().is_none());
   assert!(after.input.is_empty());
-  assert!(after
-    .request_messages()
-    .last()
-    .unwrap()
-    .content
-    .as_deref()
-    .unwrap()
-    .contains("\"answer\":\"blue\""));
+  assert!(
+    after
+      .request_messages()
+      .last()
+      .unwrap()
+      .content
+      .as_deref()
+      .unwrap()
+      .contains("\"answer\":\"blue\"")
+  );
 }
 
 #[tokio::test]
 async fn a_dead_daemon_reports_the_connect_error() {
-  let err = control::send_command("127.0.0.1:1", &Req {
-    cmd: Cmd::Status,
-    session: "x.md".to_string(),
-    answers: vec![],
-  })
+  let err = control::send_command(
+    "127.0.0.1:1",
+    &Req {
+      cmd: Cmd::Status,
+      session: "x.md".to_string(),
+      answers: vec![],
+    },
+  )
   .await
   .expect_err("nothing is listening on port 1");
   assert_eq!(
@@ -964,7 +1019,10 @@ fn arming_is_consumed_when_the_burst_settles() {
   let entry = state.arm_token();
   state.arm();
   state.settle(entry);
-  assert!(state.armed, "a send that landed mid-burst survives the settle");
+  assert!(
+    state.armed,
+    "a send that landed mid-burst survives the settle"
+  );
 
   let entry = state.arm_token();
   state.settle(entry);
@@ -984,8 +1042,6 @@ fn status_line_is_one_readable_row() {
   assert!(line.contains("pending_questions=2"), "{line}");
   assert!(!line.contains('\n'), "one line only: {line}");
 }
-
-
 
 #[tokio::test]
 async fn tool_calls_next_to_a_question_are_still_executed_and_recorded() {
@@ -1078,7 +1134,10 @@ fn only_the_tools_the_session_allows_are_advertised() {
     .collect();
   assert_eq!(names, vec!["read".to_string(), "bash".to_string()]);
   for name in &names {
-    assert!(cfg.config.allows_tool(name), "{name} is advertised but refused");
+    assert!(
+      cfg.config.allows_tool(name),
+      "{name} is advertised but refused"
+    );
   }
   assert!(!names.iter().any(|n| n == "subagent" || n == "question"));
 
@@ -1121,7 +1180,14 @@ async fn answering_over_tcp_arms_the_session_so_the_model_continues() {
 
   let after = load(&dir.join("arm-me.md"));
   assert_eq!(
-    next_action(&after, &AppConfig { confirmations: Confirmations::Ask, ..yolo_cfg() }, true),
+    next_action(
+      &after,
+      &AppConfig {
+        confirmations: Confirmations::Ask,
+        ..yolo_cfg()
+      },
+      true
+    ),
     Action::Generate,
     "the answered question leaves work for the model"
   );
@@ -1135,7 +1201,11 @@ fn content_after_the_fence_survives_every_render() {
   let once = session.render();
   assert!(once.contains("\n\nkeep this line\n"), "{once}");
   let (twice, _) = session::parse(&once);
-  assert_eq!(twice.render(), once, "rendering must not eat the blank line");
+  assert_eq!(
+    twice.render(),
+    once,
+    "rendering must not eat the blank line"
+  );
   assert!(
     twice.preamble.ends_with("\n\nkeep this line"),
     "{:?}",
@@ -1211,7 +1281,6 @@ fn every_session_name_normalizes_once() {
   );
 }
 
-
 // ---- round-2 review regressions
 
 #[test]
@@ -1285,9 +1354,12 @@ async fn a_pruned_report_turn_does_not_wedge_the_parent() {
   let child_path = dir.join("wedge.sub-01.md");
   write_session(&child_path, &child);
 
-  crate::daemon::deliver_subagent_result(&child_path, crate::daemon::SubagentReport::FromTranscript)
-    .await
-    .expect("deliver");
+  crate::daemon::deliver_subagent_result(
+    &child_path,
+    crate::daemon::SubagentReport::FromTranscript,
+  )
+  .await
+  .expect("deliver");
   assert!(read_to_string(&parent).unwrap().contains("the report"));
 
   // The model prunes the turn that holds the report, which its prompt explicitly invites.
@@ -1330,7 +1402,10 @@ async fn concurrent_report_deliveries_do_not_overwrite_each_other() {
   }
   let text = read_to_string(&parent).unwrap();
   for n in ["01", "02", "03", "04"] {
-    assert!(text.contains(&format!("report-{n}")), "report-{n} was lost:\n{text}");
+    assert!(
+      text.contains(&format!("report-{n}")),
+      "report-{n} was lost:\n{text}"
+    );
   }
 }
 
@@ -1378,14 +1453,20 @@ async fn concurrent_writes_leave_the_file_intact() {
     .map(|e| e.file_name().to_string_lossy().into_owned())
     .filter(|n| n.ends_with(".tmp"))
     .collect();
-  assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+  assert!(
+    leftovers.is_empty(),
+    "temp files left behind: {leftovers:?}"
+  );
   // Concurrent read-modify-write keeps only the last writer's view; what must hold is that the
   // file on disk is always a complete, parseable session and no scratch file is left behind.
   let final_text = read_to_string(&path).unwrap();
   assert!(final_text.contains("slopfile:system"), "{final_text}");
   let (parsed, report) = crate::session::parse(&final_text);
   assert!(report.is_clean(), "{:?}", report.problems());
-  assert!(parsed.render() == final_text, "the survivor is a fixed point");
+  assert!(
+    parsed.render() == final_text,
+    "the survivor is a fixed point"
+  );
 }
 
 #[tokio::test]
@@ -1416,7 +1497,11 @@ fn the_prompt_budget_leaves_room_for_the_answer() {
     "prompt + answer must fit the window"
   );
   assert_eq!(tokens::prompt_budget(0), 0);
-  assert_eq!(tokens::prompt_budget(3), 3, "no underflow when the allowance is zero");
+  assert_eq!(
+    tokens::prompt_budget(3),
+    3,
+    "no underflow when the allowance is zero"
+  );
 }
 
 #[test]
@@ -1439,7 +1524,11 @@ fn a_truncated_window_never_opens_with_the_assistant() {
       );
     } else {
       // Over budget: the caller must refuse rather than silently send an invalid window.
-      assert_ne!(roles.get(1), Some(&Role::Assistant), "budget {budget}: {roles:?}");
+      assert_ne!(
+        roles.get(1),
+        Some(&Role::Assistant),
+        "budget {budget}: {roles:?}"
+      );
     }
   }
 }
@@ -1471,7 +1560,10 @@ async fn a_relative_extra_read_root_resolves_for_read() {
 
   let absolute = tools::run(
     "read",
-    &format!(r#"{{"path":{:?}}}"#, skills.join("guide.md").to_string_lossy()),
+    &format!(
+      r#"{{"path":{:?}}}"#,
+      skills.join("guide.md").to_string_lossy()
+    ),
     workdir.clone(),
     30_000,
     &[root.clone()],
@@ -1489,7 +1581,11 @@ async fn a_relative_extra_read_root_resolves_for_read() {
     None,
   )
   .await;
-  assert!(!escaped.ok, "an escape must still be refused: {}", escaped.output);
+  assert!(
+    !escaped.ok,
+    "an escape must still be refused: {}",
+    escaped.output
+  );
 }
 
 // ---- round-4 review regressions
@@ -1516,10 +1612,17 @@ sys
   std::fs::write(&p, content).unwrap();
   let s = transcript::load(&p).expect("clean parse");
   let out = s.render();
-  assert!(out.contains("model = special-model"), "the fence was deleted:\n{out}");
+  assert!(
+    out.contains("model = special-model"),
+    "the fence was deleted:\n{out}"
+  );
   assert!(out.contains("# campaign notes"), "prose was lost:\n{out}");
   assert!(out.contains("keep me"), "prose was lost:\n{out}");
-  assert_eq!(out.matches("```toml").count(), 1, "the fence was duplicated:\n{out}");
+  assert_eq!(
+    out.matches("```toml").count(),
+    1,
+    "the fence was duplicated:\n{out}"
+  );
 
   // And the file the model is shown must still be editable by the model.
   assert!(
@@ -1556,7 +1659,10 @@ fn text_the_user_types_during_a_stream_is_not_clobbered() {
     after.contains("PLEASE ALSO REWRITE THE PARSER"),
     "the user's message was deleted by a flush:\n{after}"
   );
-  assert!(after.contains("hello"), "streamed output was lost:\n{after}");
+  assert!(
+    after.contains("hello"),
+    "streamed output was lost:\n{after}"
+  );
 }
 
 #[tokio::test]
@@ -1578,7 +1684,11 @@ async fn a_dangling_symlink_cannot_carry_a_write_out_of_the_workdir() {
     None,
   )
   .await;
-  assert!(!r.ok, "the write was allowed through a dangling symlink: {}", r.output);
+  assert!(
+    !r.ok,
+    "the write was allowed through a dangling symlink: {}",
+    r.output
+  );
   assert!(
     !outside.join("planted.txt").exists(),
     "a file was planted outside the workdir"
@@ -1600,7 +1710,11 @@ async fn truncating_a_command_is_not_reported_as_a_failed_command() {
   .await;
   // We drain to EOF rather than closing the pipe at the cap, so the command runs to completion
   // and its exit status is genuine: this one really did succeed.
-  assert!(r.ok, "a successful command was reported as a failure: {}", r.output);
+  assert!(
+    r.ok,
+    "a successful command was reported as a failure: {}",
+    r.output
+  );
   assert!(
     r.output.contains("truncated"),
     "the model is not told the output was cut: {:?}",
@@ -1622,14 +1736,25 @@ async fn read_output_is_capped() {
     None,
   )
   .await;
-  assert!(r.output.len() < 100_000, "read returned {} bytes uncapped", r.output.len());
-  assert!(r.output.contains("truncated"), "no note that it was cut: {:?}", &r.output[..r.output.len().min(200)]);
+  assert!(
+    r.output.len() < 100_000,
+    "read returned {} bytes uncapped",
+    r.output.len()
+  );
+  assert!(
+    r.output.contains("truncated"),
+    "no note that it was cut: {:?}",
+    &r.output[..r.output.len().min(200)]
+  );
 }
 
 #[test]
 fn a_control_request_is_bounded() {
   // No auth on the control port, so neither the line nor the session name may be unbounded.
-  assert!(crate::control::normalize(&"a".repeat(10_000)).is_err(), "an 10k session name was accepted");
+  assert!(
+    crate::control::normalize(&"a".repeat(10_000)).is_err(),
+    "an 10k session name was accepted"
+  );
   assert!(crate::control::normalize("reasonable-name").is_ok());
 }
 
@@ -1671,7 +1796,10 @@ out
     announced, answered,
     "every announced call needs a result or the server rejects the request: {msgs:?}"
   );
-  let ids: Vec<&str> = msgs.iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+  let ids: Vec<&str> = msgs
+    .iter()
+    .filter_map(|m| m.tool_call_id.as_deref())
+    .collect();
   let mut uniq = ids.clone();
   uniq.sort_unstable();
   uniq.dedup();
@@ -1731,7 +1859,11 @@ async fn a_killed_command_that_was_not_truncated_is_still_a_failure() {
     None,
   )
   .await;
-  assert!(!r.ok, "a command killed by a signal was called a success: {}", r.output);
+  assert!(
+    !r.ok,
+    "a command killed by a signal was called a success: {}",
+    r.output
+  );
 }
 
 #[test]
@@ -1785,8 +1917,15 @@ fn a_freshly_created_transcript_explains_itself_and_survives_a_round_trip() {
   // The managed block contains literal `<`, so it is escaped on render. It must come back
   // byte-identical, or the model would read a corrupted copy of its own instructions.
   let s = transcript::load(&p).expect("parse");
-  assert_eq!(s.render(), text, "the managed block did not survive parse->render");
-  assert!(s.system.contains("<!-- slopfile:NAME -->"), "markers came back escaped");
+  assert_eq!(
+    s.render(),
+    text,
+    "the managed block did not survive parse->render"
+  );
+  assert!(
+    s.system.contains("<!-- slopfile:NAME -->"),
+    "markers came back escaped"
+  );
 }
 
 // ---- short tool-call ids
@@ -1800,16 +1939,41 @@ fn ids_are_shortened_per_round_and_still_pair() {
   let long = "k4gU87g6xuj5cokczZ2Fq6BqxGdfosGX";
   s.finish_round(
     vec![
-      crate::session::Call { id: long.into(), name: "bash".into(), arguments: "{}".into() },
-      crate::session::Call { id: "BvPQlIyfPvWQm7P0l7RqaSxrAMfbjHte".into(), name: "read".into(), arguments: "{}".into() },
+      crate::session::Call {
+        id: long.into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+      },
+      crate::session::Call {
+        id: "BvPQlIyfPvWQm7P0l7RqaSxrAMfbjHte".into(),
+        name: "read".into(),
+        arguments: "{}".into(),
+      },
     ],
-    vec![crate::session::ToolOutcome { id: long.into(), name: "bash".into(), ok: true, ms: 1, output: "a".into() }],
+    vec![crate::session::ToolOutcome {
+      id: long.into(),
+      name: "bash".into(),
+      ok: true,
+      ms: 1,
+      output: "a".into(),
+    }],
   );
   let round = &s.turns[0].rounds[0];
   assert_eq!(round.assistant.calls[0].id, "c1");
-  assert_eq!(round.results[0].id, "c1", "a result must keep its call's id");
-  assert_eq!(round.assistant.calls[1].id, "c2", "an unanswered call still gets its own id");
-  let ids: Vec<&str> = round.assistant.calls.iter().map(|c| c.id.as_str()).collect();
+  assert_eq!(
+    round.results[0].id, "c1",
+    "a result must keep its call's id"
+  );
+  assert_eq!(
+    round.assistant.calls[1].id, "c2",
+    "an unanswered call still gets its own id"
+  );
+  let ids: Vec<&str> = round
+    .assistant
+    .calls
+    .iter()
+    .map(|c| c.id.as_str())
+    .collect();
   assert_eq!(ids, vec!["c1", "c2"], "ids are short and sequential");
 }
 
@@ -1819,29 +1983,59 @@ fn shortening_is_stable_across_repeated_passes() {
   s.turns.push(session::Turn::default());
   s.begin_round();
   s.finish_round(
-    vec![crate::session::Call { id: "call_abc123".into(), name: "bash".into(), arguments: "{}".into() }],
-    vec![crate::session::ToolOutcome { id: "call_abc123".into(), name: "bash".into(), ok: true, ms: 1, output: "x".into() }],
+    vec![crate::session::Call {
+      id: "call_abc123".into(),
+      name: "bash".into(),
+      arguments: "{}".into(),
+    }],
+    vec![crate::session::ToolOutcome {
+      id: "call_abc123".into(),
+      name: "bash".into(),
+      ok: true,
+      ms: 1,
+      output: "x".into(),
+    }],
   );
   let once = s.render();
   s.shorten_ids();
   s.shorten_ids();
-  assert_eq!(s.render(), once, "shortening twice must not renumber c1 -> c2");
+  assert_eq!(
+    s.render(),
+    once,
+    "shortening twice must not renumber c1 -> c2"
+  );
 }
 
 // ---- context fill pressure
 
 #[test]
 fn the_window_line_appears_only_past_the_threshold() {
-  use crate::context::{refresh_paragraph, Window, PRUNE_THRESHOLD_PCT};
+  use crate::context::{PRUNE_THRESHOLD_PCT, Window, refresh_paragraph};
   let path = std::path::Path::new("/t/1.md");
   let at = |pct: u32| {
     let budget = 100_000u32;
-    refresh_paragraph("base", path, Some(Window { used: (budget as usize * pct as usize) / 100, budget }))
+    refresh_paragraph(
+      "base",
+      path,
+      Some(Window {
+        used: (budget as usize * pct as usize) / 100,
+        budget,
+      }),
+    )
   };
-  assert!(!at(0).contains("Window:"), "a fresh session must not be nagged");
-  assert!(!at(PRUNE_THRESHOLD_PCT - 1).contains("Window:"), "one below the threshold must be quiet");
+  assert!(
+    !at(0).contains("Window:"),
+    "a fresh session must not be nagged"
+  );
+  assert!(
+    !at(PRUNE_THRESHOLD_PCT - 1).contains("Window:"),
+    "one below the threshold must be quiet"
+  );
   let hot = at(PRUNE_THRESHOLD_PCT);
-  assert!(hot.contains("Window:"), "the threshold itself must trigger: {hot}");
+  assert!(
+    hot.contains("Window:"),
+    "the threshold itself must trigger: {hot}"
+  );
   assert!(hot.contains("70%"), "the number must be stated: {hot}");
   assert!(hot.contains("Prune"), "it must say what to do: {hot}");
   assert_eq!(hot.matches("Window:").count(), 1);
@@ -1849,8 +2043,15 @@ fn the_window_line_appears_only_past_the_threshold() {
 
 #[test]
 fn a_zero_budget_does_not_divide_by_zero() {
-  use crate::context::{refresh_paragraph, Window};
-  let out = refresh_paragraph("base", std::path::Path::new("/t/1.md"), Some(Window { used: 999, budget: 0 }));
+  use crate::context::{Window, refresh_paragraph};
+  let out = refresh_paragraph(
+    "base",
+    std::path::Path::new("/t/1.md"),
+    Some(Window {
+      used: 999,
+      budget: 0,
+    }),
+  );
   assert!(!out.contains("Window:"), "{out}");
 }
 
@@ -1862,15 +2063,25 @@ fn a_subagent_is_never_offered_the_question_tool() {
   // name by inventing it; the daemon refuses that rather than answering on the user's behalf.
   let child = flow::subagent_task_template(&cfg, &["question".to_string()], "do the thing");
   assert!(
-    !crate::tools::advertised(&child.config).iter().any(|t| t.function.name == "question"),
+    !crate::tools::advertised(&child.config)
+      .iter()
+      .any(|t| t.function.name == "question"),
     "question must not be offered to a subagent"
   );
   let path = scratch("subagent-question").join("parent.sub-01.md");
   std::fs::write(&path, child.render()).unwrap();
-  assert!(flow::is_subagent_path(&path), "{} must look like a subagent", path.display());
+  assert!(
+    flow::is_subagent_path(&path),
+    "{} must look like a subagent",
+    path.display()
+  );
   // And a parent session keeps it.
   let parent = flow::session_template(&cfg, &[]);
-  assert!(crate::tools::advertised(&parent.config).iter().any(|t| t.function.name == "question"));
+  assert!(
+    crate::tools::advertised(&parent.config)
+      .iter()
+      .any(|t| t.function.name == "question")
+  );
 }
 
 // ---- backgrounding a job must not hang the call
@@ -1910,8 +2121,13 @@ async fn backgrounding_a_long_job_returns_immediately_with_its_output() {
     .status()
     .map(|s| s.success())
     .unwrap_or(false);
-  assert!(alive, "the harness killed the job it had just launched (pid {pid})");
-  let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+  assert!(
+    alive,
+    "the harness killed the job it had just launched (pid {pid})"
+  );
+  let _ = std::process::Command::new("kill")
+    .args(["-9", &pid.to_string()])
+    .status();
 }
 
 #[tokio::test]
@@ -1921,7 +2137,8 @@ async fn a_hung_foreground_command_still_times_out_and_kills_its_children() {
   let pid_file = wd.join("bg.pid");
   let r = tools::run(
     "bash",
-    &json!({ "command": format!("sleep 120 & echo $! > {}; sleep 120", pid_file.display()) }).to_string(),
+    &json!({ "command": format!("sleep 120 & echo $! > {}; sleep 120", pid_file.display()) })
+      .to_string(),
     wd.clone(),
     400,
     &[],
@@ -1930,14 +2147,21 @@ async fn a_hung_foreground_command_still_times_out_and_kills_its_children() {
   .await;
   assert!(!r.ok, "a hung command must time out");
   assert!(r.output.contains("timeout"), "{}", r.output);
-  let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+  let pid: i32 = std::fs::read_to_string(&pid_file)
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
   tokio::time::sleep(std::time::Duration::from_millis(200)).await;
   let alive = std::process::Command::new("kill")
     .args(["-0", &pid.to_string()])
     .status()
     .map(|s| s.success())
     .unwrap_or(false);
-  assert!(!alive, "the process-group kill missed the background child {pid}");
+  assert!(
+    !alive,
+    "the process-group kill missed the background child {pid}"
+  );
 }
 
 #[tokio::test]
@@ -1959,12 +2183,20 @@ async fn a_command_producing_too_much_output_still_runs_to_completion() {
     "stopping the read at the cap blocks the child on a full pipe: {:?}",
     started.elapsed()
   );
-  assert!(r.ok, "a successful command was called a failure: {}", r.output);
+  assert!(
+    r.ok,
+    "a successful command was called a failure: {}",
+    r.output
+  );
   assert!(
     !r.output.contains("TAILMARKER"),
     "the tail should have been cut, proving truncation happened"
   );
-  assert!(r.output.contains("truncated"), "no truncation note: {:?}", &r.output[..80]);
+  assert!(
+    r.output.contains("truncated"),
+    "no truncation note: {:?}",
+    &r.output[..80]
+  );
 }
 
 #[test]
@@ -1982,11 +2214,17 @@ fn the_burst_cap_is_reported_in_the_transcript_not_silently() {
   s.system = "sys".into();
   s.add_note(session::NoteBy::Harness, &note);
   let rendered = s.render();
-  assert!(rendered.contains("[harness] stopped this burst"), "{rendered}");
+  assert!(
+    rendered.contains("[harness] stopped this burst"),
+    "{rendered}"
+  );
   // and it must come back as a message, so the model actually reads it next turn
   let msgs = s.request_messages();
   assert!(
-    msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("[harness] stopped"))),
+    msgs.iter().any(|m| m
+      .content
+      .as_deref()
+      .is_some_and(|c| c.contains("[harness] stopped"))),
     "the note must reach the model: {msgs:?}"
   );
 }
@@ -2031,15 +2269,26 @@ next: clone with --depth 1
   // Round-trips, so the model finds its own role still there (the fence gains the harness's
   // default `thinking`, which is expected and unrelated).
   let again = s.render();
-  assert!(again.contains("<!-- slopfile:notes -->\n7 repos verified. Search running in background.\n<!-- /slopfile -->"), "{again}");
-  assert!(again.contains("<!-- slopfile:scratchpad -->\nnext: clone with --depth 1\n<!-- /slopfile -->"), "{again}");
+  assert!(
+    again.contains(
+      "<!-- slopfile:notes -->\n7 repos verified. Search running in background.\n<!-- /slopfile -->"
+    ),
+    "{again}"
+  );
+  assert!(
+    again.contains("<!-- slopfile:scratchpad -->\nnext: clone with --depth 1\n<!-- /slopfile -->"),
+    "{again}"
+  );
   let reparsed = transcript::load_str(&again);
   assert_eq!(reparsed.turns[0].custom[0].0, "notes", "{again}");
 
   // And comes back as context under its own name.
   let msgs = s.request_messages();
   assert!(
-    msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("7 repos verified"))),
+    msgs.iter().any(|m| m
+      .content
+      .as_deref()
+      .is_some_and(|c| c.contains("7 repos verified"))),
     "the invented role must reach the model: {msgs:?}"
   );
 }
@@ -2064,8 +2313,14 @@ a reply, but not inside an assistant
   let p = scratch("misplaced").join("s.md");
   std::fs::write(&p, raw).unwrap();
   let err = transcript::load(&p).expect_err("text straight into a turn is still wrong");
-  assert!(err.contains("assistant"), "the error must say where `text` belongs: {err}");
-  assert!(err.contains("invent"), "the error must say invented roles are allowed: {err}");
+  assert!(
+    err.contains("assistant"),
+    "the error must say where `text` belongs: {err}"
+  );
+  assert!(
+    err.contains("invent"),
+    "the error must say invented roles are allowed: {err}"
+  );
 }
 
 #[test]
@@ -2093,5 +2348,8 @@ sys
     out.contains("thinking = \"meduim\""),
     "the rejected value was silently rewritten to our default:\n{out}"
   );
-  assert!(out.contains("model = \"special-model\""), "the other settings were lost:\n{out}");
+  assert!(
+    out.contains("model = \"special-model\""),
+    "the other settings were lost:\n{out}"
+  );
 }

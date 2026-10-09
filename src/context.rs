@@ -2,8 +2,7 @@ use crate::session::{self, Session};
 use crate::types::{ChatMessage, Role};
 use std::path::Path;
 
-pub const CONTEXT_FULL_NOTE: &str =
-  "the model hit the token cap mid-response; this session file is your context, so edit it now to \
+pub const CONTEXT_FULL_NOTE: &str = "the model hit the token cap mid-response; this session file is your context, so edit it now to \
    drop or compress the useless old turns above, then write your next message below this note";
 
 /// Plain-text fences, not region markers: this text is written into the `system` region, and any
@@ -150,7 +149,7 @@ pub fn check_edit(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::session::{escape, ASSISTANT, BEGIN, SYSTEM, TEXT, TURN, USER};
+  use crate::session::{ASSISTANT, BEGIN, SYSTEM, TEXT, TURN, USER, escape};
 
   fn file(body: &str) -> String {
     format!(
@@ -167,7 +166,10 @@ mod tests {
   #[test]
   fn paragraph_names_the_path_and_the_region_rules() {
     let p = context_paragraph(Path::new("/t/shared/transcripts/1.md"));
-    assert!(p.contains("Context file: /t/shared/transcripts/1.md"), "{p}");
+    assert!(
+      p.contains("Context file: /t/shared/transcripts/1.md"),
+      "{p}"
+    );
     assert!(p.contains("prune before the context fills up"), "{p}");
     assert!(p.contains("<!-- /slopfile -->"), "{p}");
     assert!(p.contains("<!--slopfile:ESC["), "{p}");
@@ -192,8 +194,14 @@ mod tests {
     let first = refresh_paragraph("base", Path::new("/old/1.md"), None);
     let moved = refresh_paragraph(&first, Path::new("/new/1.md"), None);
     assert!(moved.contains("/new/1.md"), "{moved}");
-    assert!(!moved.contains("/old/1.md"), "a stale path survived: {moved}");
-    assert!(moved.starts_with("base"), "the model-authored part was lost: {moved}");
+    assert!(
+      !moved.contains("/old/1.md"),
+      "a stale path survived: {moved}"
+    );
+    assert!(
+      moved.starts_with("base"),
+      "the model-authored part was lost: {moved}"
+    );
   }
 
   #[test]
@@ -201,7 +209,10 @@ mod tests {
     let half = format!("base\n{}\nsome text the model was writing", CONTEXT_BEGIN);
     let fixed = refresh_paragraph(&half, Path::new("/t/1.md"), None);
     assert_eq!(fixed.matches(CONTEXT_BEGIN).count(), 1, "{fixed}");
-    assert!(!fixed.contains("some text the model was writing"), "{fixed}");
+    assert!(
+      !fixed.contains("some text the model was writing"),
+      "{fixed}"
+    );
   }
 
   #[test]
@@ -231,17 +242,16 @@ mod tests {
 
   #[test]
   fn edits_must_keep_the_toml_fence() {
-    let err = check_edit("<!-- slopfile:begin -->\n<!-- slopfile:system -->\ns\n<!-- /slopfile -->\n")
-      .expect_err("no fence");
+    let err =
+      check_edit("<!-- slopfile:begin -->\n<!-- slopfile:system -->\ns\n<!-- /slopfile -->\n")
+        .expect_err("no fence");
     assert!(err.contains("toml header"), "{err}");
   }
 
   #[test]
   fn edits_must_keep_the_system_region() {
-    let err = check_edit(&file(
-      "<!-- slopfile:turn -->\n<!-- /slopfile -->\n",
-    ))
-    .expect_err("no system region");
+    let err = check_edit(&file("<!-- slopfile:turn -->\n<!-- /slopfile -->\n"))
+      .expect_err("no system region");
     assert!(err.contains("system"), "{err}");
   }
 
@@ -267,7 +277,11 @@ mod tests {
   fn adopt_takes_a_pruned_edit() {
     let pruned = good().replace("hi\n", "");
     let edited = adopt(&pruned).expect("adopt");
-    assert_eq!(edited.turns[0].user.as_deref(), Some(""), "the user text is gone");
+    assert_eq!(
+      edited.turns[0].user.as_deref(),
+      Some(""),
+      "the user text is gone"
+    );
     assert_eq!(edited.system, "sys");
   }
 

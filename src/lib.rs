@@ -4,6 +4,7 @@ pub mod control;
 pub mod daemon;
 pub mod docker;
 pub mod flow;
+pub mod prompt;
 pub mod questions;
 pub mod research;
 pub mod session;
@@ -24,7 +25,9 @@ pub fn discover_repo_root() -> Option<PathBuf> {
   if let Ok(cwd) = std::env::current_dir() {
     candidates.extend(cwd.ancestors().map(Path::to_path_buf));
   }
-  candidates.into_iter().find(|d| d.join("shared").is_dir() && d.join("Cargo.toml").is_file())
+  candidates
+    .into_iter()
+    .find(|d| d.join("shared").is_dir() && d.join("Cargo.toml").is_file())
 }
 
 /// Re-point a `shared/...` config value at the repo we were launched from. `/shared/transcripts`

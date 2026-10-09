@@ -1,10 +1,10 @@
+use crate::api::LlamaClient;
 use crate::control::{self, Phase};
 use crate::flow;
 use crate::session::{self, Session, ToolOutcome};
 use crate::stream::StreamWriter;
 use crate::tokens;
 use crate::transcript;
-use crate::api::LlamaClient;
 use crate::types::{AppConfig, Confirmations};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -69,10 +69,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       return Ok(());
     }
     // While a question is pending the input region belongs to the answer UI, not to a new turn.
-    if session.has_input()
-      && !session.turn_in_progress()
-      && session.pending_question().is_none()
-    {
+    if session.has_input() && !session.turn_in_progress() && session.pending_question().is_none() {
       session.promote_input();
       transcript::save(path, &session)?;
     }
@@ -98,10 +95,11 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       }
       s.pending_questions = session.pending_question().map_or(0, |q| q.questions.len());
       s.armed
-    // A subagent is autonomous: nobody is watching it and nobody will ever run `sf send` on it,
-    // so waiting for an armed flag would wedge it after one round and hang the parent that is
-    // blocked on its report. This is about liveness, not about answering questions for it.
-    }) || is_sub || eff_cfg.confirmations == Confirmations::Yolo;
+      // A subagent is autonomous: nobody is watching it and nobody will ever run `sf send` on it,
+      // so waiting for an armed flag would wedge it after one round and hang the parent that is
+      // blocked on its report. This is about liveness, not about answering questions for it.
+    }) || is_sub
+      || eff_cfg.confirmations == Confirmations::Yolo;
 
     match next_action(&session, &eff_cfg, armed) {
       Action::Idle => {
@@ -226,7 +224,10 @@ async fn run_generation_turn(
   crate::context::attach_context_file(
     &mut messages,
     path,
-    Some(crate::context::Window { used: plan.token_count, budget }),
+    Some(crate::context::Window {
+      used: plan.token_count,
+      budget,
+    }),
   );
 
   let max_tokens = tokens::output_allowance(tokens::context_budget(&work, cfg));
@@ -255,10 +256,10 @@ async fn run_generation_turn(
       .chat_stream(
         &model,
         &messages,
-(!tool_defs.is_empty()).then_some(tool_defs.as_slice()),
-      max_tokens,
-      thinking,
-      |ev| active.handle(&ev),
+        (!tool_defs.is_empty()).then_some(tool_defs.as_slice()),
+        max_tokens,
+        thinking,
+        |ev| active.handle(&ev),
         || !control::update(name, |s| s.take_abort()),
       )
       .await
@@ -456,18 +457,24 @@ fn final_assistant_text(session: &Session) -> Option<String> {
 }
 
 fn subagent_parent_path(child: &Path) -> Result<PathBuf, String> {
-  let dir = child.parent().ok_or("subagent transcript has no directory")?;
+  let dir = child
+    .parent()
+    .ok_or("subagent transcript has no directory")?;
   let stem = child
     .file_stem()
     .ok_or("subagent transcript has no file stem")?
     .to_string_lossy()
     .into_owned();
-  let ix = stem.rfind(flow::SUBAGENT_SUFFIX).ok_or("not a subagent transcript")?;
+  let ix = stem
+    .rfind(flow::SUBAGENT_SUFFIX)
+    .ok_or("not a subagent transcript")?;
   Ok(dir.join(format!("{}.md", &stem[..ix])))
 }
 
 pub fn child_paths(parent: &Path) -> Result<Vec<PathBuf>, String> {
-  let dir = parent.parent().ok_or("parent transcript has no directory")?;
+  let dir = parent
+    .parent()
+    .ok_or("parent transcript has no directory")?;
   let stem = parent
     .file_stem()
     .ok_or("parent transcript has no file stem")?
@@ -499,7 +506,10 @@ pub fn child_paths(parent: &Path) -> Result<Vec<PathBuf>, String> {
   Ok(out)
 }
 
-pub(crate) fn unfinished_subagents(parent: &Path, parent_session: &Session) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn unfinished_subagents(
+  parent: &Path,
+  parent_session: &Session,
+) -> Result<Vec<PathBuf>, String> {
   Ok(
     child_paths(parent)?
       .into_iter()

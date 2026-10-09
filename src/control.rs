@@ -118,7 +118,8 @@ pub fn snapshot(name: &str) -> SessionState {
 }
 
 pub fn session_name(path: &Path) -> String {
-  path.file_stem()
+  path
+    .file_stem()
     .map(|s| s.to_string_lossy().into_owned())
     .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
@@ -234,7 +235,10 @@ pub enum ControlError {
 impl std::fmt::Display for ControlError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      Self::Connect(_) => write!(f, "unable to establish tcp connection, is the daemon running?"),
+      Self::Connect(_) => write!(
+        f,
+        "unable to establish tcp connection, is the daemon running?"
+      ),
       Self::Protocol(m) => write!(f, "{m}"),
       Self::Failed(m) => write!(f, "{m}"),
     }
@@ -257,7 +261,9 @@ pub async fn send_command(addr: &str, req: &Req) -> Result<Resp, ControlError> {
     .await
     .map_err(|_| ControlError::Connect(addr.to_string()))?;
   if reply.trim().is_empty() {
-    return Err(ControlError::Protocol("daemon closed the connection without replying".into()));
+    return Err(ControlError::Protocol(
+      "daemon closed the connection without replying".into(),
+    ));
   }
   serde_json::from_str(&reply).map_err(|e| ControlError::Protocol(format!("bad reply: {e}")))
 }
@@ -424,7 +430,12 @@ pub fn create_session(path: &Path, cfg: &AppConfig, excluded: &[String]) -> Resu
       flow::SUBAGENT_SUFFIX
     ));
   }
-  if path.exists() && !transcript::read_file(path).unwrap_or_default().trim().is_empty() {
+  if path.exists()
+    && !transcript::read_file(path)
+      .unwrap_or_default()
+      .trim()
+      .is_empty()
+  {
     return Err(format!(
       "{} exists and is not empty; refusing to overwrite",
       path.display()

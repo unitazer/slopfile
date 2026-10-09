@@ -33,7 +33,9 @@ pub const ESC_TOKENS: &[&str] = &["<"];
 
 pub const AWAITING_ANSWER: &str = "(awaiting the user's answer)";
 
-const LEAF_REGIONS: &[&str] = &[SYSTEM, USER, NOTE, REASONING, TEXT, CALL, RESULT, QUESTION, INPUT];
+const LEAF_REGIONS: &[&str] = &[
+  SYSTEM, USER, NOTE, REASONING, TEXT, CALL, RESULT, QUESTION, INPUT,
+];
 const CONTAINER_REGIONS: &[&str] = &[TURN, ASSISTANT];
 
 pub fn escape(body: &str) -> String {
@@ -135,7 +137,10 @@ pub struct Assistant {
 
 impl Assistant {
   pub fn has_output(&self) -> bool {
-    self.reasoning.is_some() || self.text.is_some() || !self.calls.is_empty() || !self.custom.is_empty()
+    self.reasoning.is_some()
+      || self.text.is_some()
+      || !self.calls.is_empty()
+      || !self.custom.is_empty()
   }
 }
 
@@ -190,11 +195,17 @@ pub struct Turn {
 
 impl Turn {
   pub fn is_empty(&self) -> bool {
-    self.user.is_none() && self.notes.is_empty() && self.rounds.is_empty() && self.question.is_none()
+    self.user.is_none()
+      && self.notes.is_empty()
+      && self.rounds.is_empty()
+      && self.question.is_none()
   }
 
   pub fn has_output(&self) -> bool {
-    self.rounds.iter().any(|r| r.assistant.has_output() || !r.results.is_empty())
+    self
+      .rounds
+      .iter()
+      .any(|r| r.assistant.has_output() || !r.results.is_empty())
   }
 
   /// The model still owes a reply when its last round came back with tool results it has not
@@ -249,7 +260,9 @@ impl ParseReport {
       out.push(format!("unknown region `{name}`"));
     }
     if self.duplicate_close {
-      out.push(format!("`{TOKEN_CLOSE}` closes a region that was never opened"));
+      out.push(format!(
+        "`{TOKEN_CLOSE}` closes a region that was never opened"
+      ));
     }
     for line in &self.swallowed {
       out.push(line.clone());
@@ -313,7 +326,11 @@ pub fn toml_fence(config: &SessionConfig) -> String {
   }
   out.push_str(&format!("thinking = \"{}\"\n", config.thinking));
   if let Some(tools) = &config.tools {
-    let list = tools.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
+    let list = tools
+      .iter()
+      .map(|t| format!("\"{t}\""))
+      .collect::<Vec<_>>()
+      .join(", ");
     out.push_str(&format!("tools = [{list}]\n"));
   }
   if !config.tools_excluded.is_empty() {
@@ -507,7 +524,10 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
         continue;
       }
       if name == INPUT {
-        if stack.last().is_some_and(|n| !CONTAINER_REGIONS.contains(&n.name.as_str())) {
+        if stack
+          .last()
+          .is_some_and(|n| !CONTAINER_REGIONS.contains(&n.name.as_str()))
+        {
           let leaf = stack.pop().expect("open leaf");
           open = Some(open_path(&stack, &leaf.name));
           attach(&mut stack, &mut roots, leaf);
@@ -524,16 +544,16 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
         input_consumed = true;
         break;
       }
-      if stack.last().is_some_and(|n| !CONTAINER_REGIONS.contains(&n.name.as_str())) {
+      if stack
+        .last()
+        .is_some_and(|n| !CONTAINER_REGIONS.contains(&n.name.as_str()))
+      {
         let after: Vec<String> = lines[ix..]
           .iter()
           .filter_map(|l| open_marker(l).map(|(n, _)| n.to_string()))
           .collect();
         if !after.is_empty() {
-          let owner = stack
-            .last()
-            .map(|n| n.name.clone())
-            .unwrap_or_default();
+          let owner = stack.last().map(|n| n.name.clone()).unwrap_or_default();
           report.swallowed.push(format!(
             "`{owner}` was left unclosed, so `{}` and {} more region(s) became plain text",
             after.join("`, `"),
@@ -547,7 +567,10 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
       }
       if !CONTAINER_REGIONS.contains(&name)
         && !LEAF_REGIONS.contains(&name)
-        && !matches!(stack.last().map(|n| n.name.as_str()), Some(ASSISTANT) | Some(TURN))
+        && !matches!(
+          stack.last().map(|n| n.name.as_str()),
+          Some(ASSISTANT) | Some(TURN)
+        )
       {
         report.unknown_regions.push(name.to_string());
       }
@@ -598,7 +621,9 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
     let root_path = vec![root.name.clone()];
     match root.name.as_str() {
       SYSTEM => session.system = unescape(&root.body()),
-      TURN => session.turns.push(turn_of(root, &root_path, &mut payload_problems)),
+      TURN => session
+        .turns
+        .push(turn_of(root, &root_path, &mut payload_problems)),
       INPUT => session.input = root.body(),
       name => misplaced(
         &mut payload_problems,
@@ -641,7 +666,9 @@ fn turn_of(node: &Node, path: &[String], problems: &mut Vec<String>) -> Turn {
   let mut current: Option<Round> = None;
   for child in node.children.iter() {
     match child.name.as_str() {
-      USER if turn.user.is_some() => misplaced(problems, &child.name, path, "a second `user` region"),
+      USER if turn.user.is_some() => {
+        misplaced(problems, &child.name, path, "a second `user` region")
+      }
       USER => turn.user = Some(unescape(&child.body())),
       NOTE => turn.notes.push(Note {
         by: note_by(&child.payload),
@@ -672,7 +699,9 @@ fn turn_of(node: &Node, path: &[String], problems: &mut Vec<String>) -> Turn {
       }
       name if !RESERVED.contains(&name) => {
         // A role the model made up for itself. Kept as-is rather than refused.
-        turn.custom.push((name.to_string(), unescape(&child.body())));
+        turn
+          .custom
+          .push((name.to_string(), unescape(&child.body())));
       }
       name => misplaced(
         problems,
@@ -710,7 +739,9 @@ fn assistant_of(node: &Node, path: &[String], problems: &mut Vec<String>) -> Ass
         }
       }
       name if !RESERVED.contains(&name) => {
-        assistant.custom.push((name.to_string(), unescape(&child.body())));
+        assistant
+          .custom
+          .push((name.to_string(), unescape(&child.body())));
       }
       name => misplaced(
         problems,
@@ -804,11 +835,11 @@ impl Session {
         out.push_str(&open_line(ASSISTANT, None));
         if let Some(r) = &round.assistant.reasoning {
           out.push_str(&leaf_inner(
-          r,
-          REASONING,
-          None,
-          !(open_asst && open_section == Some(REASONING)),
-        ));
+            r,
+            REASONING,
+            None,
+            !(open_asst && open_section == Some(REASONING)),
+          ));
         }
         if let Some(t) = &round.assistant.text {
           out.push_str(&leaf_inner(
@@ -962,7 +993,12 @@ impl Session {
             });
           }
         }
-        let text = round.assistant.text.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        let text = round
+          .assistant
+          .text
+          .as_deref()
+          .map(str::trim)
+          .filter(|t| !t.is_empty());
         let reasoning = round
           .assistant
           .reasoning

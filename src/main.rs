@@ -128,18 +128,28 @@ async fn main() {
     let files = match scan_transcripts(&app_cfg.transcripts_dir) {
       Ok(files) => files,
       Err(e) => {
-        error!("cannot scan {}: {e}; no session will be driven this sweep", app_cfg.transcripts_dir);
+        error!(
+          "cannot scan {}: {e}; no session will be driven this sweep",
+          app_cfg.transcripts_dir
+        );
         continue;
       }
     };
     // Entries for files that no longer exist are never revisited, so they would accumulate forever.
     {
-      let live: std::collections::HashSet<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
+      let live: std::collections::HashSet<&std::path::Path> =
+        files.iter().map(|p| p.as_path()).collect();
       let mut throttled = throttled.lock().await;
       throttled.retain(|p, _| live.contains(p.as_path()));
       drop(throttled);
-      parked.lock().await.retain(|p, _| live.contains(p.as_path()));
-      failures.lock().await.retain(|p, _| live.contains(p.as_path()));
+      parked
+        .lock()
+        .await
+        .retain(|p, _| live.contains(p.as_path()));
+      failures
+        .lock()
+        .await
+        .retain(|p, _| live.contains(p.as_path()));
     }
     for path in files {
       let name = control::session_name(&path);
@@ -209,15 +219,13 @@ async fn main() {
 
 async fn dispatch(command: Command, cfg: &slopfile::types::AppConfig, addr: &str) {
   let (cmd, session, answers) = match command {
-    Command::Init { path } => {
-      match slopfile::cmd_init(&path, cfg) {
-        Ok(()) => return,
-        Err(e) => {
-          eprintln!("{e}");
-          std::process::exit(1);
-        }
+    Command::Init { path } => match slopfile::cmd_init(&path, cfg) {
+      Ok(()) => return,
+      Err(e) => {
+        eprintln!("{e}");
+        std::process::exit(1);
       }
-    }
+    },
     Command::Send { session } => (Cmd::Send, session, vec![]),
     Command::Abort { session } => (Cmd::Abort, session, vec![]),
     Command::Stop { session } => (Cmd::Stop, session, vec![]),

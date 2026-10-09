@@ -404,7 +404,10 @@ pub struct SessionConfig {
 impl SessionConfig {
   pub fn allows_tool(&self, name: &str) -> bool {
     !self.tools_excluded.iter().any(|t| t == name)
-      && self.tools.as_ref().is_none_or(|l| l.iter().any(|t| t == name))
+      && self
+        .tools
+        .as_ref()
+        .is_none_or(|l| l.iter().any(|t| t == name))
   }
 }
 

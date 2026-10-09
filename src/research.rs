@@ -55,8 +55,8 @@ pub struct IterationResult {
 
 pub async fn run(opts: ResearchOpts) -> Result<(), String> {
   verify_workdir(&opts)?;
-  let agents_md =
-    std::fs::read_to_string(opts.workdir.join(AGENTS_FILE)).map_err(|e| format!("{AGENTS_FILE}: {e}"))?;
+  let agents_md = std::fs::read_to_string(opts.workdir.join(AGENTS_FILE))
+    .map_err(|e| format!("{AGENTS_FILE}: {e}"))?;
   std::fs::create_dir_all(&opts.transcripts_dir).map_err(|e| format!("transcripts dir: {e}"))?;
 
   let mut best = read_best_score(&opts.workdir)?;
@@ -65,13 +65,20 @@ pub async fn run(opts: ResearchOpts) -> Result<(), String> {
     "research: workdir={} eval=\"{}\" direction={} best={:?} starting at iter {iter}",
     opts.workdir.display(),
     opts.eval_cmd,
-    if opts.maximize { "maximize" } else { "minimize" },
+    if opts.maximize {
+      "maximize"
+    } else {
+      "minimize"
+    },
     best
   );
 
   loop {
     if iter > opts.max_iters {
-      info!("research: iteration budget of {} reached; stopping", opts.max_iters);
+      info!(
+        "research: iteration budget of {} reached; stopping",
+        opts.max_iters
+      );
       break;
     }
 
@@ -84,7 +91,8 @@ pub async fn run(opts: ResearchOpts) -> Result<(), String> {
     // channel, so a driver that forgot this would just wait out the iteration timeout.
     arm(&opts.addr, &path).await?;
 
-    let outcome = wait_for_iteration(&path, &opts.addr, opts.poll_ms, opts.iter_timeout_secs).await?;
+    let outcome =
+      wait_for_iteration(&path, &opts.addr, opts.poll_ms, opts.iter_timeout_secs).await?;
     if outcome.aborted {
       warn!("✗ iter {iter}: session was aborted");
     }
@@ -138,7 +146,8 @@ fn verify_workdir(opts: &ResearchOpts) -> Result<(), String> {
   if !wd.is_dir() {
     return Err(format!("workdir does not exist: {}", wd.display()));
   }
-  git(wd, &["rev-parse", "--git-dir"]).map_err(|_| format!("{} is not a git repository", wd.display()))?;
+  git(wd, &["rev-parse", "--git-dir"])
+    .map_err(|_| format!("{} is not a git repository", wd.display()))?;
   if !wd.join(AGENTS_FILE).is_file() {
     return Err(format!("missing {AGENTS_FILE} in {}", wd.display()));
   }
@@ -166,7 +175,11 @@ fn git(workdir: &Path, args: &[&str]) -> Result<String, String> {
     .output()
     .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
   if !out.status.success() {
-    let mut msg = format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    let mut msg = format!(
+      "git {}: {}",
+      args.join(" "),
+      String::from_utf8_lossy(&out.stderr).trim()
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !stdout.trim().is_empty() {
       msg.push('\n');
@@ -178,13 +191,26 @@ fn git(workdir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 pub fn baseline_exists(workdir: &Path) -> bool {
-  git(workdir, &["rev-parse", "-q", "--verify", &format!("refs/tags/{BASELINE_TAG}")]).is_ok()
+  git(
+    workdir,
+    &[
+      "rev-parse",
+      "-q",
+      "--verify",
+      &format!("refs/tags/{BASELINE_TAG}"),
+    ],
+  )
+  .is_ok()
 }
 
 pub fn sanitize(workdir: &Path) -> Result<(), String> {
   let has_commits = git(workdir, &["rev-parse", "-q", "--verify", "HEAD"]).is_ok();
   if has_commits {
-    let target = if baseline_exists(workdir) { BASELINE_TAG } else { "HEAD" };
+    let target = if baseline_exists(workdir) {
+      BASELINE_TAG
+    } else {
+      "HEAD"
+    };
     git(workdir, &["reset", "--hard", target])?;
   }
   git(workdir, &["clean", "-fd"])?;
@@ -209,7 +235,15 @@ pub fn read_best_score(workdir: &Path) -> Result<Option<f64>, String> {
   if !baseline_exists(workdir) {
     return Ok(None);
   }
-  let subject = git(workdir, &["log", "-1", "--format=%s", &format!("refs/tags/{BASELINE_TAG}")])?;
+  let subject = git(
+    workdir,
+    &[
+      "log",
+      "-1",
+      "--format=%s",
+      &format!("refs/tags/{BASELINE_TAG}"),
+    ],
+  )?;
   Ok(parse_score_subject(&subject))
 }
 
@@ -234,7 +268,11 @@ pub async fn run_eval(opts: &ResearchOpts) -> Result<f64, String> {
   let mut stdout = child.stdout.take().expect("stdout is piped");
   let mut stderr = child.stderr.take().expect("stderr is piped");
 
-  let timeout_secs = if opts.eval_timeout_secs == 0 { u64::MAX } else { opts.eval_timeout_secs };
+  let timeout_secs = if opts.eval_timeout_secs == 0 {
+    u64::MAX
+  } else {
+    opts.eval_timeout_secs
+  };
   let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
     let (mut out_s, mut err_s) = (String::new(), String::new());
     let _ = stdout.read_to_string(&mut out_s).await;
@@ -257,16 +295,29 @@ pub async fn run_eval(opts: &ResearchOpts) -> Result<f64, String> {
           .stderr(Stdio::null())
           .status();
       }
-      Err(format!("eval: timed out after {timeout_secs}s: {}", opts.eval_cmd))
+      Err(format!(
+        "eval: timed out after {timeout_secs}s: {}",
+        opts.eval_cmd
+      ))
     }
     Ok(Err(e)) => Err(e),
     Ok(Ok((out_s, err_s, status))) => {
       if !status.success() {
-        let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
-        return Err(format!("eval: exit {code}:\n{}", truncate_chars(&err_s, EVAL_OUTPUT_CAP)));
+        let code = status
+          .code()
+          .map(|c| c.to_string())
+          .unwrap_or_else(|| "signal".into());
+        return Err(format!(
+          "eval: exit {code}:\n{}",
+          truncate_chars(&err_s, EVAL_OUTPUT_CAP)
+        ));
       }
-      parse_eval_output(&out_s)
-        .ok_or_else(|| format!("eval: no number found in stdout:\n{}", truncate_chars(&out_s, EVAL_OUTPUT_CAP)))
+      parse_eval_output(&out_s).ok_or_else(|| {
+        format!(
+          "eval: no number found in stdout:\n{}",
+          truncate_chars(&out_s, EVAL_OUTPUT_CAP)
+        )
+      })
     }
   }
 }
@@ -290,7 +341,14 @@ You act through tools only; there is no `question` tool and nobody will answer. 
 This session is exactly ONE iteration of the campaign: explore a single direction, measure it, update the journal, then stop.
 The harness re-measures your result itself afterwards and commits or restores the workspace; you must not run git commit/restore/stash.";
 
-pub fn seed_prompt(iter: u32, agents_md: &str, journal: &str, best: Option<f64>, maximize: bool, eval_cmd: &str) -> String {
+pub fn seed_prompt(
+  iter: u32,
+  agents_md: &str,
+  journal: &str,
+  best: Option<f64>,
+  maximize: bool,
+  eval_cmd: &str,
+) -> String {
   let direction = if maximize { "higher" } else { "lower" };
   let score_line = match best {
     Some(b) => format!("Best measured score so far: {b}. {direction} is better."),
@@ -370,7 +428,14 @@ pub fn seed_transcript(
   best: Option<f64>,
   iter: u32,
 ) -> Result<PathBuf, String> {
-  let prompt = seed_prompt(iter, agents_md, journal, best, opts.maximize, &opts.eval_cmd);
+  let prompt = seed_prompt(
+    iter,
+    agents_md,
+    journal,
+    best,
+    opts.maximize,
+    &opts.eval_cmd,
+  );
   let path = opts.transcripts_dir.join(format!("research-{iter:03}.md"));
   transcript::save(&path, &research_session_template(&opts.model, &prompt))?;
   Ok(path)
@@ -455,7 +520,10 @@ async fn wait_for_iteration(
     let status = match ask_status(addr, &session).await {
       Ok(status) => status,
       Err(e) => {
-        warn!("{}: cannot reach the daemon ({e}); assuming the iteration is still running", path.display());
+        warn!(
+          "{}: cannot reach the daemon ({e}); assuming the iteration is still running",
+          path.display()
+        );
         control::Status {
           session: session.clone(),
           ..Default::default()
@@ -463,18 +531,28 @@ async fn wait_for_iteration(
       }
     };
     if status.solved {
-      return Ok(IterationResult { solved: true, aborted: false });
+      return Ok(IterationResult {
+        solved: true,
+        aborted: false,
+      });
     }
     if status.context_full {
       warn!(
         "{}: model exhausted its context mid-iteration; discarding this attempt",
         path.display()
       );
-      return Ok(IterationResult { solved: false, aborted: false });
+      return Ok(IterationResult {
+        solved: false,
+        aborted: false,
+      });
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let text =
+      std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     if iteration_finished(&text) {
-      return Ok(IterationResult { solved: false, aborted: false });
+      return Ok(IterationResult {
+        solved: false,
+        aborted: false,
+      });
     }
     if timeout_secs > 0 && started.elapsed() >= Duration::from_secs(timeout_secs) {
       warn!(
@@ -483,7 +561,11 @@ async fn wait_for_iteration(
       );
       let req = Req {
         cmd: Cmd::Abort,
-        session: path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+        session: path
+          .file_stem()
+          .unwrap_or_default()
+          .to_string_lossy()
+          .into_owned(),
         answers: vec![],
       };
       if let Err(e) = control::send_command(addr, &req).await {
@@ -493,7 +575,10 @@ async fn wait_for_iteration(
         );
         continue;
       }
-      return Ok(IterationResult { solved: false, aborted: true });
+      return Ok(IterationResult {
+        solved: false,
+        aborted: true,
+      });
     }
   }
 }
@@ -599,7 +684,10 @@ mod tests {
 
   #[test]
   fn score_subject_roundtrip() {
-    assert_eq!(parse_score_subject("research: iter 7 score=0.42"), Some(0.42));
+    assert_eq!(
+      parse_score_subject("research: iter 7 score=0.42"),
+      Some(0.42)
+    );
     assert_eq!(parse_score_subject("research: iter 3 score=12"), Some(12.0));
     assert_eq!(parse_score_subject("no score here"), None);
     assert_eq!(parse_score_subject(""), None);
@@ -611,7 +699,10 @@ mod tests {
     assert!(is_better(-5.0, None, true));
     assert!(is_better(0.4, Some(0.5), false), "minimize: lower wins");
     assert!(!is_better(0.6, Some(0.5), false));
-    assert!(!is_better(0.5, Some(0.5), false), "equal is not an improvement");
+    assert!(
+      !is_better(0.5, Some(0.5), false),
+      "equal is not an improvement"
+    );
     assert!(is_better(9.0, Some(8.0), true), "maximize: higher wins");
     assert!(!is_better(7.0, Some(8.0), true));
   }
@@ -642,7 +733,10 @@ mod tests {
 
     sanitize(&dir).unwrap();
 
-    assert_eq!(std::fs::read_to_string(dir.join("base.txt")).unwrap(), "baseline\n");
+    assert_eq!(
+      std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+      "baseline\n"
+    );
     assert!(!dir.join("untracked.rs").exists(), "untracked files wiped");
     assert_eq!(read_best_score(&dir).unwrap(), Some(5.0));
 
@@ -650,7 +744,10 @@ mod tests {
     git(&dir, &["add", "-A"]).unwrap();
     git(&dir, &["commit", "-q", "-m", "rogue commit"]).unwrap();
     sanitize(&dir).unwrap();
-    assert_eq!(std::fs::read_to_string(dir.join("base.txt")).unwrap(), "baseline\n");
+    assert_eq!(
+      std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+      "baseline\n"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
   }
@@ -719,7 +816,11 @@ mod tests {
     let agents = "make it fast\n";
     let path = seed_transcript(&opts, agents, "", None, 1).unwrap();
     assert_eq!(path.file_name().unwrap(), "research-001.md");
-    assert_eq!(next_iter_number(&dir), 2, "next number skips existing files");
+    assert_eq!(
+      next_iter_number(&dir),
+      2,
+      "next number skips existing files"
+    );
 
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.starts_with("```toml\nmodel = \"m\"\n"));
@@ -729,13 +830,22 @@ mod tests {
         && text.contains("tools_excluded = [\"question\"]"),
       "subagent swapped for solve: {text}"
     );
-    assert!(text.contains("--- BEGIN AGENTS.md ---\nmake it fast"), "{text}");
+    assert!(
+      text.contains("--- BEGIN AGENTS.md ---\nmake it fast"),
+      "{text}"
+    );
     assert!(text.contains("(JOURNAL.md does not exist yet"), "{text}");
     assert!(text.contains("No baseline exists yet"), "{text}");
     let input_at = text.rfind("<!-- slopfile:input -->").expect("input region");
     let seed_at = text.find("--- BEGIN AGENTS.md ---").expect("seed");
-    assert!(seed_at > input_at, "the seed prompt is the input region: {text}");
-    assert!(!text.contains("<!-- slopfile:user -->"), "nothing promoted yet");
+    assert!(
+      seed_at > input_at,
+      "the seed prompt is the input region: {text}"
+    );
+    assert!(
+      !text.contains("<!-- slopfile:user -->"),
+      "nothing promoted yet"
+    );
 
     assert!(!iteration_finished(&text), "seeded input is not finished");
 
@@ -752,11 +862,17 @@ mod tests {
     dangling.promote_input();
     dangling.begin_round();
     dangling.push_text("partial thought");
-    assert!(!iteration_finished(&dangling.render()), "open section: still running");
+    assert!(
+      !iteration_finished(&dangling.render()),
+      "open section: still running"
+    );
 
     let mut queued = done.clone();
     queued.input = "come back\n".into();
-    assert!(!iteration_finished(&queued.render()), "queued input: not finished");
+    assert!(
+      !iteration_finished(&queued.render()),
+      "queued input: not finished"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
   }
@@ -780,7 +896,9 @@ mod tests {
 
   #[test]
   fn journal_seed_keeps_tail_when_huge() {
-    let big = (0..2000).map(|i| format!("entry {i}: did something\n")).collect::<String>();
+    let big = (0..2000)
+      .map(|i| format!("entry {i}: did something\n"))
+      .collect::<String>();
     let out = truncate_head(&big, 500);
     assert!(out.chars().count() < 600, "capped to ~max chars");
     assert!(out.contains("[earlier journal entries truncated]"));
@@ -827,8 +945,18 @@ mod tests {
       &text[text.len().saturating_sub(120)..]
     );
     assert!(
-      tpl.config.tools.as_ref().unwrap().contains(&"solve".to_string())
-        && !tpl.config.tools.as_ref().unwrap().contains(&"subagent".to_string()),
+      tpl
+        .config
+        .tools
+        .as_ref()
+        .unwrap()
+        .contains(&"solve".to_string())
+        && !tpl
+          .config
+          .tools
+          .as_ref()
+          .unwrap()
+          .contains(&"subagent".to_string()),
       "{:?}",
       tpl.config.tools
     );

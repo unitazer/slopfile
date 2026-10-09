@@ -1,4 +1,4 @@
-use crate::session::{Session, REASONING, TEXT};
+use crate::session::{REASONING, Session, TEXT};
 use crate::transcript;
 use crate::types::StreamEvent;
 use std::path::{Path, PathBuf};

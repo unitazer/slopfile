@@ -9,11 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 #[derive(Parser)]
-#[command(
-  name = "sf",
-  about = "talk to a running slopfile daemon",
-  version
-)]
+#[command(name = "sf", about = "talk to a running slopfile daemon", version)]
 struct Cli {
   #[arg(long, global = true)]
   addr: Option<String>,
@@ -26,34 +22,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
   /// Create a new session file
-  Init {
-    session: String,
-  },
+  Init { session: String },
   /// Arm the session and start generating
-  Send {
-    session: String,
-  },
+  Send { session: String },
   /// Let the current turn finish, then go idle
-  Stop {
-    session: String,
-  },
+  Stop { session: String },
   /// Kill the in-flight stream right now
-  Abort {
-    session: String,
-  },
+  Abort { session: String },
   /// Show what the daemon is doing with the session
-  Status {
-    session: String,
-  },
+  Status { session: String },
   /// Answer the questions the model asked
   Question {
     session: String,
     answers: Vec<String>,
   },
   /// Report the token budget for a session
-  Tokens {
-    session: String,
-  },
+  Tokens { session: String },
 }
 
 #[tokio::main]
@@ -80,7 +64,12 @@ async fn main() {
   }
 }
 
-async fn run(command: Command, addr: &str, transcripts: &str, cfg: &AppConfig) -> Result<(), String> {
+async fn run(
+  command: Command,
+  addr: &str,
+  transcripts: &str,
+  cfg: &AppConfig,
+) -> Result<(), String> {
   match command {
     Command::Init { session } => init(&session, transcripts, cfg),
     Command::Tokens { session } => tokens(&session, transcripts, cfg).await,
@@ -92,16 +81,13 @@ async fn run(command: Command, addr: &str, transcripts: &str, cfg: &AppConfig) -
   }
 }
 
-async fn remote(
-  addr: &str,
-  cmd: Cmd,
-  session: &str,
-  answers: Vec<String>,
-) -> Result<(), String> {
+async fn remote(addr: &str, cmd: Cmd, session: &str, answers: Vec<String>) -> Result<(), String> {
   with_timeout(remote_inner(addr, cmd, session, answers)).await
 }
 
-async fn with_timeout<F: std::future::Future<Output = Result<(), String>>>(f: F) -> Result<(), String> {
+async fn with_timeout<F: std::future::Future<Output = Result<(), String>>>(
+  f: F,
+) -> Result<(), String> {
   match tokio::time::timeout(std::time::Duration::from_secs(10), f).await {
     Ok(r) => r,
     Err(_) => Err("control: the daemon did not reply within 10s (is it running?)".to_string()),
@@ -119,7 +105,9 @@ async fn remote_inner(
     session: session.to_string(),
     answers,
   };
-  let resp = control::send_command(addr, &req).await.map_err(|e| e.to_string())?;
+  let resp = control::send_command(addr, &req)
+    .await
+    .map_err(|e| e.to_string())?;
   if !resp.ok {
     return Err(resp.error.unwrap_or_else(|| "command failed".to_string()));
   }
@@ -141,7 +129,6 @@ fn cmd_name(cmd: Cmd) -> &'static str {
     Cmd::Question => "question",
   }
 }
-
 
 /// Creating a session is pure local file work, and must work with no daemon running. The only hard
 /// part is finding the transcripts directory, which `load_app_config` now resolves for the host.

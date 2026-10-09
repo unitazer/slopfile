@@ -1,12 +1,15 @@
 use super::*;
-use crate::types::Thinking;
 use crate::questions::Question;
+use crate::types::Thinking;
 
 const FENCE: &str = "```toml\nmodel = \"qwen3.8-27b\"\nthinking = \"auto\"\n```\n";
 const BEGIN_LINE: &str = "<!-- slopfile:begin -->\n";
 
 fn region(name: &str, body: &str) -> String {
-  format!("<!-- slopfile:{name} -->\n{}\n<!-- /slopfile -->\n", escape(body))
+  format!(
+    "<!-- slopfile:{name} -->\n{}\n<!-- /slopfile -->\n",
+    escape(body)
+  )
 }
 
 fn payload_region(name: &str, payload: &str) -> String {
@@ -135,11 +138,9 @@ fn same_shape(a: &Session, b: &Session) -> bool {
     && a.turns.len() == b.turns.len()
     && a.input == b.input
     && a.open == b.open
-    && a
-      .turns
-      .iter()
-      .zip(b.turns.iter())
-      .all(|(x, y)| x.user == y.user && x.notes.len() == y.notes.len() && x.rounds.len() == y.rounds.len())
+    && a.turns.iter().zip(b.turns.iter()).all(|(x, y)| {
+      x.user == y.user && x.notes.len() == y.notes.len() && x.rounds.len() == y.rounds.len()
+    })
 }
 
 #[test]
@@ -190,7 +191,11 @@ fn escape_leaves_token_free_text_untouched() {
 
 #[test]
 fn escape_handles_nested_wrappers() {
-  let body = format!("{} and {}", escape("<!-- /slopfile -->"), escape("<!--slopfile:ESC[x]-->"));
+  let body = format!(
+    "{} and {}",
+    escape("<!-- /slopfile -->"),
+    escape("<!--slopfile:ESC[x]-->")
+  );
   assert_eq!(unescape(&escape(&body)), body);
   assert!(
     escape(&body).len() > body.len(),
@@ -280,7 +285,14 @@ fn render_marks_the_open_section_and_leaves_it_unclosed() {
   assert!(parsed.turn_in_progress());
   assert_eq!(
     parsed.open.as_deref(),
-    Some(["turn".to_string(), "assistant".to_string(), "text".to_string()].as_slice())
+    Some(
+      [
+        "turn".to_string(),
+        "assistant".to_string(),
+        "text".to_string()
+      ]
+      .as_slice()
+    )
   );
   assert_eq!(
     parsed.turns[2].rounds[0].assistant.text.as_deref(),
@@ -322,7 +334,8 @@ fn turn_complete_iff_closed() {
   assert!(session.last_turn_complete());
   assert_eq!(session.open, None);
 
-  let open = format!("{FENCE}{BEGIN_LINE}<!-- slopfile:turn -->\n<!-- slopfile:assistant -->\nthinking\n");
+  let open =
+    format!("{FENCE}{BEGIN_LINE}<!-- slopfile:turn -->\n<!-- slopfile:assistant -->\nthinking\n");
   let (session, _) = parse(&open);
   assert!(session.turn_in_progress());
   assert!(!session.last_turn_complete());
@@ -342,7 +355,14 @@ fn parse_open_region_owns_rest_of_file() {
   assert!(report.swallowed.is_empty(), "{:?}", report.swallowed);
   assert_eq!(
     session.open.as_deref(),
-    Some(["turn".to_string(), "assistant".to_string(), "text".to_string()].as_slice())
+    Some(
+      [
+        "turn".to_string(),
+        "assistant".to_string(),
+        "text".to_string()
+      ]
+      .as_slice()
+    )
   );
   assert_eq!(
     session.turns[0].rounds[0].assistant.text.as_deref(),
@@ -360,7 +380,10 @@ fn unclosed_leaf_followed_by_a_region_is_reported() {
   assert_eq!(report.swallowed.len(), 1);
   let problems = report.problems();
   assert!(problems[0].contains("left unclosed"), "{problems:?}");
-  assert!(problems[0].contains("user"), "the report must name what it ate: {problems:?}");
+  assert!(
+    problems[0].contains("user"),
+    "the report must name what it ate: {problems:?}"
+  );
   assert_eq!(
     session.turns[0].rounds[0].assistant.text.as_deref(),
     Some("leaky\n<!-- slopfile:user -->\nnope\n<!-- /slopfile -->\n")
@@ -383,7 +406,10 @@ fn unknown_region_is_reported() {
   assert_eq!(report.unknown_regions, vec!["thinkin".to_string()]);
   assert!(report.problems()[0].contains("unknown region `thinkin`"));
   assert_eq!(session.turns.len(), 0, "unknown regions are not turns");
-  assert!(!session.dangling(), "the region was closed, so nothing dangles");
+  assert!(
+    !session.dangling(),
+    "the region was closed, so nothing dangles"
+  );
 }
 
 #[test]
@@ -393,7 +419,11 @@ fn input_is_eof_terminated_and_opaque() {
   let (session, report) = parse(&file);
   assert!(report.is_clean(), "{report:?}");
   assert_eq!(session.input, hostile);
-  assert_eq!(session.turns.len(), 0, "typed markers never become structure");
+  assert_eq!(
+    session.turns.len(),
+    0,
+    "typed markers never become structure"
+  );
   assert_eq!(session.render(), file);
 }
 
@@ -476,7 +506,7 @@ fn request_messages_synthesizes_a_call_for_an_orphan_result() {
 fn multi_round_turn_keeps_each_assistant_with_its_own_results() {
   let round = |id: &str, text: &str, out: &str| Round {
     assistant: Assistant {
-    custom: Vec::new(),
+      custom: Vec::new(),
       reasoning: None,
       text: Some(text.to_string()),
       calls: vec![Call {
@@ -576,26 +606,38 @@ fn question_round_trip_and_answer() {
   let rendered = session.render();
   let (mut parsed, report) = parse(&rendered);
   assert!(report.is_clean(), "{report:?}");
-  assert_eq!(parsed.pending_question().expect("pending").questions, questions);
+  assert_eq!(
+    parsed.pending_question().expect("pending").questions,
+    questions
+  );
   let messages = parsed.request_messages();
   assert_eq!(messages.len(), 3);
   assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "c1");
   assert_eq!(messages[2].role, Role::Tool);
   assert_eq!(messages[2].content.as_deref(), Some(AWAITING_ANSWER));
 
-  parsed.answer_question(vec![(1, "blue".to_string())]).expect("answer");
+  parsed
+    .answer_question(vec![(1, "blue".to_string())])
+    .expect("answer");
   assert!(parsed.pending_question().is_none());
   let messages = parsed.request_messages();
   assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "c1");
   assert!(
-    messages[2].content.as_deref().unwrap().contains("\"answer\":\"blue\""),
+    messages[2]
+      .content
+      .as_deref()
+      .unwrap()
+      .contains("\"answer\":\"blue\""),
     "{:?}",
     messages[2].content
   );
   let (mut reread, report) = parse(&parsed.render());
   assert!(report.is_clean(), "{report:?}");
   assert!(reread.pending_question().is_none());
-  assert!(reread.answer_question(vec![]).is_err(), "nothing left to answer");
+  assert!(
+    reread.answer_question(vec![]).is_err(),
+    "nothing left to answer"
+  );
 }
 
 #[test]
@@ -615,7 +657,9 @@ fn answer_question_clears_the_answer_line() {
       default: None,
     }],
   });
-  session.answer_question(vec![(1, "yes".to_string())]).expect("answer");
+  session
+    .answer_question(vec![(1, "yes".to_string())])
+    .expect("answer");
   assert_eq!(session.input, "");
   let (parsed, report) = parse(&session.render());
   assert!(report.is_clean(), "{report:?}");
@@ -650,7 +694,16 @@ fn rewinding_an_open_round_hands_back_the_partial_output() {
   let (again, report) = parse(&parsed.render());
   assert!(report.is_clean(), "{report:?}");
   assert_eq!(
-    again.turns.last().unwrap().rounds.last().unwrap().assistant.text.as_deref(),
+    again
+      .turns
+      .last()
+      .unwrap()
+      .rounds
+      .last()
+      .unwrap()
+      .assistant
+      .text
+      .as_deref(),
     Some("half answer and the rest")
   );
 }
@@ -722,7 +775,10 @@ fn crlf_files_parse_and_render_as_lf() {
   assert_eq!(session.input, "hello\n", "crlf input is normalized");
   assert!(!session.preamble.contains('\r'));
   let rendered = session.render();
-  assert!(!rendered.contains("\r"), "structure is lf-only: {rendered:?}");
+  assert!(
+    !rendered.contains("\r"),
+    "structure is lf-only: {rendered:?}"
+  );
   assert!(rendered.ends_with("hello\n"), "{rendered:?}");
   assert_eq!(parse(&rendered).0.input, "hello\n", "stable");
 }
@@ -769,7 +825,10 @@ fn finish_round_records_calls_and_results() {
   assert!(parsed.open.is_none(), "the turn closed");
   let round = &parsed.turns[0].rounds[0];
   assert_eq!(round.assistant.text.as_deref(), Some("calling"));
-  assert_eq!(round.assistant.calls[0].id, "c1", "ids are shortened on write");
+  assert_eq!(
+    round.assistant.calls[0].id, "c1",
+    "ids are shortened on write"
+  );
   assert_eq!(round.results[0].output, "boom");
   assert!(!round.results[0].ok);
   assert_eq!(parsed.render(), rendered);
@@ -808,18 +867,31 @@ fn a_malformed_payload_is_reported_not_silently_invented() {
     ),
   ));
   let (session, report) = parse(&file);
-  assert!(!report.is_clean(), "a corrupt header must not pass as clean");
+  assert!(
+    !report.is_clean(),
+    "a corrupt header must not pass as clean"
+  );
   let problems = report.problems().join("; ");
   assert!(problems.contains("call"), "{problems}");
   assert!(problems.contains("result"), "{problems}");
-  assert!(problems.contains("turn"), "the report must locate the region: {problems}");
+  assert!(
+    problems.contains("turn"),
+    "the report must locate the region: {problems}"
+  );
   let round = &session.turns[0].rounds[0];
-  assert!(round.assistant.calls.is_empty(), "an unparseable call is not invented");
+  assert!(
+    round.assistant.calls.is_empty(),
+    "an unparseable call is not invented"
+  );
   assert!(
     !round.results[0].ok,
     "an unreadable result is never reported as a success"
   );
-  assert!(round.results[0].output.contains("cannot be trusted"), "{:?}", round.results[0]);
+  assert!(
+    round.results[0].output.contains("cannot be trusted"),
+    "{:?}",
+    round.results[0]
+  );
 }
 
 #[test]
@@ -827,7 +899,11 @@ fn a_malformed_question_payload_is_reported() {
   let file = session_file(&container(TURN, &payload_region(QUESTION, "{oops")));
   let (session, report) = parse(&file);
   assert!(!report.is_clean());
-  assert!(report.problems()[0].contains("question"), "{:?}", report.problems());
+  assert!(
+    report.problems()[0].contains("question"),
+    "{:?}",
+    report.problems()
+  );
   assert!(session.pending_question().is_none());
 }
 
@@ -841,7 +917,10 @@ fn bytes_outside_ascii_never_split_a_character() {
 #[test]
 fn a_tool_output_full_of_brackets_still_round_trips() {
   let output = "drwxr-xr-x 2 root root 4096 Jan  1 00:00 [drwxr-xr-x] {a,b}\n[[[nested]]]";
-  let file = session_file(&container(TURN, &result_region("c1", "bash", true, 3, output)));
+  let file = session_file(&container(
+    TURN,
+    &result_region("c1", "bash", true, 3, output),
+  ));
   let (session, report) = parse(&file);
   assert!(report.is_clean(), "{report:?}");
   assert_eq!(session.turns[0].rounds[0].results[0].output, output);
@@ -856,20 +935,29 @@ fn pending_input_survives_an_open_turn() {
   let mut cases: Vec<(Option<Vec<String>>, Session)> = Vec::new();
   {
     let mut s = Session::default();
-    s.turns.push(Turn { user: Some("hi".into()), ..Turn::default() });
+    s.turns.push(Turn {
+      user: Some("hi".into()),
+      ..Turn::default()
+    });
     s.open = Some(vec!["turn".into()]);
     cases.push((s.open.clone(), s));
   }
   {
     let mut s = Session::default();
-    s.turns.push(Turn { user: Some("hi".into()), ..Turn::default() });
+    s.turns.push(Turn {
+      user: Some("hi".into()),
+      ..Turn::default()
+    });
     s.begin_round();
     s.open = Some(vec!["turn".into(), "assistant".into()]);
     cases.push((s.open.clone(), s));
   }
   {
     let mut s = Session::default();
-    s.turns.push(Turn { user: Some("hi".into()), ..Turn::default() });
+    s.turns.push(Turn {
+      user: Some("hi".into()),
+      ..Turn::default()
+    });
     s.begin_round();
     s.push_text("thinking out loud");
     s.open = Some(vec!["turn".into(), "assistant".into(), "text".into()]);
@@ -904,7 +992,8 @@ fn a_file_with_no_begin_marker_keeps_its_prose() {
 
 #[test]
 fn a_marker_line_inside_the_fence_is_not_structure() {
-  let fence = "```toml\nmodel = \"special-model\"\nhelp = \"\"\"\n<!-- slopfile:begin -->\n\"\"\"\n```\n";
+  let fence =
+    "```toml\nmodel = \"special-model\"\nhelp = \"\"\"\n<!-- slopfile:begin -->\n\"\"\"\n```\n";
   let text = format!(
     "{fence}<!-- slopfile:begin -->\n{}\n<!-- slopfile:input -->\n",
     region(SYSTEM, "sys")
@@ -964,7 +1053,10 @@ fn answering_a_question_in_a_round_less_turn_does_not_panic() {
   assert_eq!(messages.len(), 3, "{messages:?}");
   assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "c1");
   assert!(messages[2].content.as_deref().unwrap().contains("yes"));
-  assert!(session.answer_question(vec![]).is_err(), "nothing left to answer");
+  assert!(
+    session.answer_question(vec![]).is_err(),
+    "nothing left to answer"
+  );
 }
 
 #[test]
@@ -986,7 +1078,10 @@ fn promoting_input_never_overwrites_an_earlier_user_message() {
     "the earlier message must survive"
   );
   assert_eq!(session.turns.len(), 2);
-  assert_eq!(session.turns[1].user.as_deref(), Some("and also fix the lint"));
+  assert_eq!(
+    session.turns[1].user.as_deref(),
+    Some("and also fix the lint")
+  );
 }
 
 #[test]
@@ -1003,8 +1098,16 @@ fn a_pruned_empty_turn_absorbs_the_next_message() {
 fn every_call_gets_exactly_one_result() {
   let calls = || {
     vec![
-      Call { id: "".into(), name: "bash".into(), arguments: "{}".into() },
-      Call { id: "".into(), name: "bash".into(), arguments: "{}".into() },
+      Call {
+        id: "".into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+      },
+      Call {
+        id: "".into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+      },
     ]
   };
   let mut session = Session::default();
@@ -1017,8 +1120,20 @@ fn every_call_gets_exactly_one_result() {
   session.finish_round(
     calls(),
     vec![
-      ToolOutcome { id: "".into(), name: "bash".into(), ok: true, ms: 1, output: "one".into() },
-      ToolOutcome { id: "".into(), name: "bash".into(), ok: true, ms: 1, output: "two".into() },
+      ToolOutcome {
+        id: "".into(),
+        name: "bash".into(),
+        ok: true,
+        ms: 1,
+        output: "one".into(),
+      },
+      ToolOutcome {
+        id: "".into(),
+        name: "bash".into(),
+        ok: true,
+        ms: 1,
+        output: "two".into(),
+      },
     ],
   );
   let messages = session.request_messages();
@@ -1054,8 +1169,16 @@ fn a_call_the_harness_skips_still_gets_a_result() {
   session.begin_round();
   session.finish_round(
     vec![
-      Call { id: "c1".into(), name: "solve".into(), arguments: "{}".into() },
-      Call { id: "c2".into(), name: "bash".into(), arguments: "{}".into() },
+      Call {
+        id: "c1".into(),
+        name: "solve".into(),
+        arguments: "{}".into(),
+      },
+      Call {
+        id: "c2".into(),
+        name: "bash".into(),
+        arguments: "{}".into(),
+      },
     ],
     vec![ToolOutcome {
       id: "c1".into(),
@@ -1072,7 +1195,11 @@ fn a_call_the_harness_skips_still_gets_a_result() {
     .collect();
   assert_eq!(answered, vec!["c1", "c2"], "both calls are answered");
   assert!(
-    messages[3].content.as_deref().unwrap().contains("not executed"),
+    messages[3]
+      .content
+      .as_deref()
+      .unwrap()
+      .contains("not executed"),
     "the skipped call says so: {:?}",
     messages[3].content
   );
@@ -1084,40 +1211,66 @@ fn a_call_the_harness_skips_still_gets_a_result() {
 fn regions_out_of_place_are_reported_not_dropped() {
   let note_at_top = session_file(&region(NOTE, "IMPORTANT SCRATCH"));
   let (_, report) = parse(&note_at_top);
-  assert!(!report.is_clean(), "a note at the top level is lost otherwise");
-  assert!(report.problems()[0].contains("out of place"), "{:?}", report.problems());
+  assert!(
+    !report.is_clean(),
+    "a note at the top level is lost otherwise"
+  );
+  assert!(
+    report.problems()[0].contains("out of place"),
+    "{:?}",
+    report.problems()
+  );
 
   let two_texts = session_file(&container(
     TURN,
     &container(
       ASSISTANT,
-      &format!("{}{}", region(TEXT, "first version"), region(TEXT, "second")),
+      &format!(
+        "{}{}",
+        region(TEXT, "first version"),
+        region(TEXT, "second")
+      ),
     ),
   ));
   let (session, report) = parse(&two_texts);
-  assert!(!report.is_clean(), "the first text would be silently replaced");
-  assert!(report.problems()[0].contains("second `text`"), "{:?}", report.problems());
+  assert!(
+    !report.is_clean(),
+    "the first text would be silently replaced"
+  );
+  assert!(
+    report.problems()[0].contains("second `text`"),
+    "{:?}",
+    report.problems()
+  );
   assert_eq!(
     session.turns[0].rounds[0].assistant.text.as_deref(),
     Some("first version"),
     "the first body is kept until the file is fixed"
   );
 
-  let nested = session_file(&container(
-    TURN,
-    &container(TURN, &region(USER, "inner")),
-  ));
+  let nested = session_file(&container(TURN, &container(TURN, &region(USER, "inner"))));
   let (_, report) = parse(&nested);
   assert!(!report.is_clean(), "a turn inside a turn is lost otherwise");
-  assert!(report.problems()[0].contains("out of place"), "{:?}", report.problems());
+  assert!(
+    report.problems()[0].contains("out of place"),
+    "{:?}",
+    report.problems()
+  );
 
   let two_users = session_file(&container(
     TURN,
     &format!("{}{}", region(USER, "one"), region(USER, "two")),
   ));
   let (_, report) = parse(&two_users);
-  assert!(!report.is_clean(), "a second user region would be overwritten");
-  assert!(report.problems()[0].contains("second `user`"), "{:?}", report.problems());
+  assert!(
+    !report.is_clean(),
+    "a second user region would be overwritten"
+  );
+  assert!(
+    report.problems()[0].contains("second `user`"),
+    "{:?}",
+    report.problems()
+  );
 }
 
 #[test]
@@ -1159,7 +1312,11 @@ fn rewinding_a_round_drops_its_calls_too() {
   session.begin_round();
   session.push_text("half");
   session.finish_round(
-    vec![Call { id: "c1".into(), name: "bash".into(), arguments: "{}".into() }],
+    vec![Call {
+      id: "c1".into(),
+      name: "bash".into(),
+      arguments: "{}".into(),
+    }],
     vec![ToolOutcome {
       id: "c1".into(),
       name: "bash".into(),
@@ -1214,7 +1371,10 @@ fn an_unknown_thinking_level_is_rejected_and_names_the_valid_ones() {
     .expect_err("a typo must not be swallowed");
   let text = err.to_string();
   for valid in ["auto", "none", "low", "medium", "high", "xhigh"] {
-    assert!(text.contains(valid), "the error should list {valid}: {text}");
+    assert!(
+      text.contains(valid),
+      "the error should list {valid}: {text}"
+    );
   }
 }
 
@@ -1228,7 +1388,10 @@ fn an_unparseable_fence_falls_back_without_bricking_the_session() {
      <!-- /slopfile -->\n<!-- slopfile:input -->\n"
   );
   let (session, report) = parse(&file);
-  assert!(report.is_clean(), "a bad fence is a warning, not a refusal: {report:?}");
+  assert!(
+    report.is_clean(),
+    "a bad fence is a warning, not a refusal: {report:?}"
+  );
   assert_eq!(session.thinking(), Thinking::Auto);
   assert!(
     session.render().contains("thinking = \"meduim\""),

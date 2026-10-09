@@ -29,10 +29,22 @@ async fn request_token_count(
   }
   let mut last_err = String::new();
   for (url, body) in [
-    (format!("{api_base}/tokenize"), serde_json::json!({"content": content.clone(), "model": model})),
-    (format!("{api_base}/tokenize"), serde_json::json!({"content": content.clone()})),
-    (format!("{api_base}/v1/tokenize"), serde_json::json!({"content": content.clone(), "model": model})),
-    (format!("{api_base}/v1/tokenize"), serde_json::json!({"content": content.clone()})),
+    (
+      format!("{api_base}/tokenize"),
+      serde_json::json!({"content": content.clone(), "model": model}),
+    ),
+    (
+      format!("{api_base}/tokenize"),
+      serde_json::json!({"content": content.clone()}),
+    ),
+    (
+      format!("{api_base}/v1/tokenize"),
+      serde_json::json!({"content": content.clone(), "model": model}),
+    ),
+    (
+      format!("{api_base}/v1/tokenize"),
+      serde_json::json!({"content": content.clone()}),
+    ),
   ] {
     let resp = match client.post(&url).json(&body).send().await {
       Ok(r) => r,
@@ -110,8 +122,13 @@ async fn request_token_counts(
   let mut chunks = todo.chunks(FAN_OUT);
   while let Some(batch) = chunks.next() {
     let futs = batch.iter().map(|(ix, key)| async move {
-      let counted =
-        request_token_count(api_base, client, model, std::slice::from_ref(&messages[*ix])).await;
+      let counted = request_token_count(
+        api_base,
+        client,
+        model,
+        std::slice::from_ref(&messages[*ix]),
+      )
+      .await;
       (*key, counted)
     });
     for (key, counted) in futures_util::future::join_all(futs).await {
@@ -126,11 +143,11 @@ async fn request_token_counts(
   messages
     .iter()
     .map(|m| {
-      cache
-        .counts
-        .get(&content_key(m))
-        .copied()
-        .ok_or_else(|| error.clone().unwrap_or_else(|| "no token count".to_string()))
+      cache.counts.get(&content_key(m)).copied().ok_or_else(|| {
+        error
+          .clone()
+          .unwrap_or_else(|| "no token count".to_string())
+      })
     })
     .collect()
 }
@@ -159,7 +176,11 @@ pub async fn build_request_messages(
   http: &reqwest::Client,
 ) -> Result<RequestPlan, String> {
   if messages.is_empty() {
-    return Ok(RequestPlan { messages, dropped: 0, token_count: 0 });
+    return Ok(RequestPlan {
+      messages,
+      dropped: 0,
+      token_count: 0,
+    });
   }
   // A tokenizer that is down must not take the session down with it: fall back to a rough
   // estimate and let the model keep working.
@@ -174,7 +195,10 @@ pub async fn build_request_messages(
     Ok(counts) => counts,
     Err(e) => {
       tracing::warn!("{e}; falling back to a 4-chars-per-token estimate");
-      messages.iter().map(|m| (estimate_chars(m) / 4) + 1).collect()
+      messages
+        .iter()
+        .map(|m| (estimate_chars(m) / 4) + 1)
+        .collect()
     }
   };
   let cap = prompt_budget(context_budget(session, cfg));
@@ -241,7 +265,10 @@ pub fn truncate_messages(
   if !matches!(messages.get(keep_from).map(|m| m.role), Some(Role::User)) {
     if let Some(next) = (keep_from..messages.len()).find(|ix| messages[*ix].role == Role::User) {
       keep_from = next;
-    } else if let Some(prev) = (1..keep_from).rev().find(|ix| messages[*ix].role == Role::User) {
+    } else if let Some(prev) = (1..keep_from)
+      .rev()
+      .find(|ix| messages[*ix].role == Role::User)
+    {
       // May exceed the budget; the caller then refuses the request, which is the honest outcome.
       keep_from = prev;
     } else {
@@ -260,7 +287,6 @@ pub fn truncate_messages(
   (messages, total)
 }
 
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -270,17 +296,31 @@ mod tests {
   fn truncate_keeps_system_and_drops_oldest_turns() {
     let mut msgs = vec![ChatMessage::system("sys prompt here")];
     for i in 1..=8 {
-      msgs.push(ChatMessage::user(format!("user turn number {i} with some body text")));
-      msgs.push(ChatMessage::assistant(format!("assistant answer number {i} with some body text")));
+      msgs.push(ChatMessage::user(format!(
+        "user turn number {i} with some body text"
+      )));
+      msgs.push(ChatMessage::assistant(format!(
+        "assistant answer number {i} with some body text"
+      )));
     }
     let counts: Vec<usize> = msgs.iter().map(|m| (estimate_chars(m) / 4) + 1).collect();
     let (small, small_sum) = truncate_messages(msgs.clone(), &counts, 30);
     assert_eq!(small[0].role, Role::System);
-    assert!(small.len() < msgs.len(), "old turns dropped: {} -> {}",
-      msgs.len(), small.len());
-    assert!(small_sum <= 30, "kept sum must respect the budget: {small_sum}");
+    assert!(
+      small.len() < msgs.len(),
+      "old turns dropped: {} -> {}",
+      msgs.len(),
+      small.len()
+    );
+    assert!(
+      small_sum <= 30,
+      "kept sum must respect the budget: {small_sum}"
+    );
     let last = small.last().unwrap();
-    assert_eq!(last.content.as_deref(), Some("assistant answer number 8 with some body text"));
+    assert_eq!(
+      last.content.as_deref(),
+      Some("assistant answer number 8 with some body text")
+    );
     assert!(matches!(small[1].role, Role::User | Role::Assistant));
 
     let (big, big_sum) = truncate_messages(msgs.clone(), &counts, 1_000_000);
@@ -297,7 +337,11 @@ mod tests {
       let mut asst = ChatMessage::assistant(format!("thinking then call {i}"));
       asst.tool_calls = Some(vec![call.clone()]);
       msgs.push(asst);
-      msgs.push(ChatMessage::tool(call.id.clone(), "bash".to_string(), "out".to_string()));
+      msgs.push(ChatMessage::tool(
+        call.id.clone(),
+        "bash".to_string(),
+        "out".to_string(),
+      ));
     }
     let counts: Vec<usize> = msgs.iter().map(|m| (estimate_chars(m) / 4) + 1).collect();
     let (small, _) = truncate_messages(msgs.clone(), &counts, 6);

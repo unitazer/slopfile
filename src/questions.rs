@@ -3,10 +3,10 @@ use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Question {
-    pub id: u32,
-    pub question: String,
-    pub answers: Vec<String>,
-    pub default: Option<String>,
+  pub id: u32,
+  pub question: String,
+  pub answers: Vec<String>,
+  pub default: Option<String>,
 }
 
 pub const BLOCK_HEADER: &str = "QUESTIONS";
@@ -30,10 +30,7 @@ pub fn question_from_tool_item(id: u32, v: &serde_json::Value) -> Question {
         .collect::<Vec<_>>()
     })
     .unwrap_or_default();
-  let default = v
-    .get("default")
-    .and_then(|d| d.as_str())
-    .map(String::from);
+  let default = v.get("default").and_then(|d| d.as_str()).map(String::from);
   Question {
     id,
     question,
@@ -43,28 +40,28 @@ pub fn question_from_tool_item(id: u32, v: &serde_json::Value) -> Question {
 }
 
 pub fn render_block(qs: &[Question]) -> String {
-    let mut out = String::new();
-    out.push_str(BLOCK_HEADER);
-    out.push('\n');
-    out.push_str("| # | Question | Options |\n");
-    out.push_str("|---|----------|---------|\n");
-    for q in qs {
-        let opts = q
-            .answers
-            .iter()
-            .map(|a| a.replace('|', "\\|"))
-            .collect::<Vec<_>>()
-            .join(" # ");
-        out.push_str(&format!(
-            "| {} | {} | {} |\n",
-            q.id,
-            q.question.replace('|', "\\|"),
-            opts
-        ));
-    }
-    out.push_str(ANSWER_PROMPT);
-    out.push_str("> \n");
-    out
+  let mut out = String::new();
+  out.push_str(BLOCK_HEADER);
+  out.push('\n');
+  out.push_str("| # | Question | Options |\n");
+  out.push_str("|---|----------|---------|\n");
+  for q in qs {
+    let opts = q
+      .answers
+      .iter()
+      .map(|a| a.replace('|', "\\|"))
+      .collect::<Vec<_>>()
+      .join(" # ");
+    out.push_str(&format!(
+      "| {} | {} | {} |\n",
+      q.id,
+      q.question.replace('|', "\\|"),
+      opts
+    ));
+  }
+  out.push_str(ANSWER_PROMPT);
+  out.push_str("> \n");
+  out
 }
 
 /// Everything at or after the answer prompt, which is the part only the human writes.
@@ -105,7 +102,10 @@ pub fn is_skip(input: &str) -> bool {
   })
 }
 
-pub fn parse_answers(questions: &[Question], answer_text: &str) -> Result<Vec<(u32, String)>, String> {
+pub fn parse_answers(
+  questions: &[Question],
+  answer_text: &str,
+) -> Result<Vec<(u32, String)>, String> {
   let mut tokens: VecDeque<String> = answer_text
     .split([',', '\n'])
     .map(|t| t.trim())
@@ -135,20 +135,22 @@ pub fn resolve_positional(
       answers.len()
     ));
   }
-  Ok(questions
-    .iter()
-    .zip(answers.iter())
-    .map(|(q, a)| (q.id, resolve_token(a.trim(), q)))
-    .collect())
+  Ok(
+    questions
+      .iter()
+      .zip(answers.iter())
+      .map(|(q, a)| (q.id, resolve_token(a.trim(), q)))
+      .collect(),
+  )
 }
 
 fn resolve_token(token: &str, q: &Question) -> String {
-    if let Ok(k) = token.parse::<usize>()
-        && (1..=q.answers.len()).contains(&k)
-    {
-        return q.answers[k - 1].clone();
-    }
-    token.to_string()
+  if let Ok(k) = token.parse::<usize>()
+    && (1..=q.answers.len()).contains(&k)
+  {
+    return q.answers[k - 1].clone();
+  }
+  token.to_string()
 }
 
 #[cfg(test)]
@@ -195,7 +197,11 @@ mod tests {
   #[test]
   fn answer_text_finds_the_prompt_line() {
     let mut input = render_block(&qs());
-    assert_eq!(answer_text(&input), None, "an empty prompt is not an answer");
+    assert_eq!(
+      answer_text(&input),
+      None,
+      "an empty prompt is not an answer"
+    );
     input.push_str("1\n");
     assert_eq!(answer_text(&input), None);
     input.push_str("> 1, 3\n");
@@ -292,6 +298,9 @@ mod tests {
   fn resolve_positional_never_falls_back_to_defaults() {
     let answers = resolve_positional(&qs(), &["blue".to_string(), "nope".to_string()])
       .expect("positional answers");
-    assert_eq!(answers, vec![(1, "blue".to_string()), (2, "nope".to_string())]);
+    assert_eq!(
+      answers,
+      vec![(1, "blue".to_string()), (2, "nope".to_string())]
+    );
   }
 }

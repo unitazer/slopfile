@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::fs::{create_dir_all, read_to_string};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -231,9 +231,10 @@ fn resolve_target(
 }
 
 fn str_arg<'a>(tool: &str, args: &'a Value, key: &str) -> Result<&'a str, ToolResult> {
-  args.get(key).and_then(Value::as_str).ok_or_else(|| {
-    ToolResult::err(format!("{tool}: missing string argument \"{key}\""))
-  })
+  args
+    .get(key)
+    .and_then(Value::as_str)
+    .ok_or_else(|| ToolResult::err(format!("{tool}: missing string argument \"{key}\"")))
 }
 
 macro_rules! arg {
@@ -278,10 +279,7 @@ fn read(
     let elsewhere = extra_roots
       .iter()
       .find_map(|root| resolve_in(root, path_str).ok());
-    match in_workdir
-      .filter(|p| p.exists())
-      .or_else(|| elsewhere)
-    {
+    match in_workdir.filter(|p| p.exists()).or_else(|| elsewhere) {
       Some(p) => p,
       None => return ToolResult::err(format!("read: path escapes workdir: {path_str}")),
     }
@@ -442,11 +440,8 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
   let out_task = tokio::spawn(drain_into(stdout, out_buf.clone()));
   let err_task = tokio::spawn(drain_into(stderr, err_buf.clone()));
 
-  let waited = tokio::time::timeout(
-    std::time::Duration::from_millis(timeout_ms),
-    child.wait(),
-  )
-  .await;
+  let waited =
+    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.wait()).await;
   let status = match waited {
     Err(_) => {
       out_task.abort();
@@ -525,10 +520,14 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
         // Unreachable in practice: we drain to EOF rather than closing the pipe at the cap, so
         // there is no SIGPIPE and a signal death is a genuine crash.
         (false, None, true) => {
-          return ToolResult::err(format!("bash: killed by signal after {BASH_OUTPUT_CAP} chars:\n{combined}{note}"));
+          return ToolResult::err(format!(
+            "bash: killed by signal after {BASH_OUTPUT_CAP} chars:\n{combined}{note}"
+          ));
         }
         // A signal death we did not cause is a genuine crash.
-        (false, None, false) => return ToolResult::err(format!("bash: killed by signal:\n{combined}")),
+        (false, None, false) => {
+          return ToolResult::err(format!("bash: killed by signal:\n{combined}"));
+        }
       }
     }
   }
@@ -780,8 +779,7 @@ async fn drain_into(
   use tokio::io::AsyncReadExt;
   let mut chunk = [0u8; 8192];
   loop {
-    match tokio::time::timeout(std::time::Duration::from_millis(500), pipe.read(&mut chunk)).await
-    {
+    match tokio::time::timeout(std::time::Duration::from_millis(500), pipe.read(&mut chunk)).await {
       Err(_) => continue,
       Ok(Ok(0)) | Ok(Err(_)) => return,
       Ok(Ok(n)) => {
@@ -814,7 +812,6 @@ fn truncate(s: &str) -> String {
   out.push_str(&format!("\n… [truncated {dropped} chars]"));
   out
 }
-
 
 fn floor_char_boundary(text: &str, mut at: usize) -> usize {
   let bytes = text.as_bytes();
@@ -869,7 +866,11 @@ mod tests {
       "own context file must be readable: {}",
       read.output
     );
-    assert!(read.output.contains("<!-- slopfile:user -->"), "{}", read.output);
+    assert!(
+      read.output.contains("<!-- slopfile:user -->"),
+      "{}",
+      read.output
+    );
 
     let edit = ctx(
       "edit",
@@ -949,11 +950,7 @@ mod tests {
     )
     .await;
     assert!(!no_turns.ok, "{}", no_turns.output);
-    assert!(
-      no_turns.output.contains("system"),
-      "{}",
-      no_turns.output
-    );
+    assert!(no_turns.output.contains("system"), "{}", no_turns.output);
 
     let header_killer = ctx(
       "edit",
@@ -977,9 +974,20 @@ mod tests {
   #[tokio::test]
   async fn reads_are_not_gated_on_file_contents() {
     let wd = test_dir("read-any");
-    let transcript = "```toml\nmodel = \"m\"\n```\n<!-- slopfile:begin -->\n<!-- slopfile:input -->\n";
-    t("write", json!({"path": "transcript.md", "content": transcript}), wd.clone()).await;
-    let w2 = t("write", json!({"path": "plain.md", "content": "just text\n"}), wd.clone()).await;
+    let transcript =
+      "```toml\nmodel = \"m\"\n```\n<!-- slopfile:begin -->\n<!-- slopfile:input -->\n";
+    t(
+      "write",
+      json!({"path": "transcript.md", "content": transcript}),
+      wd.clone(),
+    )
+    .await;
+    let w2 = t(
+      "write",
+      json!({"path": "plain.md", "content": "just text\n"}),
+      wd.clone(),
+    )
+    .await;
     assert!(w2.ok, "write plain failed: {}", w2.output);
 
     let r = t("read", json!({"path": "transcript.md"}), wd.clone()).await;
@@ -998,19 +1006,25 @@ mod tests {
 
     let args = json!({"path": skills.join("skill.md").to_string_lossy()});
     let refused = run("read", &args.to_string(), wd.clone(), 30_000, &[], None).await;
-    assert!(!refused.ok, "read outside workdir without extra root must fail");
+    assert!(
+      !refused.ok,
+      "read outside workdir without extra root must fail"
+    );
 
-    let allowed =
-      run(
-        "read",
-        &args.to_string(),
-        wd.clone(),
-        30_000,
-        std::slice::from_ref(&skills),
-        None,
-      )
-      .await;
-    assert!(allowed.ok, "read with extra root should succeed: {}", allowed.output);
+    let allowed = run(
+      "read",
+      &args.to_string(),
+      wd.clone(),
+      30_000,
+      std::slice::from_ref(&skills),
+      None,
+    )
+    .await;
+    assert!(
+      allowed.ok,
+      "read with extra root should succeed: {}",
+      allowed.output
+    );
     assert!(allowed.output.contains("body line"), "{}", allowed.output);
 
     let escaped_write = run(
@@ -1022,8 +1036,15 @@ mod tests {
       None,
     )
     .await;
-    assert!(!escaped_write.ok, "write must never use extra roots: {}", escaped_write.output);
-    assert!(!skills.join("evil.md").exists(), "no file may be written via extra root");
+    assert!(
+      !escaped_write.ok,
+      "write must never use extra roots: {}",
+      escaped_write.output
+    );
+    assert!(
+      !skills.join("evil.md").exists(),
+      "no file may be written via extra root"
+    );
 
     let _ = fs::remove_dir_all(&wd);
     let _ = fs::remove_dir_all(&skills);
@@ -1302,7 +1323,15 @@ mod tests {
   #[tokio::test]
   async fn bash_timeout_kills_the_child() {
     let wd = test_dir("bash-timeout");
-    let r = run("bash", "{\"command\":\"sleep 5\"}", wd.clone(), 200, &[], None).await;
+    let r = run(
+      "bash",
+      "{\"command\":\"sleep 5\"}",
+      wd.clone(),
+      200,
+      &[],
+      None,
+    )
+    .await;
     assert!(!r.ok, "sleep 5 with 200ms timeout should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
     let _ = fs::remove_dir_all(&wd);
@@ -1315,7 +1344,15 @@ mod tests {
     // Backgrounding alone used to hang the call; the foreground part has to hang too, so this
     // still exercises the timeout path and the process-group kill.
     let cmd = format!("sleep 60 & echo $! > {}; sleep 60", pid_file.display());
-    let r = run("bash", &json!({ "command": cmd }).to_string(), wd.clone(), 200, &[], None).await;
+    let r = run(
+      "bash",
+      &json!({ "command": cmd }).to_string(),
+      wd.clone(),
+      200,
+      &[],
+      None,
+    )
+    .await;
     assert!(!r.ok, "should have timed out");
     assert!(r.output.contains("timeout"), "unexpected: {}", r.output);
     let bg_pid: i32 = fs::read_to_string(&pid_file)

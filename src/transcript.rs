@@ -23,7 +23,11 @@ pub fn write_file(path: &Path, content: String) -> Result<(), String> {
     Ok(()) => Ok(()),
     Err(e) => {
       let _ = std::fs::remove_file(&tmp);
-      Err(format!("rename {} to {}: {e}", tmp.display(), path.display()))
+      Err(format!(
+        "rename {} to {}: {e}",
+        tmp.display(),
+        path.display()
+      ))
     }
   }
 }
@@ -48,7 +52,8 @@ fn transcript_load_checked(text: &str) -> Result<Session, String> {
 /// Parse and refuse anything the model would have to fix by hand, with one canonical message.
 pub fn load(path: &Path) -> Result<Session, String> {
   let text = read_file(path)?;
-  transcript_load_checked(&text).map_err(|why| format!("failed to parse session file `{}`: {why}", path.display()))
+  transcript_load_checked(&text)
+    .map_err(|why| format!("failed to parse session file `{}`: {why}", path.display()))
 }
 
 pub fn load_lenient(path: &Path) -> Result<(Session, ParseReport), String> {
