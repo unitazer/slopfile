@@ -1490,7 +1490,7 @@ async fn research_asks_the_daemon_for_status_instead_of_reading_its_own_registry
 fn the_prompt_budget_leaves_room_for_the_answer() {
   let budget = 131_072;
   let allowance = tokens::output_allowance(budget);
-  assert_eq!(allowance, budget / 4);
+  assert_eq!(allowance, 40_000);
   assert_eq!(
     tokens::prompt_budget(budget),
     budget - allowance,
@@ -1499,8 +1499,8 @@ fn the_prompt_budget_leaves_room_for_the_answer() {
   assert_eq!(tokens::prompt_budget(0), 0);
   assert_eq!(
     tokens::prompt_budget(3),
-    3,
-    "no underflow when the allowance is zero"
+    0,
+    "no underflow when the allowance exceeds the window"
   );
 }
 

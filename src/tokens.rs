@@ -166,7 +166,7 @@ pub fn prompt_budget(budget: u32) -> u32 {
 }
 
 pub fn output_allowance(budget: u32) -> u32 {
-  budget / 4
+  (budget / 4).max(40_000)
 }
 
 pub async fn build_request_messages(
