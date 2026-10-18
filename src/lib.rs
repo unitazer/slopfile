@@ -69,6 +69,14 @@ pub fn load_app_config() -> types::AppConfig {
   if let Ok(v) = var("SLOPFILE_API_BASE") {
     cfg.api_base = v;
   }
+  // Set-but-empty is the shape an unset shell variable takes in a compose file or a `.env`, and
+  // `Some("")` would then fail every session with `unknown provider `` ` written into its
+  // transcript. The rest of the env handling already refuses an empty value; match that.
+  if let Ok(v) = var("SLOPFILE_PROVIDER")
+    && !v.trim().is_empty()
+  {
+    cfg.provider = Some(v);
+  }
   if let Ok(v) = var("SLOPFILE_TRANSCRIPTS") {
     cfg.transcripts_dir = v;
   }
@@ -80,6 +88,9 @@ pub fn load_app_config() -> types::AppConfig {
   }
   if let Ok(v) = var("SLOPFILE_ABORT_RESTART") {
     cfg.abort_restart_server = v != "0" && !v.eq_ignore_ascii_case("false");
+  }
+  if let Ok(v) = var("SLOPFILE_BURST_MAX_TURNS") {
+    cfg.burst_max_turns = v.parse().unwrap_or(cfg.burst_max_turns);
   }
   if let Ok(v) = var("SLOPFILE_LLAMA_CONTAINER") {
     cfg.llama_container = v;
@@ -108,3 +119,29 @@ pub fn cmd_init(path: &str, cfg: &types::AppConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod main_tests;
+
+#[cfg(test)]
+mod duplicate_key_tests {
+  use super::*;
+
+  #[test]
+  fn a_config_with_both_model_keys_keeps_the_rest_of_the_file() {
+    let dir = std::env::temp_dir().join("slopfile-dupe-key-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slopfile.toml");
+    std::fs::write(
+      &path,
+      "workdir = \"/custom/workdir\"\nmax_context_tokens = 131072\nmodel = \"old-name\"\ndefault_session_model = \"new-name\"\n",
+    )
+    .unwrap();
+    let cfg = types::AppConfig::load_from_file(path.to_str().unwrap());
+    assert!(
+      cfg.is_ok(),
+      "both names present must not discard the file: {:?}",
+      cfg.err()
+    );
+    let cfg = cfg.unwrap();
+    assert_eq!(cfg.workdir, "/custom/workdir", "workdir must survive");
+    assert_eq!(cfg.max_context_tokens, 131_072, "context must survive");
+  }
+}

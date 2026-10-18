@@ -1,11 +1,36 @@
 confirmations = "ask"
 api_base = "http://127.0.0.1:8080"
+# provider = "openrouter"   # app-wide default for sessions whose fence names none
 workdir = "/workspace"
 transcripts_dir = "/shared/transcripts"
 sweep_interval_ms = 250
-model = "qwen3.8-27b"
+default_session_model = "qwen3.8-27b"
 max_context_tokens = 65536
 tool_timeout_ms = 60000
 abort_restart_server = true
 llama_container = "clanker-llama"
 subagent_max_depth = 2
+# burst_max_turns = 0   # ceiling on turns per `sf send`; 0 (default) means none
+
+# Any OpenAI-compatible endpoint. A session selects one with `provider = "<name>"` in its fence.
+# `${VAR}` in a header value is read from the environment, so a key need not live in this file.
+# A session can also set its own `headers` in its fence, which win over these -- that is the
+# lazier path, since transcripts are gitignored and are not part of any request.
+# Note the model can still read its own transcript, so this is convenience, not secrecy:
+# use ${VAR} if the key must not be readable by the agent.
+#
+# `reasoning_style` picks how `thinking` is spelled on the wire: "effort" (OpenAI's
+# `reasoning_effort`, and the default) or "object" (OpenRouter's `reasoning: {effort}`).
+# A model can advertise one and not the other, so this is per provider.
+#
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+reasoning_style = "object"
+headers = { Authorization = "Bearer ${OPENROUTER_API_KEY}", "HTTP-Referer" = "http://localhost", "X-Title" = "slopfile" }
+#
+# [providers.openai]
+# base_url = "https://api.openai.com/v1"
+# headers = { Authorization = "Bearer ${OPENAI_API_KEY}" }
+#
+# `llama = true` opts back in to llama.cpp's private routes (/models/load, /abort, /tokenize);
+# a hosted provider has none of them, so the default is false.

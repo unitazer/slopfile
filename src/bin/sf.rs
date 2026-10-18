@@ -3,6 +3,7 @@ use env_logger::Env;
 use log::info;
 use slopfile::api::LlamaClient;
 use slopfile::control::{self, Cmd, Req};
+use slopfile::tokens;
 use slopfile::transcript;
 use slopfile::types::AppConfig;
 use std::path::{Path, PathBuf};
@@ -159,29 +160,57 @@ async fn tokens(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(),
     return Err(format!("no such task `{}`", path.display()));
   }
   let parsed = transcript::load(&path)?;
-  let client = LlamaClient::new(&cfg.api_base);
+  let client = LlamaClient::new(cfg).for_provider(cfg, parsed.provider(), parsed.headers())?;
   let messages = parsed.request_messages();
-  let plan = slopfile::tokens::build_request_messages(&parsed, messages, cfg, client.rest())
-    .await
-    .map_err(|e| format!("tokens: {e}"))?;
+  let tool_defs = slopfile::tools::advertised(&parsed.config);
+  let tools_chars = serde_json::to_string(&tool_defs).map_or(0, |s| s.len() as u64);
+  // No anchor here: the measured sample lives in the daemon's memory for the session it belongs
+  // to. Running this command tells you what the payload weighs, not what it costs in tokens --
+  // except against a llama-server, which counts for real and needs no sample.
+  let plan = slopfile::tokens::build_request_messages(
+    &parsed,
+    messages,
+    cfg,
+    client.endpoint(),
+    &client,
+    &slopfile::tokens::Counting {
+      anchor: None,
+      tools_chars,
+    },
+  )
+  .await
+  .map_err(|e| format!("tokens: {e}"))?;
   let budget = slopfile::tokens::context_budget(&parsed, cfg);
-  let headroom = budget.saturating_sub(plan.token_count as u32);
   println!("tokens: {}", path.display());
   println!(
     "  messages:     {} sent ({} oldest dropped to fit budget)",
     plan.messages.len(),
     plan.dropped
   );
-  println!(
-    "  model tokens: {}  (via llama-server /tokenize, content only)",
-    plan.token_count
-  );
+  match plan.token_count {
+    Some(n) => {
+      // Against `budget`, not the usable prompt: `n` is already capped at `prompt_budget`, so
+      // subtracting from the full window would never drop below the output allowance and would
+      // report headroom on a transcript that has none left.
+      let headroom = tokens::prompt_budget(budget).saturating_sub(n as u32);
+      println!(
+        "  model tokens: {n}  (via {}/tokenize)",
+        client.endpoint().base
+      );
+      println!("  headroom:     {headroom} tokens");
+    }
+    None => println!(
+      "  model tokens: unknown -- {} has no tokenizer, and the measured sample lives in the \
+       daemon. Payload is {} bytes; run the daemon and read its log for a real count.",
+      client.endpoint().base,
+      plan.payload_chars
+    ),
+  }
   let allowance = slopfile::tokens::output_allowance(budget);
   println!(
     "  context budget: {budget}  output allowance: {allowance}  prompt budget: {}",
     budget.saturating_sub(allowance)
   );
-  println!("  input headroom: {headroom}");
   info!("command `tokens` reported for task `{}`", path.display());
   Ok(())
 }

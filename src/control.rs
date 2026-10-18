@@ -2,7 +2,7 @@ use crate::flow;
 use crate::questions;
 
 use crate::transcript;
-use crate::types::AppConfig;
+use crate::types::{AppConfig, PromptSample};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,19 @@ pub struct SessionState {
   pub phase: Phase,
   pub pending_questions: usize,
   pub model: String,
+  /// The endpoint this session is talking to, so `sf status` can answer "which one is this?"
+  pub endpoint: String,
+  /// The last request as the provider counted it. In-memory on purpose: it is a cache of an
+  /// observation, and a daemon restart costs exactly one uncalibrated turn.
+  pub last_prompt: Option<PromptSample>,
+  /// The provider refused the request and retrying will not help. Unlike a failure this is
+  /// terminal on its own: the session stops immediately instead of being re-driven every sweep
+  /// until the park threshold, which against a spent quota is the difference between one wasted
+  /// request and several hundred.
+  pub blocked: bool,
+  /// The user ran `sf stop`. An edit to the file un-parks a session, and without this that edit
+  /// would quietly restart something they had deliberately stopped.
+  pub stopped: bool,
   arm_token: u64,
 }
 
@@ -45,6 +58,10 @@ impl Default for SessionState {
       phase: Phase::Idle,
       pending_questions: 0,
       model: String::new(),
+      endpoint: String::new(),
+      last_prompt: None,
+      blocked: false,
+      stopped: false,
       arm_token: 0,
     }
   }
@@ -54,11 +71,17 @@ impl SessionState {
   pub fn arm(&mut self) {
     self.armed = true;
     self.parked = false;
+    // An explicit stop is the user saying "not this one". Re-arming it because the file happened
+    // to change is how a stopped session comes back to life on its own.
+    self.stopped = false;
+    // A send is the user saying "try again", which is also how a provider refusal gets cleared.
+    self.blocked = false;
     self.arm_token += 1;
   }
 
   pub fn disarm(&mut self) {
     self.armed = false;
+    self.stopped = true;
   }
 
   pub fn request_abort(&mut self) {
@@ -92,10 +115,13 @@ impl SessionState {
       armed: self.armed,
       abort: self.abort,
       parked: self.parked,
+      blocked: self.blocked,
+      stopped: self.stopped,
       solved: self.solved,
       context_full: self.context_full,
       pending_questions: self.pending_questions,
       model: self.model.clone(),
+      endpoint: self.endpoint.clone(),
     }
   }
 }
@@ -173,27 +199,37 @@ pub struct Status {
   pub armed: bool,
   pub abort: bool,
   pub parked: bool,
+  /// The provider refused this session outright, so it is parked for a different reason than the
+  /// retry threshold. Worth its own field: a user reading `parked=true` cannot otherwise tell a
+  /// five-failure blip from a rate limit that will not clear on its own.
+  pub blocked: bool,
+  /// The user asked for this session to stop. Un-parking must not quietly undo that.
+  pub stopped: bool,
   pub solved: bool,
   pub context_full: bool,
   pub pending_questions: usize,
   pub model: String,
+  pub endpoint: String,
 }
 
 impl std::fmt::Display for Status {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     write!(
       f,
-      "task {} phase={} running={} armed={} abort={} parked={} solved={} context_full={} pending_questions={} model={}",
+      "task {} phase={} running={} armed={} abort={} parked={} blocked={} stopped={} solved={} context_full={} pending_questions={} model={} endpoint={}",
       self.session,
       self.phase.label(),
       self.running,
       self.armed,
       self.abort,
       self.parked,
+      self.blocked,
+      self.stopped,
       self.solved,
       self.context_full,
       self.pending_questions,
-      self.model
+      self.model,
+      self.endpoint
     )
   }
 }

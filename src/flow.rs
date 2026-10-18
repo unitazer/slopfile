@@ -26,7 +26,8 @@ pub fn is_subagent_path(path: &Path) -> bool {
 
 pub fn session_template(cfg: &AppConfig, excluded: &[String]) -> Session {
   let config = session::SessionConfig {
-    model: Some(cfg.model.clone()),
+    provider: cfg.provider.clone(),
+    model: Some(cfg.default_session_model.clone()),
     tools: Some(DEFAULT_TOOLS.iter().map(|t| t.to_string()).collect()),
     tools_excluded: excluded.to_vec(),
     ..Default::default()
@@ -290,6 +291,10 @@ fn default_answers(questions: &[Question]) -> Vec<(u32, String)> {
 
 pub fn add_context_full_note(session: &mut Session) {
   session.add_note(NoteBy::Harness, context::CONTEXT_FULL_NOTE);
+}
+
+pub fn add_reasoning_exhausted_note(session: &mut Session) {
+  session.add_note(NoteBy::Harness, context::REASONING_EXHAUSTED_NOTE);
 }
 
 pub fn adopt_model_edit(current: &Session, path: &Path) -> Result<Option<Session>, String> {

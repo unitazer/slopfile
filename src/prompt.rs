@@ -3,10 +3,13 @@ use std::path::PathBuf;
 
 pub fn system_prompt_default(cfg: &AppConfig, tools_excluded: &[String]) -> String {
   let has = |t: &str| !tools_excluded.iter().any(|x| x == t);
+  // Without this tool the model can still reach the point where it wants a decision. Saying
+  // nothing leaves it to either guess or stall on a question nobody can answer, so name the
+  // constraint instead of just dropping the sentence.
   let decision_line = if has("question") {
     "When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing."
   } else {
-    ""
+    "You have no way to ask the user anything: nobody will answer a question from you, and no decision is coming. Never block on one. Make the call yourself, state the assumption you made, and keep going."
   };
   let mut out = format!(
     "You are an expert software engineering assistant. You help the user by reading files, running commands, editing code, and writing files, and you reply to them in plain text.
@@ -49,9 +52,11 @@ Current working directory: {}",
     cfg.workdir
   ));
   out.push_str(&skills_index(&cfg.skills_dir));
-  out.push_str(&
-  "if you feel like you have infromation that took some trial and error to discover/obtain, you should write it down as a new skill. creating new skills is how you manage persistent memory to reduce the amount of trial and error needed in the future"    
- );
+  // `skills_index` is empty when there are no skills, and the block above ends without a newline,
+  // so this needs its own leading break or it welds itself onto the working directory.
+  out.push_str(
+    "\n\nIf you learn something that took trial and error to discover, write it down as a new skill. Creating skills is how you manage persistent memory, so the next session does not have to rediscover it."
+  );
   out
 }
 

@@ -2,6 +2,12 @@ use crate::session::{self, Session};
 use crate::types::{ChatMessage, Role};
 use std::path::Path;
 
+/// The output allowance ran out because the model spent it thinking, not because the transcript
+/// grew. The advice is therefore the opposite of `CONTEXT_FULL_NOTE`: leave the file alone.
+pub const REASONING_EXHAUSTED_NOTE: &str = "the model used its entire output allowance on \
+   thinking and wrote nothing back; nothing is wrong with this transcript, so do not prune it. \
+   Lower `thinking` in the fence above, or raise `max_context_tokens` so the allowance is bigger";
+
 pub const CONTEXT_FULL_NOTE: &str = "the model hit the token cap mid-response; this session file is your context, so edit it now to \
    drop or compress the useless old turns above, then write your next message below this note";
 
@@ -20,15 +26,22 @@ pub const PRUNE_THRESHOLD_PCT: u32 = 70;
 #[derive(Clone, Copy, Debug)]
 pub struct Window {
   pub used: usize,
-  pub budget: u32,
+  /// Tokens the prompt may occupy: the window minus what is reserved for the answer. This is the
+  /// denominator, not `total`, and the difference is the whole ballgame -- a reply has to fit
+  /// too, so the prompt is held below `total` and never reaches it. Measured against the full
+  /// window the percentage tops out under the threshold and the reminder never fires at all: at a
+  /// 65k window it could not exceed 38%.
+  pub usable: u32,
+  /// The full context window, which the model still needs to reason about.
+  pub total: u32,
 }
 
 impl Window {
   fn percent(&self) -> u32 {
-    if self.budget == 0 {
+    if self.usable == 0 {
       return 0;
     }
-    (self.used as u64 * 100 / u64::from(self.budget)) as u32
+    (self.used as u64 * 100 / u64::from(self.usable)) as u32
   }
 }
 
@@ -44,10 +57,11 @@ fn pressure_line(window: Option<Window>) -> String {
     return String::new();
   }
   format!(
-    "\nWindow: {} tokens, about {} used ({}%). Prune before you continue: drop dead tool \
+    "\nWindow: {} tokens, of which {} are available for this conversation; about {} used ({}%). \
+     Prune before you continue: drop dead tool \
      output, compress turns you have finished with, and delete anything you have already used. \
      Whatever you leave in this file is what you get back, so make room for the work ahead.\n",
-    w.budget, w.used, pct
+    w.total, w.usable, w.used, pct
   )
 }
 

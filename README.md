@@ -151,9 +151,11 @@ send again.
 2. The daemon promotes that text to a `user` region, opens an `assistant`
    region, and streams `reasoning` / `text` into it as tokens arrive.
 3. Tool calls land as `call` + `result` regions; the daemon loops until the
-   model stops asking for tools. One `sf send` opens a **burst** capped at 20
-   turns; hitting it writes a `note` into the file saying so, because going
-   quiet is indistinguishable from the model having finished.
+   model stops asking for tools. One `sf send` opens a **burst**, and a burst
+   has no turn limit — it ends when the model stops, or when you `sf abort` /
+   `sf stop`. (There used to be a fixed 20-turn cap; it was a band-aid for a
+   `bash` bug that forced the model to poll backgrounded jobs, and it outlived
+   the bug. `burst_max_turns` sets an opt-in ceiling if you want one.)
 4. On clean completion the `turn` region is closed.
 5. `question` → the daemon renders a `QUESTIONS` table into `input` and waits.
    Answer below the `>` line (indices, comma separated, or free text) and
@@ -204,8 +206,8 @@ once made its stop condition dead code.)
 
 ## Run 1 — host (quick, no Docker for the daemon)
 
-You need a `llama-server` (or any OpenAI-compatible endpoint) reachable at the
-`api_base` from the config.
+You need a `llama-server` reachable at the `api_base` from the config, or one of
+the `[providers.*]` endpoints — see [Providers](#providers).
 
 ```bash
 # 1. Build both binaries
@@ -373,12 +375,20 @@ Each `[name]` section advertises one model — drop the GGUF (and optional
 mmproj) into `slopfile/shared/models/` and add a section. The preset ships with
 one model, `qwen3.8-27b` (Qwen3.8-27B multimodal, Q4_K_XL, 131k context).
 
-The default template writes `model = "qwen3.8-27b"` in the session header;
-the daemon routes each request to the model named in that header
-(`slopfile.toml`'s `model` is just the fallback when the header omits it).
-To use a different model in a session, set its preset-section name in the
-file's header ` ```toml model = "..." `` block. The server auto-loads on
-demand and the daemon best-effort preloads it before streaming.
+The daemon routes each request to the model named in the session's
+` ```toml model = "..." `` block. To use a different model in a session, set
+its preset-section name there. The server auto-loads on demand and the daemon
+best-effort preloads it before streaming.
+
+`slopfile.toml`'s `default_session_model` is where a *new* session's fence gets
+its model from. It is not a global override — a session pins its model when it
+is created, so changing this setting does not move existing sessions. To move
+one, edit its fence. (The old key `model` is still accepted in `slopfile.toml`
+and means the same thing.)
+
+That same header block can name a provider — see [Providers](#providers) —
+which is how one transcript talks to OpenRouter while its neighbour stays
+local.
 
 ---
 
@@ -389,19 +399,154 @@ confirmations = "ask"          # questions only: "ask" waits for you, "yolo" aut
                                # the question's default. It does NOT gate any tool -- nothing here
                                # asks before running bash. An unrecognized value silently
                                # becomes "ask", so check for typos.
-api_base = "http://127.0.0.1:8080"
+api_base = "http://127.0.0.1:8080"          # the implicit llama-server endpoint
+provider = "openrouter"                      # optional app-wide default; see "Providers"
 workdir = "/home/unitazer/things/clanker"      # tool-call root; edits are restricted to it
 transcripts_dir = ".../shared/transcripts"     # session files the daemon watches
 sweep_interval_ms = 250                        # poll cadence
-model = "qwen3.8-27b"                          # served model name
+default_session_model = "qwen3.8-27b"          # model stamped into each NEW session's fence;
+                                                # it does not override existing sessions
 tool_timeout_ms = 30000                        # per-tool bash timeout
 max_context_tokens = 65536                     # must equal ctx-size in presets.ini (see below)
 abort_restart_server = true                    # docker restart llama-server on abort
 llama_container = "clanker-llama"              # container to restart on abort
+burst_max_turns = 0                            # ceiling on turns per `sf send`; 0 = none
+
+# Any OpenAI-compatible endpoint, selectable per session. Headers are where the API key goes.
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+reasoning_style = "object"
+headers = { Authorization = "Bearer ${OPENROUTER_API_KEY}", "X-Title" = "slopfile" }
 ```
 
 `max_context_tokens` is the slopfile-side half of a pair — see
 [Things that must be kept in sync](#things-that-must-be-kept-in-sync-by-hand).
+
+## Providers
+
+`api_base` is always available and is assumed to be a llama-server. Anything
+else — OpenRouter, OpenAI, a gateway, your own server — goes in
+`[providers.<name>]` and a session asks for it by name:
+
+```toml
+provider = "openrouter"
+model = "qwen/qwen3-235b-a22b"
+thinking = "auto"
+tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent"]
+```
+
+`provider` is optional. Omitted, a session takes the app-wide `provider`, and
+failing that `api_base` — so existing transcripts are unaffected by any of this.
+
+One caveat, the same one `default_session_model` has: the app-wide `provider`
+is stamped into each new session's fence, and that is a one-way latch. Clearing
+it from `slopfile.toml` afterwards does not move existing sessions back to
+`api_base`; edit their fences if you want that.
+
+`base_url` may be written with or without the trailing `/v1`; it is normalized
+away, since the request paths carry the version themselves.
+
+`headers` go out on every request to that provider. **`${VAR}` is expanded from
+the environment**, which is where the key belongs:
+
+```toml
+headers = { Authorization = "Bearer ${OPENROUTER_API_KEY}" }
+```
+
+An unset *or empty* variable is an error, not a dropped header — otherwise a
+missing key surfaces as `Authorization: Bearer ` and a 401 that reads like a
+wrong key rather than a missing one.
+
+### Where the key actually goes
+
+`${VAR}` is expanded by the **daemon process**, so under Docker it is read from
+the *container's* environment, not your shell. Two ways to get it in, laziest first:
+
+**1. In the transcript.** The session's fence takes its own `headers`, applied
+on top of the provider's, so the key never has to leave the file:
+
+```toml
+provider = "openrouter"
+headers = { Authorization = "Bearer sk-or-v1-REAL-KEY" }
+model = "qwen/qwen3-235b-a22b"
+```
+
+The fence is not part of any request — `request_messages()` builds them from the
+`system` region and the turns alone, and it is not in the context paragraph
+either. Transcripts are gitignored.
+
+But **the model can still read it.** `read`/`write`/`edit` deliberately exempt
+the session's own transcript, the context paragraph names its path, and `bash`
+has no path sandbox, so `cat /shared/transcripts/<name>.md` works regardless. A
+prompt injection — or just a curious model — can surface a fence header and put
+it anywhere `bash` can reach. That is the same exposure as any secret in a file
+the agent can read, so weigh it accordingly: option 1 is convenient, not
+confidential. If the key must not be readable by the model, use option 2. Either
+way `shared/transcripts/` should stay out of backups or syncs you don't
+control.
+
+**2. In the container's environment.** Add to the `slopfile` service in
+`docker/docker-compose.yml` — the file passes the variable through next to the
+other `SLOPFILE_*` variables:
+
+```yaml
+OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}   # empty is fine unless you use OpenRouter
+```
+
+If you would rather have a missing key fail loudly, use `${VAR:?}` instead of the
+default `${VAR:-}` above. Compose substitutes an empty string for an
+unset variable, which is what the empty-check above exists to catch.
+
+`slopfile.toml` itself is tracked, so don't put a literal key there — option 1
+or 2, not a plain `headers` line in the config.
+
+### Thinking
+
+`thinking` in the fence sets the effort. OpenAI and llama-server read a
+`reasoning_effort` field; OpenRouter's unified interface is a `reasoning` object.
+They are not interchangeable — a model can advertise one and not the other — so
+the shape is a per-provider setting:
+
+```toml
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+reasoning_style = "object"   # default is "effort"
+```
+
+`none`, `low`, `medium`, `high` and `xhigh` all mean the same thing in both
+shapes. `auto` omits the field either way, so the model keeps its own default.
+
+Reasoning tokens come out of the same `max_tokens` allowance as the reply. A
+model that spends the whole allowance thinking comes back with
+`finish_reason: "length"` and nothing visible written — which slopfile tells
+apart from a full context window, because the advice is the opposite: leave the
+transcript alone, lower `thinking` or raise `max_context_tokens`.
+
+### Counting tokens
+
+There is no `/tokenize` on a hosted endpoint, and slopfile does not guess. OpenRouter
+bills and reports with the model's **native** tokenizer and returns
+`usage.prompt_tokens` on every response, so the ratio between the bytes sent and
+the tokens counted is *measured*, per model, per session — not a constant.
+(`stream_options: {include_usage: true}` is sent for hosted endpoints to get the
+same from OpenAI; llama-server's request is unchanged.)
+
+That means the **first** turn against a new endpoint has nothing to measure
+against. It sends the transcript whole and reports `tokens=?` rather than a made-up
+number, and the budget applies from turn two on. The sample is in-memory, so a
+daemon restart costs one such turn.
+
+Consequence worth knowing: `max_context_tokens` is load-bearing for hosted
+endpoints, and enforcement is back on there. If you set a small one, sessions
+will start pruning themselves — which you want, but not as a surprise.
+
+Other things that differ from a local llama-server, all handled:
+`reasoning_content` is stripped from the request (OpenAI rejects the field) and
+read back from `reasoning` instead; llama.cpp's private routes (`/models/load`,
+`/abort`, `/tokenize`) are skipped; and a `llama-server`'s own `/tokenize` is
+still preferred for local models, since `max_context_tokens` there is tuned by
+hand against `ctx-size`. Setting `llama = true` on a provider that *is* a
+llama-server re-enables all of it.
 
 ## Things that must be kept in sync by hand
 
@@ -518,13 +663,19 @@ rewritten behind the model's back.
   regions are broken; the message names the region and states the grammar. Note
   that an unknown name is only an error at the *top level* — inside a `turn` or
   an `assistant` it is kept as a role you invented. Fix it by hand, then send.
-- **`stopped this burst after 20 turns`** — the model used its whole burst
-  budget, usually by polling a long job instead of backgrounding it. `bash` now
-  returns immediately for `nohup … &`, so this usually means a turn that is
-  making no progress; consider stopping it.
+- **`this burst hit its turn ceiling (N)`** — only reachable if you set
+  `burst_max_turns`, which is 0 (no ceiling) by default. The session continues
+  from wherever it stopped; raise or drop the number in the fence.
 - **`refusing to write`** from `session-edit.py` — the edit would not parse or
   put a region where it has no meaning. It never wrote anything, so the
   transcript is untouched; use `session-edit.py list` to get the real path.
+- **the file just stops, with an empty `input` region** — it used to be ambiguous between "the
+  model finished" and "the request never happened". A refusal now writes itself into the
+  transcript as a `[harness]` note naming the provider's own explanation, and the session parks
+  until you `sf send` again rather than spending more of a spent quota retrying.
+- **`the provider refused the request (429)`** — OpenRouter's free tier allows 50 model requests
+  per day, and one tool-calling turn can be several. It resets at 00:00 UTC; adding 10 credits
+  raises it to 1000/day. `sf abort` / `sf stop` end a burst early.
 - **`context_full`** — the model hit the token cap. It is told to prune its own
   file; if it does not, the harness drops old turns. Consider `max_context_tokens`
   (see the sync section above).

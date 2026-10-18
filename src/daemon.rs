@@ -1,11 +1,11 @@
-use crate::api::LlamaClient;
+use crate::api::{ApiError, LlamaClient};
 use crate::control::{self, Phase};
 use crate::flow;
 use crate::session::{self, Session, ToolOutcome};
 use crate::stream::StreamWriter;
 use crate::tokens;
 use crate::transcript;
-use crate::types::{AppConfig, Confirmations};
+use crate::types::{AppConfig, Confirmations, Endpoint, PromptSample};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::sync::Mutex as AsyncMutex;
@@ -21,11 +21,203 @@ fn delivery_lock() -> &'static AsyncMutex<()> {
   LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
-/// One `sf send` opens a burst that runs until the model stops calling tools. The cap exists so a
-/// wedged model cannot spin forever, but it is a per-burst budget, so a long task has to fit inside
-/// it -- which is why hitting it is reported in the transcript rather than silently.
-pub const MAX_TURNS_PER_BURST: usize = 20;
+/// Write why a request did not happen into the transcript itself.
+///
+/// The failure used to exist only in the daemon log, which left the file looking exactly like a
+/// session that simply finished -- same trailing empty input region, same silence -- so the only
+/// way to find out was `docker logs` after the fact. A provider refusal is the one failure a user
+/// is most likely to hit and least likely to have any other way of diagnosing.
+pub(crate) fn record_provider_failure(
+  path: &Path,
+  mut s: Session,
+  e: &ApiError,
+) -> Result<(), String> {
+  // This runs on a transcript that may be mid-stream, with `text` still open so a later run can
+  // resume mid-sentence. Notes render inside the open region, and the parser then reads the note
+  // *and the whole input region* as part of the model's partial answer -- after which the file
+  // no longer parses at all and every later run dies on load. Close the dangling section first;
+  // the turn stays open, so the partial answer is still there and still resumable.
+  s.close_section();
+  // The session we were handed is the snapshot taken before the request went out, but the human
+  // has had the whole generation to edit the file -- pruning turns, fixing a typo, typing the
+  // next message. Saving the snapshot wholesale silently reverts all of it, which is worst for the
+  // overflow case: the note tells them to shrink this transcript, they do it mid-request, and it
+  // comes straight back.
+  //
+  // So the file wins, and only the one thing it cannot know about is put back: whatever the model
+  // streamed into the turn that is still in flight.
+  match transcript::load(path) {
+    Ok(on_disk) => {
+      let in_flight = s
+        .turns
+        .last()
+        .and_then(|t| t.rounds.last())
+        .map(|r| r.assistant.clone());
+      s = on_disk;
+      if let Some(partial) = in_flight
+        && let Some(round) = s.turns.last_mut().and_then(|t| t.rounds.last_mut())
+      {
+        // Only graft onto the round this fragment actually belongs to. Matching by position is not
+        // enough: if the user prunes the dangling assistant region mid-generation, the last round
+        // on disk is some earlier one, and writing a fragment of the aborted reply over its text
+        // would leave the transcript claiming the model said something it never said.
+        //
+        // Two things identify the real target. An unanswered round has no calls and no results --
+        // though a plain prose answer satisfies that too, so it is not enough on its own. The text
+        // is the real tell: the in-flight round on disk holds what has flushed so far, which is a
+        // prefix of what we hold. A completed round's text is something else entirely.
+        let unanswered = round.assistant.calls.is_empty() && round.results.is_empty();
+        let same_round = match (round.assistant.text.as_deref(), partial.text.as_deref()) {
+          (Some(on_disk), Some(streamed)) => on_disk.is_empty() || streamed.starts_with(on_disk),
+          _ => true,
+        };
+        if unanswered && same_round {
+          if partial.reasoning.is_some() {
+            round.assistant.reasoning = partial.reasoning;
+          }
+          if partial.text.is_some() {
+            round.assistant.text = partial.text;
+          }
+        }
+      }
+    }
+    // Falling back to the pre-request snapshot here would quietly undo every edit the human made
+    // while the request was running -- the one thing this function exists to prevent -- so it is
+    // worth saying out loud rather than losing their words without a word.
+    Err(e) => tracing::warn!(
+      "{path:?}: could not re-read the transcript to preserve your edits ({e});      writing the in-flight state over it"
+    ),
+  }
+  // Only a refusal is the provider saying no. A timeout or a dropped connection is a different
+  // thing entirely, and promising "it will come back on the next send" there is advice that can be
+  // wrong -- a stream that died mid-generation may have lost the turn it was writing.
+  // A 408, a 425, or anything with `Retry-After` is a refusal that expires, not a dropped
+  // connection. Describing it as the latter sends the user looking at their network instead of at
+  // the rate limit that just hit them.
+  let is_refusal = matches!(e, ApiError::NonOkStatus(..));
+  let note = if e.is_context_overflow() {
+    // The single most likely first-turn failure on a hosted endpoint, and the one case where
+    // "re-sending is safe" is exactly wrong: the request is too big, so it fails identically until
+    // the transcript shrinks.
+    format!(
+      "[harness] {e}\n   The provider rejected this because the request was too large for the \
+       model's context window, not because of anything in it. Re-sending will fail the same way \
+       until the transcript shrinks: delete or compress older turns in this file, or raise \
+       `max_context_tokens` if the model really does have a bigger window."
+    )
+  } else if e.is_terminal() {
+    format!(
+      "[harness] {e}\n   The provider refused the request, so this turn was never answered. \
+       Nothing in the transcript was lost and re-sending is safe."
+    )
+  } else {
+    if is_refusal {
+      format!(
+        "[harness] {e}\n   The provider turned this one down but said it is temporary, so it will \
+         clear on its own. Re-sending later is safe; check whether the turn above was left \
+         half-written."
+      )
+    } else {
+      format!(
+        "[harness] {e}\n   The connection failed rather than being refused, so this is likely \
+         transient. Re-sending is safe, but check whether the turn above was left half-written."
+      )
+    }
+  };
+  // A send against the same dead endpoint fails the same way, and a note per attempt would bury the
+  // transcript it is trying to explain. Replace the previous one instead of stacking.
+  if let Some(last) = s.turns.last_mut()
+    && let Some(note_slot) = last.notes.last_mut()
+    && note_slot.by == session::NoteBy::Harness
+    && (note_slot.text.contains("this turn was never answered")
+      || note_slot.text.contains("left half-written")
+      || note_slot.text.contains("too large for the"))
+  {
+    note_slot.text = note;
+  } else {
+    s.add_note(session::NoteBy::Harness, &note);
+  }
+  transcript::save(path, &s)
+}
 
+/// The text a burst writes when it hits a ceiling. Kept as one function so the test asserts on
+/// what is actually emitted rather than on a copy that can drift.
+pub(crate) fn burst_ceiling_note(burst_cap: u32) -> String {
+  format!(
+    "[harness] this burst hit its turn ceiling ({burst_cap}). There is no ceiling by default — \
+     set `burst_max_turns = 0` in the fence above (or in `shared/slopfile.toml`) to make that \
+     explicit and unlimited; without a fence value, the app-wide setting applies. The work is all \
+     above and continues from there."
+  )
+}
+
+/// The answer the model actually showed, with inline think tags removed -- the same split the
+/// transcript writer makes, so "did it say anything visible?" is asked about the same text the user
+/// would see.
+pub(crate) fn visible_text(content: &str) -> String {
+  // Alternates on both tags, like the transcript writer does. A single `<think>` pass loses a
+  // second think block, and a truncated reply is exactly the shape with more than one -- which
+  // would report visible output that was only thinking and misdiagnose the turn as context-full.
+  let mut out = String::new();
+  let mut rest = content;
+  let mut in_think = false;
+  while let Some(i) = rest
+    .find("<think>")
+    .into_iter()
+    .chain(rest.find("</think>"))
+    .min()
+  {
+    if !in_think {
+      out.push_str(&rest[..i]);
+    }
+    if rest[i..].starts_with("<think>") {
+      rest = &rest[i + "<think>".len()..];
+      in_think = true;
+    } else {
+      rest = &rest[i + "</think>".len()..];
+      in_think = false;
+    }
+  }
+  if !in_think {
+    out.push_str(rest);
+  }
+  out
+}
+
+/// A turn that never left the building -- a misspelled provider, unusable headers -- rather than
+/// one the provider turned down. Same job as `record_provider_failure`: the reason belongs in the
+/// file, because the file otherwise just stops for no visible reason.
+pub(crate) fn record_config_failure(path: &Path, e: &str) -> Result<(), String> {
+  let mut s = transcript::load(path)?;
+  s.close_section();
+  let note = format!(
+    "[harness] {e}\n   Nothing was sent. If the provider is named in this file's fence, fix it \
+     there; otherwise it is the app-wide `provider` in `shared/slopfile.toml`, or a \
+     `SLOPFILE_*` environment variable. Re-sending alone will fail the same way."
+  );
+  if let Some(last) = s.turns.last_mut()
+    && let Some(note_slot) = last.notes.last_mut()
+    && note_slot.by == session::NoteBy::Harness
+    && note_slot.text.contains("Nothing was sent")
+  {
+    note_slot.text = note;
+  } else {
+    s.add_note(session::NoteBy::Harness, &note);
+  }
+  transcript::save(path, &s)
+}
+
+/// One `sf send` opens a burst that runs until the model stops calling tools.
+///
+/// There is deliberately no turn limit. There used to be one at 20, and it was a band-aid: a bug
+/// in `bash` made a correctly-backgrounded job inherit the pipe, so the call hung to timeout and
+/// then killed the job it had just launched, and the model responded the only way it could -- by
+/// polling in 28-second sleeps. Every poll was a turn, so a 23-call session spent its whole budget
+/// watching a job that had already finished. The bug is fixed (2d56f21); the scar was not, and by
+/// then a turn was worth ~5s on a hosted model, so the cap was stopping legitimate work.
+///
+/// `AppConfig::burst_max_turns` is still there for anyone who wants a ceiling -- it defaults to
+/// 0, meaning none -- and `sf abort` / `sf stop` remain the real control.
 pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
   let name = control::session_name(path);
   let is_sub = flow::is_subagent_path(path);
@@ -34,29 +226,6 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
   let token_at_entry = control::update(&name, |s| s.arm_token());
   loop {
     turns += 1;
-    if turns > MAX_TURNS_PER_BURST {
-      // Say so in the file. Going quiet looks identical to "the model decided it was done", so
-      // the user is left sending `sf send` to find out whether anything is actually wrong.
-      let mut s = transcript::load(path).unwrap_or_else(|_| Session::default());
-      s.add_note(
-        session::NoteBy::Harness,
-        format!(
-          "[harness] stopped this burst after {MAX_TURNS_PER_BURST} turns without being asked to. \
-           Anything you had not finished is still below; continue, but do it in fewer turns — \
-           run long jobs in the background instead of polling them, and batch work up."
-        ),
-      );
-      let _ = transcript::save(path, &s);
-      warn!("{path:?}: giving up after {turns} turns (noted in the transcript)");
-      if is_sub {
-        deliver_subagent_result(path, SubagentReport::TurnCap).await?;
-      }
-      control::update(&name, |s| {
-        s.running = false;
-        s.settle(token_at_entry);
-      });
-      return Ok(());
-    }
 
     let mut session = transcript::load(path)?;
     if session.system.trim().is_empty()
@@ -66,6 +235,27 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
     {
       transcript::save(path, &flow::session_template(cfg, &[]))?;
       info!("{path:?}: initialized empty session");
+      return Ok(());
+    }
+    // Opt-in ceiling, off unless asked for. Checked here rather than at the top of the loop so a
+    // session can set its own -- the fence is the per-session dial for everything else.
+    let burst_cap = session
+      .config
+      .burst_max_turns
+      .unwrap_or(cfg.burst_max_turns);
+    if burst_cap > 0 && turns as u32 > burst_cap {
+      // Say so in the file. Going quiet looks identical to "the model decided it was done", so
+      // the user is left sending `sf send` to find out whether anything is actually wrong.
+      session.add_note(session::NoteBy::Harness, burst_ceiling_note(burst_cap));
+      let _ = transcript::save(path, &session);
+      warn!("{path:?}: giving up after {turns} turns (noted in the transcript)");
+      if is_sub {
+        deliver_subagent_result(path, SubagentReport::TurnCap).await?;
+      }
+      control::update(&name, |s| {
+        s.running = false;
+        s.settle(token_at_entry);
+      });
       return Ok(());
     }
     // While a question is pending the input region belongs to the answer UI, not to a new turn.
@@ -91,7 +281,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
         s.model = session
           .model()
           .map(str::to_string)
-          .unwrap_or_else(|| cfg.model.clone());
+          .unwrap_or_else(|| cfg.default_session_model.clone());
       }
       s.pending_questions = session.pending_question().map_or(0, |q| q.questions.len());
       s.armed
@@ -207,39 +397,76 @@ async fn run_generation_turn(
   let model = work
     .model()
     .map(str::to_string)
-    .unwrap_or_else(|| cfg.model.clone());
+    .unwrap_or_else(|| cfg.default_session_model.clone());
 
   let thinking = work.thinking();
+
+  // Re-resolved every turn, not once at startup: the fence is the user's dial and they can turn it
+  // between turns. `Err` here is a typo'd provider name, and it must stop the turn rather than
+  // quietly falling back to some other endpoint's model.
+  //
+  // It also gets written into the transcript. A misspelled provider leaves the file ending in an
+  // empty input region, which is exactly the silence the failure note exists to end -- and this
+  // one is entirely the user's typo, so it is the case they are most likely to hit and least
+  // likely to guess at.
+  let client = match client.for_provider(cfg, work.provider(), work.headers()) {
+    Ok(c) => c,
+    Err(e) => {
+      record_config_failure(path, &e)?;
+      return Err(e);
+    }
+  };
+  let client = &client;
+  let endpoint = client.endpoint().base.clone();
 
   // Build the request first, then measure it: the context paragraph is part of what gets sent, so
   // counting before adding it would under-count by a thousand characters.
   let mut messages = work.request_messages();
   // First pass with no fill level: the paragraph must be counted, but the count does not exist yet.
   crate::context::attach_context_file(&mut messages, path, None);
-  let plan = tokens::build_request_messages(&work, messages, cfg, client.rest()).await?;
+  let tool_defs = crate::tools::advertised(&work.config);
+  let tools_chars = serde_json::to_string(&tool_defs).map_or(0, |s| s.len() as u64);
+  let anchor = control::update(name, |s| s.last_prompt.clone());
+  let plan = tokens::build_request_messages(
+    &work,
+    messages,
+    cfg,
+    client.endpoint(),
+    client,
+    &tokens::Counting {
+      anchor,
+      tools_chars,
+    },
+  )
+  .await?;
   let mut messages = plan.messages;
   // Second pass with the real number, so the model knows how much room it has before it decides
   // whether to spend a turn compacting. The line itself costs ~40 tokens, which is noise here.
+  // With no measured sample there is no honest number to give, so the line stays off entirely
+  // rather than the model being told a figure we made up.
   let budget = tokens::context_budget(&work, cfg);
   crate::context::attach_context_file(
     &mut messages,
     path,
-    Some(crate::context::Window {
-      used: plan.token_count,
-      budget,
+    plan.token_count.map(|used| crate::context::Window {
+      used,
+      // The prompt competes for the window minus the reply's allowance, so that -- not the
+      // whole window -- is what "how full am I" is measured against.
+      usable: tokens::prompt_budget(budget),
+      total: budget,
     }),
   );
 
   let max_tokens = tokens::output_allowance(tokens::context_budget(&work, cfg));
-  let tool_defs = crate::tools::advertised(&work.config);
 
   client.ensure_model_loaded(&model).await;
 
   let mut active = StreamWriter::new(path, work);
   info!(
-    "→ {path:?}: generating (model={model}, thinking={thinking}, messages={}, tokens={}, dropped={})",
+    "→ {path:?}: generating (provider={}, model={model}, thinking={thinking}, messages={}, tokens={}, dropped={})",
+    endpoint,
     messages.len(),
-    plan.token_count,
+    plan.token_count.map_or("?".to_string(), |n| n.to_string()),
     plan.dropped
   );
   // The lock serializes the model, not the tools: holding it across a 30s bash would stall every
@@ -250,6 +477,7 @@ async fn run_generation_turn(
       s.running = true;
       s.phase = Phase::Generating;
       s.model = model.clone();
+      s.endpoint = endpoint.clone();
       s.clear_abort();
     });
     client
@@ -263,14 +491,46 @@ async fn run_generation_turn(
         || !control::update(name, |s| s.take_abort()),
       )
       .await
+  };
+  let result = match result {
+    Ok(result) => result,
+    Err(e) => {
+      control::update(name, |s| {
+        s.running = false;
+        s.phase = Phase::Idle;
+      });
+      // Leave it in the file. A provider that refuses the request and a model that has finished
+      // look identical from the outside -- both leave the transcript ending in an empty input
+      // region -- so without this the only place the reason existed was a log nobody reads.
+      record_provider_failure(path, active.into_session(), &e)?;
+      if e.is_terminal() {
+        // Retrying a refusal just spends more of whatever the provider is limiting. A daily quota
+        // does not come back in five seconds, and a turn that still owes a reply means every
+        // sweep would otherwise try again -- forty requests in three seconds, measured.
+        control::update(name, |s| s.blocked = true);
+        warn!("{path:?}: {e}; parked until you send again");
+        if flow::is_subagent_path(path) {
+          deliver_subagent_result(path, SubagentReport::ProviderRefusal(e.to_string())).await?;
+        }
+        return Ok(TurnOutcome::Done);
+      }
+      return Err(format!("chat_stream: {e}"));
+    }
+  };
+
+  // Pair what we sent with what the provider counted, so the next turn has a measured density
+  // instead of an assumed one. Recorded from the list that actually went out, after truncation.
+  if let Some(usage) = &result.usage
+    && usage.prompt_tokens > 0
+  {
+    let sample = PromptSample {
+      chars: plan.payload_chars,
+      tokens: usage.prompt_tokens,
+      endpoint: client.endpoint().base.clone(),
+      model: model.clone(),
+    };
+    control::update(name, |s| s.last_prompt = Some(sample));
   }
-  .map_err(|e| {
-    control::update(name, |s| {
-      s.running = false;
-      s.phase = Phase::Idle;
-    });
-    format!("chat_stream: {e}")
-  })?;
 
   active.finish_section();
   let mut streamed = active.into_session();
@@ -283,11 +543,40 @@ async fn run_generation_turn(
     streamed.close_turn();
     transcript::save(path, &streamed)?;
     control::update(name, |s| s.phase = Phase::Idle);
-    maybe_restart_llama(cfg, path).await;
+    maybe_restart_llama(cfg, client.endpoint(), path).await;
     return Ok(TurnOutcome::Done);
   }
 
   if result.finish_reason.as_deref() == Some("length") {
+    // `length` means the output allowance ran out, which is not the same as the context window
+    // filling up. When reasoning tokens are billed out of that same allowance, a turn can stop
+    // with nothing visible written at all -- and telling the model to prune its transcript would
+    // be advice that cannot possibly help. `context_full` stays false here for the same reason:
+    // the research driver discards a whole attempt when it sees it.
+    let by_reasoning = result
+      .usage
+      .as_ref()
+      // The visible text, not `result.content`: that is the raw stream including any inline
+      // `<think>...</think>` markup, which the writer splits out into the reasoning region. Ask it
+      // about text that was really only thinking and the turn gets blamed on context that was
+      // never full.
+      .is_some_and(|u| u.truncated_by_reasoning(&visible_text(&result.content)))
+      // Tool-call arguments never reach `result.content` -- they are accumulated separately. A turn
+      // that thought for 25k tokens and then ran out mid-tool-call would otherwise look identical
+      // to one that said nothing at all, and be told the transcript is fine when the allowance was
+      // the problem.
+      && result.tool_calls.is_empty();
+    if by_reasoning {
+      flow::add_reasoning_exhausted_note(&mut streamed);
+      streamed.close_turn();
+      transcript::save(path, &streamed)?;
+      control::update(name, |s| s.phase = Phase::Idle);
+      warn!(
+        "⚠ {path:?}: thinking consumed the whole output allowance (finish_reason=length); the \
+         transcript was not the problem"
+      );
+      return Ok(TurnOutcome::Done);
+    }
     flow::add_context_full_note(&mut streamed);
     streamed.close_turn();
     transcript::save(path, &streamed)?;
@@ -423,8 +712,10 @@ pub(crate) fn settle_tool_round(
   }
 }
 
-async fn maybe_restart_llama(cfg: &AppConfig, path: &Path) {
-  if !cfg.abort_restart_server {
+async fn maybe_restart_llama(cfg: &AppConfig, endpoint: &Endpoint, path: &Path) {
+  // There is only one llama-server, and it is the one that was interrupted. A remote endpoint
+  // keeps serving the next request on its own, and its container is not ours to restart.
+  if !cfg.abort_restart_server || !endpoint.llama {
     info!("✗ {path:?}: aborted");
     return;
   }
@@ -533,6 +824,9 @@ pub(crate) fn unfinished_subagents(
 pub(crate) enum SubagentReport {
   FromTranscript,
   TurnCap,
+  /// The provider refused this subagent's turn. Without a report the parent waits on a child that
+  /// will never report, so it parks in WaitingSubagents until someone intervenes by hand.
+  ProviderRefusal(String),
 }
 
 pub(crate) async fn deliver_subagent_result(
@@ -572,11 +866,18 @@ pub(crate) async fn deliver_subagent_result(
         .unwrap_or_else(|| "(subagent produced no text output)".to_string());
       (
         format!(
-          "(the subagent hit the per-burst turn cap and was cut off mid-work; the report below may be incomplete)\n\n{body}"
+          "(the subagent hit a per-burst turn ceiling and was cut off mid-work; the report below may be incomplete)\n\n{body}"
         ),
         true,
       )
     }
+    SubagentReport::ProviderRefusal(why) => (
+      format!(
+        "(this subagent could not finish: the provider refused its request, so nothing was \
+         gathered. {why}\n\nEither retry it or do the work here.)"
+      ),
+      false,
+    ),
   };
   let injected = flow::inject_subagent_report(&mut parent, &short, &report, ok);
   transcript::save(&parent_path, &parent)?;

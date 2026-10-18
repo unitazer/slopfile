@@ -319,10 +319,52 @@ impl Node {
   }
 }
 
+/// A quoted TOML key. Header names like `HTTP-Referer` are legal bare keys, but quoting every
+/// key means no name can ever need escaping to survive a round trip through the fence.
+fn toml_key(key: &str) -> String {
+  toml_string(key)
+}
+
+/// A quoted TOML basic string. Handled rather than interpolated because an API key or a
+/// `Bearer ...` value can legitimately contain quotes, backslashes and newlines, and an
+/// unescaped one would produce a fence that no longer parses -- which `merged_fence` then
+/// refuses to regenerate, silently freezing every later config change to that transcript.
+fn toml_string(s: &str) -> String {
+  let mut out = String::with_capacity(s.len() + 2);
+  out.push('"');
+  for c in s.chars() {
+    match c {
+      '"' => out.push_str("\\\""),
+      '\\' => out.push_str("\\\\"),
+      '\n' => out.push_str("\\n"),
+      '\r' => out.push_str("\\r"),
+      '\t' => out.push_str("\\t"),
+      '\u{8}' => out.push_str("\\b"),
+      '\u{c}' => out.push_str("\\f"),
+      c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+      c => out.push(c),
+    }
+  }
+  out.push('"');
+  out
+}
+
 pub fn toml_fence(config: &SessionConfig) -> String {
   let mut out = String::from("```toml\n");
+  if let Some(provider) = &config.provider {
+    out.push_str(&format!("provider = {}\n", toml_string(provider)));
+  }
+  if !config.headers.is_empty() {
+    let list = config
+      .headers
+      .iter()
+      .map(|(k, v)| format!("{} = {}", toml_key(k), toml_string(v)))
+      .collect::<Vec<_>>()
+      .join(", ");
+    out.push_str(&format!("headers = {{ {list} }}\n"));
+  }
   if let Some(model) = &config.model {
-    out.push_str(&format!("model = \"{model}\"\n"));
+    out.push_str(&format!("model = {}\n", toml_string(model)));
   }
   out.push_str(&format!("thinking = \"{}\"\n", config.thinking));
   if let Some(tools) = &config.tools {
@@ -347,6 +389,9 @@ pub fn toml_fence(config: &SessionConfig) -> String {
   }
   if let Some(n) = config.tool_timeout_ms {
     out.push_str(&format!("tool_timeout_ms = {n}\n"));
+  }
+  if let Some(n) = config.burst_max_turns {
+    out.push_str(&format!("burst_max_turns = {n}\n"));
   }
   out.push_str("```\n");
   out
@@ -820,18 +865,15 @@ impl Session {
       if let Some(user) = &turn.user {
         out.push_str(&leaf(user, USER, None));
       }
-      for note in &turn.notes {
-        let payload = match note.by {
-          NoteBy::Harness => Some(r#"{"by":"harness"}"#),
-          NoteBy::Model => None,
-        };
-        out.push_str(&leaf(&note.text, NOTE, payload));
-      }
       for (name, body) in &turn.custom {
         out.push_str(&leaf(body, name, None));
       }
       for (ri, round) in turn.rounds.iter().enumerate() {
-        let open_asst = open_here && open_assistant && ri + 1 == turn.rounds.len();
+        // A note belongs directly in the turn, never inside an open assistant, so the assistant has
+        // to be closed whenever this turn has notes. The turn itself stays open either way, so an
+        // interrupted turn is still resumable -- it just stops pretending to be mid-sentence.
+        let open_asst =
+          open_here && open_assistant && ri + 1 == turn.rounds.len() && turn.notes.is_empty();
         out.push_str(&open_line(ASSISTANT, None));
         if let Some(r) = &round.assistant.reasoning {
           out.push_str(&leaf_inner(
@@ -868,6 +910,19 @@ impl Session {
           };
           out.push_str(&leaf(&result.output, RESULT, Some(&json(&head))));
         }
+      }
+      // Notes render after the rounds, not before. A note is written at a moment of consequence --
+      // the context filled, a ceiling was hit -- and its whole job is to change what the model does
+      // next. Rendered first it was message #2 in the conversation with the entire rest of the
+      // history after it, which is the weakest possible place to put an instruction, and it made
+      // "the old turns above" point at the system prompt. Last is also where a human reading the
+      // file expects to find the explanation for everything above it.
+      for note in &turn.notes {
+        let payload = match note.by {
+          NoteBy::Harness => Some(r#"{"by":"harness"}"#),
+          NoteBy::Model => None,
+        };
+        out.push_str(&leaf(&note.text, NOTE, payload));
       }
       if let Some(pending) = &turn.question {
         out.push_str(&open_line(QUESTION, Some(&json(pending))));
@@ -964,16 +1019,6 @@ impl Session {
       {
         out.push(ChatMessage::user(user.trim()));
       }
-      for note in &turn.notes {
-        let text = note.text.trim();
-        if text.is_empty() {
-          continue;
-        }
-        out.push(match note.by {
-          NoteBy::Harness => ChatMessage::user(text),
-          NoteBy::Model => assistant_message(Some(text), None, Vec::new()),
-        });
-      }
       // A role the model gave itself comes back to it under its own name, so the thing it asked
       // for is still the thing it can see.
       for (_name, body) in &turn.custom {
@@ -1021,11 +1066,30 @@ impl Session {
           ));
         }
       }
+      // Notes come after the rounds, matching `render`. These notes exist to change what the model
+      // does *next* -- "your context filled, prune the file" -- so they have to arrive as the most
+      // recent thing it read. Sent first they were message #2 with the entire rest of the history
+      // after them, the weakest place to put an instruction, and it made "the old turns above"
+      // point at the system prompt rather than the transcript.
+      for note in &turn.notes {
+        let text = note.text.trim();
+        if text.is_empty() {
+          continue;
+        }
+        out.push(match note.by {
+          NoteBy::Harness => ChatMessage::user(text),
+          NoteBy::Model => assistant_message(Some(text), None, Vec::new()),
+        });
+      }
     }
     if !self.input.trim().is_empty() {
       out.push(ChatMessage::user(self.input.trim()));
     }
-    coalesce_assistants(out)
+    // A harness note lands immediately before the input region, and both are `user` role. Strict
+    // OpenAI-compatible routers reject two consecutive messages of the same role outright, and that
+    // rejection is a 400 -- which is terminal, so it would park the session for good. Merging is
+    // also just what the model would read: both are instructions from the same side.
+    coalesce_users(coalesce_assistants(out))
   }
 
   pub fn turn_in_progress(&self) -> bool {
@@ -1305,6 +1369,16 @@ impl Session {
     self.config.model.as_deref()
   }
 
+  /// The `[providers.<name>]` this session was pointed at, or `None` for the app-wide default.
+  pub fn provider(&self) -> Option<&str> {
+    self.config.provider.as_deref()
+  }
+
+  /// Headers this session adds to, or overrides on, the provider's own.
+  pub fn headers(&self) -> &std::collections::BTreeMap<String, String> {
+    &self.config.headers
+  }
+
   pub fn thinking(&self) -> Thinking {
     self.config.thinking
   }
@@ -1374,6 +1448,29 @@ fn pair_calls_with_results(
     });
   }
   (calls, results)
+}
+
+/// Merge runs of consecutive `user` messages into one, separated by a blank line.
+fn coalesce_users(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+  let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+  for message in messages {
+    let merge = message.role == Role::User
+      && out
+        .last()
+        .is_some_and(|last: &ChatMessage| last.role == Role::User);
+    match out.last_mut() {
+      Some(last) if merge => {
+        if let Some(extra) = message.content {
+          last.content = Some(match last.content.take() {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{extra}"),
+            _ => extra,
+          });
+        }
+      }
+      _ => out.push(message),
+    }
+  }
+  out
 }
 
 fn coalesce_assistants(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {

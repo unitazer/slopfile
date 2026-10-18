@@ -60,9 +60,9 @@ async fn main() {
 
 fn load_model_default() -> String {
   let cfg = slopfile::load_app_config();
-  if cfg.model.is_empty() {
+  if cfg.default_session_model.is_empty() {
     "default".to_string()
   } else {
-    cfg.model
+    cfg.default_session_model
   }
 }

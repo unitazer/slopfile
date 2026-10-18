@@ -55,6 +55,14 @@ services:
       SLOPFILE_WORKDIR: /workspace
       SF_ADDR: 0.0.0.0:8787
       RUST_LOG: slopfile=info,warn
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # `${...:?}` makes a missing key an error at `docker compose up` rather than an empty
+      # string in the container, which would otherwise reach the model host as
+      # `Authorization: Bearer ` and come back as a 401 that looks like a wrong key.
+      #
+      # The lazier alternative needs no compose change at all: put the header in the session
+      # transcript's ```toml fence instead. Transcripts are gitignored and are not part of any
+      # request -- though the model can read its own file, so that is convenience, not secrecy.
     ports:
       - "127.0.0.1:8787:8787"
     restart: unless-stopped

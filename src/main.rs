@@ -87,11 +87,17 @@ async fn main() {
   }
 
   info!(
-    "slopfile: workdir={} transcripts={} model={} api={} sweep={}ms confirmations={:?} control={addr}",
+    "slopfile: workdir={} transcripts={} model={} api={} providers=[{}] sweep={}ms confirmations={:?} control={addr}",
     app_cfg.workdir,
     app_cfg.transcripts_dir,
-    app_cfg.model,
-    app_cfg.api_base,
+    app_cfg.default_session_model,
+    app_cfg.endpoint_or_api_base().base,
+    app_cfg
+      .providers
+      .keys()
+      .cloned()
+      .collect::<Vec<_>>()
+      .join(", "),
     app_cfg.sweep_interval_ms,
     app_cfg.confirmations
   );
@@ -119,8 +125,13 @@ async fn main() {
   let busy: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
   let throttled: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
   let failures: Arc<Mutex<HashMap<PathBuf, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+  // A park records the arm token it happened at, so the sweep can tell "the user has sent since
+  // we parked" from "the user sent once, long ago, and the flag was never cleared". `armed` alone
+  // cannot make that distinction: it is only reset on the paths that return `Ok`, so after any
+  // error it latches true forever and the session unpark-loops instead of parking at all.
   let parked: Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>> =
     Arc::new(Mutex::new(HashMap::new()));
+  let parked_at_token: Arc<Mutex<HashMap<PathBuf, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
   loop {
     // A sweep that cannot list the directory drives nothing, and must say so rather than looking
@@ -150,6 +161,13 @@ async fn main() {
         .lock()
         .await
         .retain(|p, _| live.contains(p.as_path()));
+      // Same for the arm tokens recorded alongside each park. Subagent transcripts are created and
+      // removed constantly, so without this one entry per deleted file would sit here for the
+      // daemon's whole life.
+      parked_at_token
+        .lock()
+        .await
+        .retain(|p, _| live.contains(p.as_path()));
     }
     for path in files {
       let name = control::session_name(&path);
@@ -158,13 +176,41 @@ async fn main() {
       }
       let parked_at = parked.lock().await.get(&path).copied();
       if let Some(at) = parked_at {
-        if at.is_some() && file_fingerprint(&path).map(|(t, _)| t) == at {
+        // Two ways out of a park: the file changed, or the user sent again. `sf send` does not
+        // touch the file, so the fingerprint alone would swallow the only command the warning
+        // told the user to run. The arm token is what distinguishes a fresh send from a flag that
+        // merely latched: `arm()` bumps it, and nothing else does.
+        let token_at_park = parked_at_token.lock().await.get(&path).copied();
+        let user_asked = match token_at_park {
+          Some(t) => control::snapshot(&name).arm_token() > t,
+          None => true,
+        };
+        if at.is_some() && !user_asked && file_fingerprint(&path).map(|(t, _)| t) == at {
           continue;
         }
         parked.lock().await.remove(&path);
+        parked_at_token.lock().await.remove(&path);
         failures.lock().await.remove(&path);
-        control::update(&name, |s| s.parked = false);
-        info!("session {}: unparked (file changed)", path.display());
+        // Re-arm on un-park. The park exists to stop the sweep retrying on its own, and the two
+        // documented ways out are an edit and `sf send` -- but in `ask` mode the sweep only drives
+        // an armed session, so un-parking without arming left an edit doing nothing at all while
+        // the warning told the user to try it.
+        //
+        // Except when the user stopped it. A session they explicitly stopped should stay stopped
+        // until they say otherwise, not come back because they edited a file for some other reason.
+        control::update(&name, |s| {
+          if !s.stopped {
+            s.arm();
+          } else {
+            s.parked = false;
+            s.blocked = false;
+          }
+        });
+        info!(
+          "session {}: unparked ({})",
+          path.display(),
+          if user_asked { "sent" } else { "file changed" }
+        );
       }
       let mut guard = busy.lock().await;
       if guard.contains(&path) {
@@ -183,11 +229,39 @@ async fn main() {
       let throttled = throttled.clone();
       let failures = failures.clone();
       let parked = parked.clone();
+      let parked_at_token = parked_at_token.clone();
       tokio::spawn(async move {
-        let client = LlamaClient::new(&cfg.api_base).with_idle_timeout(idle_timeout);
+        let client = LlamaClient::new(&cfg).with_idle_timeout(idle_timeout);
         match daemon::drive_file(&path, &cfg, &client).await {
           Ok(()) => {
             failures.lock().await.remove(&path);
+            // The provider refused and said so in the transcript. Park it now rather than letting
+            // the next sweep try again -- `armed` cannot do this, because yolo mode re-drives
+            // every session with work outstanding regardless.
+            //
+            // Test and take in one step, under one lock. Split across two acquisitions a `sf send`
+            // can land in between: `arm()` bumps the token and clears `blocked`, this records the
+            // *new* token as the park-time one, and the next sweep sees "no send since we parked"
+            // -- so the command reports success and does nothing. Re-reading `blocked` inside the
+            // closure closes the window in the other direction too.
+            let token = control::update(&name, |s| {
+              if !s.blocked {
+                return None;
+              }
+              s.blocked = false;
+              Some(s.arm_token())
+            });
+            if let Some(token) = token {
+              let parked_at = file_fingerprint(&path).map(|(t, _)| t);
+              parked.lock().await.insert(path.clone(), parked_at);
+              parked_at_token.lock().await.insert(path.clone(), token);
+              control::update(&name, |s| s.parked = true);
+              warn!(
+                "session {}: parked; the provider refused this one (noted in the transcript). Edit \
+                 the file or `sf send` to try again.",
+                path.display()
+              );
+            }
           }
           Err(e) => {
             error!("session {}: {e}", path.display());
@@ -201,7 +275,9 @@ async fn main() {
             if count >= PARK_AFTER_FAILURES {
               failures.lock().await.remove(&path);
               let parked_at = file_fingerprint(&path).map(|(t, _)| t);
+              let token = control::snapshot(&name).arm_token();
               parked.lock().await.insert(path.clone(), parked_at);
+              parked_at_token.lock().await.insert(path.clone(), token);
               control::update(&name, |s| s.parked = true);
               warn!(
                 "session {}: parked after {PARK_AFTER_FAILURES} consecutive failures; edit the file to retry",

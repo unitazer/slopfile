@@ -1,6 +1,7 @@
 use super::*;
 use crate::questions::Question;
 use crate::types::Thinking;
+use std::collections::BTreeMap;
 
 const FENCE: &str = "```toml\nmodel = \"qwen3.8-27b\"\nthinking = \"auto\"\n```\n";
 const BEGIN_LINE: &str = "<!-- slopfile:begin -->\n";
@@ -77,6 +78,9 @@ fn unwrap_parts(escaped: &str) -> (String, Vec<String>) {
 
 fn sample_session() -> Session {
   let config = SessionConfig {
+    provider: Some("openrouter".to_string()),
+    headers: BTreeMap::new(),
+    burst_max_turns: None,
     model: Some("qwen3.8-27b".to_string()),
     thinking: Thinking::Auto,
     tool_timeout_ms: None,
@@ -786,6 +790,9 @@ fn crlf_files_parse_and_render_as_lf() {
 #[test]
 fn toml_fence_round_trips_through_the_parser() {
   let config = SessionConfig {
+    provider: Some("openrouter".to_string()),
+    headers: BTreeMap::new(),
+    burst_max_turns: None,
     model: Some("m".to_string()),
     thinking: Thinking::Auto,
     tool_timeout_ms: Some(1234),
@@ -796,6 +803,87 @@ fn toml_fence_round_trips_through_the_parser() {
   let session = Session::new(config, "sys");
   let (parsed, _) = parse(&session.render());
   assert_eq!(parsed.config, session.config);
+}
+
+#[test]
+fn the_fence_can_carry_a_key_and_survives_the_round_trip() {
+  let config = SessionConfig {
+    provider: Some("openrouter".to_string()),
+    // The lazy path: an inline table with a literal key, plus an awkward value that has to be
+    // escaped or the fence stops parsing -- and an unparseable fence is never regenerated, so
+    // every later edit to that transcript's config would be silently frozen.
+    headers: BTreeMap::from([
+      (
+        "Authorization".to_string(),
+        "Bearer sk-or-v1-\"quoted\"".to_string(),
+      ),
+      ("HTTP-Referer".to_string(), "http://localhost".to_string()),
+    ]),
+    model: Some("qwen/qwen3-235b-a22b".to_string()),
+    thinking: Thinking::Auto,
+    ..Default::default()
+  };
+  let rendered = toml_fence(&config);
+  assert!(
+    rendered.contains("provider = \"openrouter\"\n"),
+    "{rendered}"
+  );
+  assert!(
+    rendered.contains(r#"headers = { "Authorization" = "Bearer sk-or-v1-\"quoted\"", "HTTP-Referer" = "http://localhost" }"#),
+    "{rendered}"
+  );
+  assert_eq!(config_from_fence(&rendered), config);
+}
+
+/// A provider name or model containing a quote used to write a fence that would not parse -- and
+/// an unparseable fence is never regenerated, so every later edit to that transcript's config
+/// would be frozen with no indication why.
+#[test]
+fn awkward_provider_and_model_names_survive_a_round_trip() {
+  let config = SessionConfig {
+    provider: Some("say\"hi".to_string()),
+    model: Some("back\\slash".to_string()),
+    thinking: Thinking::Auto,
+    ..Default::default()
+  };
+  let rendered = toml_fence(&config);
+  assert!(
+    !config_from_fence(&rendered)
+      .provider
+      .as_deref()
+      .unwrap()
+      .is_empty(),
+    "{rendered}"
+  );
+  assert_eq!(config_from_fence(&rendered), config);
+}
+
+#[test]
+fn the_fence_carries_the_provider_alongside_the_model() {
+  let config = SessionConfig {
+    provider: Some("openrouter".to_string()),
+    headers: BTreeMap::new(),
+    burst_max_turns: None,
+    model: Some("qwen3.8-27b".to_string()),
+    thinking: Thinking::Auto,
+    tools: Some(
+      crate::flow::DEFAULT_TOOLS
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect::<Vec<_>>(),
+    ),
+    ..Default::default()
+  };
+  let rendered = toml_fence(&config);
+  assert!(
+    rendered.contains("provider = \"openrouter\"\nmodel = \"qwen3.8-27b\"\n"),
+    "the provider is the outer choice and belongs above the model: {rendered}"
+  );
+  assert_eq!(config_from_fence(&rendered), config);
+
+  // A fence that never heard of providers still parses, with no provider claimed.
+  let legacy = "```toml\nmodel = \"qwen3.8-27b\"\nthinking = \"auto\"\n```\n";
+  assert_eq!(config_from_fence(legacy).provider, None);
 }
 
 #[test]

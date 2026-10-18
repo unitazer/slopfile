@@ -19,11 +19,14 @@ fn yolo_cfg() -> AppConfig {
   AppConfig {
     confirmations: Confirmations::Yolo,
     api_base: "http://127.0.0.1:8080".into(),
+    providers: Default::default(),
+    provider: None,
+    burst_max_turns: 0,
     workdir: "/tmp".into(),
     transcripts_dir: "/tmp".into(),
     skills_dir: "/tmp/does-not-exist".into(),
     sweep_interval_ms: 250,
-    model: "qwen3.8-27b".into(),
+    default_session_model: "qwen3.8-27b".into(),
     max_context_tokens: 8192,
     tool_timeout_ms: 30000,
     abort_restart_server: false,
@@ -2019,7 +2022,8 @@ fn the_window_line_appears_only_past_the_threshold() {
       path,
       Some(Window {
         used: (budget as usize * pct as usize) / 100,
-        budget,
+        usable: budget,
+        total: budget,
       }),
     )
   };
@@ -2049,7 +2053,8 @@ fn a_zero_budget_does_not_divide_by_zero() {
     std::path::Path::new("/t/1.md"),
     Some(Window {
       used: 999,
-      budget: 0,
+      usable: 0,
+      total: 0,
     }),
   );
   assert!(!out.contains("Window:"), "{out}");
@@ -2199,24 +2204,576 @@ async fn a_command_producing_too_much_output_still_runs_to_completion() {
   );
 }
 
+/// The reason a burst stopped has to be readable in the transcript. Leaving it in the daemon log
+/// made "the provider refused" and "the model finished" look identical from the outside -- both
+/// leave the file ending in an empty input region, silently.
+#[test]
+fn a_provider_refusal_is_recorded_in_the_transcript_itself() {
+  use crate::api::ApiError;
+  let dir = scratch("provider-failure");
+  let path = dir.join("1.md");
+  write_session(&path, &session_template(&yolo_cfg(), &[]));
+
+  let e = ApiError::NonOkStatus(
+    429,
+    r#"{"error":{"message":"Rate limit exceeded: free-models-per-day"}}"#.to_string(),
+    false,
+  );
+  daemon::record_provider_failure(&path, load(&path), &e).unwrap();
+  let text = read_to_string(&path).unwrap();
+  assert!(
+    text.contains("Rate limit exceeded: free-models-per-day"),
+    "the provider's own sentence, not a status code: {text}"
+  );
+  // Written as a comment region, so it never reads as the model having said it.
+  assert!(text.contains("<!-- slopfile:note"), "{text}");
+
+  // Sending again against the same dead endpoint must not bury the file it is explaining.
+  for _ in 0..3 {
+    daemon::record_provider_failure(&path, load(&path), &e).unwrap();
+  }
+  let text = read_to_string(&path).unwrap();
+  assert_eq!(
+    text.matches("this turn was never answered").count(),
+    1,
+    "one refusal must not become four notes: {text}"
+  );
+}
+
+/// A 4xx is returned before any token arrives, so nothing has flushed since the snapshot was
+/// taken. Saving that snapshot wholesale deletes whatever the user typed while the request was in
+/// flight -- and a refusal is exactly when someone retypes their message.
+#[test]
+fn a_refusal_does_not_delete_input_typed_while_the_request_was_in_flight() {
+  use crate::api::ApiError;
+  let dir = scratch("failure-input");
+  let path = dir.join("1.md");
+  let mut session = session_template(&yolo_cfg(), &[]);
+  session.input = "original request".into();
+  session.promote_input();
+  session.begin_round();
+  write_session(&path, &session);
+
+  // The snapshot the StreamWriter holds, taken before the request went out.
+  let snapshot = load(&path);
+  // Meanwhile the user saves a correction.
+  let mut on_disk = load(&path);
+  on_disk.input = "ALSO DO THIS".into();
+  write_session(&path, &on_disk);
+
+  daemon::record_provider_failure(
+    &path,
+    snapshot,
+    &ApiError::NonOkStatus(429, r#"{"error":{"message":"nope"}}"#.to_string(), false),
+  )
+  .unwrap();
+
+  let after = load(&path);
+  assert_eq!(
+    after.input.trim(),
+    "ALSO DO THIS",
+    "the human's newer words must survive the note"
+  );
+}
+
+/// The overflow note tells the user to shrink this transcript. If they do that while the failed
+/// request was still in flight, the edit must stick -- otherwise the advice is self-defeating.
+#[test]
+fn a_failure_note_does_not_revert_edits_made_while_the_request_was_running() {
+  use crate::api::ApiError;
+  let dir = scratch("failure-edit");
+  let path = dir.join("1.md");
+
+  // Two turns on disk; the request is made against both.
+  let mut session = session_template(&yolo_cfg(), &[]);
+  session.input = "first".into();
+  session.promote_input();
+  session.begin_round();
+  session.push_text("an old answer nobody needs");
+  session.finish_round(vec![], vec![]);
+  session.input = "second".into();
+  session.promote_input();
+  session.begin_round();
+  write_session(&path, &session);
+  let snapshot = load(&path);
+
+  // Mid-request, the user prunes the first turn.
+  let mut edited = load(&path);
+  edited.turns.remove(0);
+  write_session(&path, &edited);
+
+  daemon::record_provider_failure(
+    &path,
+    snapshot,
+    &ApiError::NonOkStatus(
+      400,
+      r#"{"error":{"message":"This model's maximum context length is 512000 tokens"}}"#.to_string(),
+      false,
+    ),
+  )
+  .unwrap();
+
+  let after = load(&path);
+  assert_eq!(
+    after.turns.len(),
+    1,
+    "the user's prune must not be undone by the failure note"
+  );
+  assert!(
+    after
+      .turns
+      .last()
+      .unwrap()
+      .notes
+      .iter()
+      .any(|n| n.text.contains("too large")),
+    "and the note must still be there"
+  );
+}
+
+/// If the user prunes the dangling assistant region mid-generation, the last round on disk becomes
+/// an already-answered one. Grafting the aborted fragment onto it by position would rewrite a
+/// real answer as a half-sentence, and the transcript would assert the model said something it
+/// never said -- while still carrying that round's tool calls and results.
+#[test]
+fn an_aborted_fragment_is_not_grafted_onto_a_finished_round() {
+  use crate::api::ApiError;
+  use crate::session::Call;
+  let dir = scratch("failure-graft");
+  let path = dir.join("1.md");
+
+  let mut session = session_template(&yolo_cfg(), &[]);
+  session.input = "do two things".into();
+  session.promote_input();
+  // Round 1 completes properly, with a tool call and its result.
+  session.begin_round();
+  session.push_text("the real answer to round one");
+  session.finish_round(
+    vec![Call {
+      id: "c1".into(),
+      name: "read".into(),
+      arguments: "{}".into(),
+    }],
+    vec![crate::session::ToolOutcome {
+      id: "c1".into(),
+      name: "read".into(),
+      output: "file contents".into(),
+      ok: true,
+      ms: 1,
+    }],
+  );
+  // Round 2 is in flight when the request dies.
+  session.begin_round();
+  session.push_text("I was partway through");
+  write_session(&path, &session);
+  let snapshot = load(&path);
+
+  // Mid-flight the user deletes the dangling open region, leaving round 1 as the last round.
+  let mut edited = load(&path);
+  edited.turns[0].rounds.truncate(1);
+  edited.close_turn();
+  write_session(&path, &edited);
+
+  let pre = load(&path);
+  {
+    let r = pre.turns.last().unwrap().rounds.last().unwrap();
+    println!(
+      "PRE-GRAFT rounds={} calls={} results={} text={:?}",
+      pre.turns.last().unwrap().rounds.len(),
+      r.assistant.calls.len(),
+      r.results.len(),
+      r.assistant.text
+    );
+  }
+  daemon::record_provider_failure(
+    &path,
+    snapshot,
+    &ApiError::Timeout(std::time::Duration::from_secs(300)),
+  )
+  .unwrap();
+
+  let after = load(&path);
+  let last = after.turns.last().unwrap();
+  let round = last.rounds.last().unwrap();
+  assert_eq!(
+    round.assistant.text.as_deref(),
+    Some("the real answer to round one"),
+    "a completed round's answer must never be overwritten by an aborted fragment"
+  );
+  assert!(
+    !round.assistant.calls.is_empty(),
+    "and its tool call must stay paired with it: {round:?}"
+  );
+}
+
+/// The ordinary end of a turn leaves a round with no calls and no results, so that alone cannot
+/// tell a finished answer from one still being written. Here the previous round is prose and the
+/// user prunes the dangling region, which is the case that guard alone would get wrong.
+#[test]
+fn an_aborted_fragment_is_not_grafted_onto_a_finished_prose_round() {
+  use crate::api::ApiError;
+  let dir = scratch("failure-graft-prose");
+  let path = dir.join("1.md");
+
+  let mut session = session_template(&yolo_cfg(), &[]);
+  session.input = "say something".into();
+  session.promote_input();
+  session.begin_round();
+  session.push_text("here is a complete prose answer");
+  session.close_turn();
+  // A second turn starts streaming and the request dies.
+  session.input = "now something else".into();
+  session.promote_input();
+  session.begin_round();
+  session.push_text("I was partway");
+  write_session(&path, &session);
+  let snapshot = load(&path);
+
+  // Mid-flight the user deletes the dangling turn, leaving the finished prose turn as the last one.
+  let mut edited = load(&path);
+  edited.turns.truncate(1);
+  edited.close_turn();
+  write_session(&path, &edited);
+
+  daemon::record_provider_failure(
+    &path,
+    snapshot,
+    &ApiError::Timeout(std::time::Duration::from_secs(300)),
+  )
+  .unwrap();
+
+  let after = load(&path);
+  assert_eq!(
+    after
+      .turns
+      .last()
+      .unwrap()
+      .rounds
+      .last()
+      .unwrap()
+      .assistant
+      .text
+      .as_deref(),
+    Some("here is a complete prose answer"),
+    "a finished prose answer must not be replaced by an aborted fragment"
+  );
+}
+
+/// The failure note is written by loading a transcript that may be mid-stream, with `text` still
+/// open. A note rendered inside that open region is swallowed by the parser on the next read --
+/// taking the input region and the user's typed message with it, and wedging the file for good.
+#[test]
+fn a_failure_note_on_a_half_written_turn_does_not_corrupt_the_file() {
+  use crate::api::ApiError;
+  let dir = scratch("failure-midstream");
+  let path = dir.join("1.md");
+  let mut session = session_template(&yolo_cfg(), &[]);
+  session.input = "do the thing".into();
+  session.promote_input();
+  session.begin_round();
+  // Push text without closing the section: this is precisely the state a live stream leaves on
+  // disk, because `push_text` opens it and only `finish_section` closes it.
+  session.push_text("I was partway through answering");
+  write_session(&path, &session);
+  session = load(&path);
+  assert_eq!(
+    session.section(),
+    Some("text"),
+    "mid-stream: the section is open so a later run can resume mid-sentence"
+  );
+
+  daemon::record_provider_failure(
+    &path,
+    load(&path),
+    &ApiError::Timeout(std::time::Duration::from_secs(300)),
+  )
+  .unwrap();
+
+  let reloaded = load(&path);
+  assert!(
+    reloaded
+      .turns
+      .last()
+      .unwrap()
+      .notes
+      .iter()
+      .any(|n| n.text.contains("timed out")),
+    "note must be readable as a note, not swallowed as assistant text"
+  );
+  assert_eq!(
+    reloaded.turns[0].rounds[0].assistant.text.as_deref(),
+    Some("I was partway through answering"),
+    "the partial answer must not be corrupted by the note"
+  );
+  assert_eq!(
+    reloaded.section(),
+    None,
+    "the dangling section is closed: {reloaded:?}"
+  );
+  assert!(
+    reloaded.turn_in_progress(),
+    "and the turn is still resumable"
+  );
+}
+
+/// A harness note renders immediately before the input region and both are `user` role. Strict
+/// OpenAI-compatible routers reject two consecutive same-role messages, and that rejection is a
+/// terminal 400 -- so it would park the session permanently over note placement.
+#[test]
+fn a_harness_note_and_the_input_do_not_come_out_as_two_user_messages() {
+  let mut s = session_template(&yolo_cfg(), &[]);
+  s.input = "do the next thing".into();
+  s.promote_input();
+  s.begin_round();
+  s.push_text("working on it");
+  s.close_turn();
+  s.input = "carry on from there".into();
+  s.add_note(
+    session::NoteBy::Harness,
+    "[harness] the provider refused the last request; re-sending is safe.",
+  );
+
+  let msgs = s.request_messages();
+  for pair in msgs.windows(2) {
+    assert_ne!(
+      pair[0].role, pair[1].role,
+      "two consecutive same-role messages: {msgs:?}"
+    );
+  }
+  // And both halves of the instruction still reach the model.
+  assert!(
+    msgs.iter().any(|m| m
+      .content
+      .as_deref()
+      .is_some_and(|c| c.contains("provider refused") && c.contains("carry on"))),
+    "note and input must arrive together: {msgs:?}"
+  );
+}
+
+/// `sf stop` has to stick. Un-parking re-arms a session so an edit can retry it -- and without
+/// this, editing a stopped session's file for any reason would quietly restart it.
+#[test]
+fn a_stopped_session_is_not_rearmed_by_unparking() {
+  let name = "stop-test";
+  control::update(name, |s| {
+    s.arm();
+    s.parked = true;
+    s.blocked = true;
+  });
+  control::update(name, |s| s.disarm());
+  assert!(control::snapshot(name).stopped, "`sf stop` is recorded");
+
+  // This is what the sweep's un-park branch does.
+  control::update(name, |s| {
+    if !s.stopped {
+      s.arm();
+    } else {
+      s.parked = false;
+      s.blocked = false;
+    }
+  });
+  let after = control::snapshot(name);
+  assert!(
+    !after.armed,
+    "a stopped session must stay stopped after an edit"
+  );
+  assert!(
+    !after.parked && !after.blocked,
+    "but the park itself is cleared"
+  );
+
+  // An explicit send is how the user changes their mind, and it works.
+  control::update(name, |s| s.arm());
+  assert!(control::snapshot(name).armed, "`sf send` re-arms it");
+  assert!(!control::snapshot(name).stopped);
+}
+
+/// The percentage is deliberately measured against `usable`/// The percentage is deliberately measured against `usable` (the window minus what the reply
+/// needs), not the full window -- truncation happens at `usable`, so that is the number that
+/// decides when pruning pays. Measured against `total` it could never cross the threshold and the
+/// reminder would never fire at all. These pin the production pairing, where the two differ.
+#[test]
+fn the_pressure_line_is_measured_against_the_conversation_budget() {
+  use crate::context::{Window, refresh_paragraph};
+  let p = "/t/1.md";
+  // At the shipped 65k window, 40k is reserved for the answer, leaving 25536 for conversation.
+  let line = refresh_paragraph(
+    "base",
+    std::path::Path::new(p),
+    Some(Window {
+      used: 17_880,
+      usable: 25_536,
+      total: 65_536,
+    }),
+  );
+  assert!(
+    line.contains("Window:"),
+    "70% of the conversation budget must fire the reminder: {line}"
+  );
+  assert!(
+    line.contains("65536") && line.contains("25536"),
+    "both figures, so the fraction is checkable: {line}"
+  );
+  // Same point measured against the full window would read 27% and stay silent -- which is the
+  // bug this pairing exists to avoid.
+  assert!(
+    !refresh_paragraph(
+      "base",
+      std::path::Path::new(p),
+      Some(Window {
+        used: 17_880,
+        usable: 65_536,
+        total: 65_536,
+      }),
+    )
+    .contains("Window:"),
+    "against the full window it must not nag yet"
+  );
+}
+
+/// A truncated reply is exactly the shape with more than one think block. If the second one is
+/// not consumed, "visible" output comes back non-empty when the model never actually said
+/// anything -- and the turn gets blamed on a transcript that was never full.
+#[test]
+fn visible_text_strips_every_think_block() {
+  use crate::daemon::visible_text;
+  assert_eq!(visible_text("<think>ab</think>answer"), "answer");
+  assert_eq!(
+    visible_text("<think>a</think>mid<think>b</think>end"),
+    "midend"
+  );
+  assert_eq!(
+    visible_text("<think>ab<think>cd"),
+    "",
+    "an unclosed think tag means nothing was visible"
+  );
+  assert_eq!(visible_text("no tags at all"), "no tags at all");
+  assert_eq!(visible_text(""), "");
+  // Same input the writer splits across regions, so the two agree.
+  assert_eq!(visible_text("<think>reason</think>"), "");
+}
+
+/// A refusal used to cost five requests before parking, and against a spent daily quota that is
+/// five more the user does not have. `armed` cannot express "stop" on its own, because yolo mode
+/// re-drives anything with work outstanding, so the block has to be its own flag.
+#[test]
+fn a_send_clears_a_provider_block_and_nothing_else_does() {
+  let name = "block-test";
+  control::update(name, |s| s.blocked = true);
+  assert!(
+    control::snapshot(name).blocked,
+    "set by a terminal provider error"
+  );
+
+  control::update(name, |s| s.blocked = false);
+  assert!(
+    !control::snapshot(name).blocked,
+    "cleared by the sweep, not by time"
+  );
+
+  control::update(name, |s| s.blocked = true);
+  control::update(name, |s| s.arm());
+  assert!(
+    !control::snapshot(name).blocked,
+    "`sf send` is the user saying try again, so it must clear a refusal"
+  );
+}
+
+/// A typo is the one failure a user can fix instantly, and the one least likely to be guessed at:
+/// the file just stops.
+#[test]
+fn a_misspelled_provider_is_reported_in_the_transcript() {
+  let dir = scratch("typo-provider");
+  let path = dir.join("1.md");
+  let mut cfg = yolo_cfg();
+  cfg.providers.insert(
+    "openrouter".to_string(),
+    crate::types::Provider {
+      base_url: "https://openrouter.ai/api".into(),
+      headers: Default::default(),
+      llama: false,
+      reasoning_style: Default::default(),
+    },
+  );
+  let mut session = session_template(&cfg, &[]);
+  session.input = "hi".into();
+  session.promote_input();
+  session.config.provider = Some("openroter".into());
+  write_session(&path, &session);
+
+  let client = crate::api::LlamaClient::new(&cfg);
+  let err = client
+    .for_provider(&cfg, Some("openroter"), &Default::default())
+    .err()
+    .expect("unknown provider must be an error, not a silent fallback");
+  daemon::record_config_failure(&path, &err).unwrap();
+
+  let reloaded = load(&path);
+  let notes = &reloaded.turns.last().unwrap().notes;
+  assert!(
+    notes.iter().any(|n| n.text.contains("openroter")),
+    "the note must name what was wrong: {notes:?}"
+  );
+  assert!(
+    notes
+      .iter()
+      .any(|n| n.text.contains("Re-sending alone will fail")),
+    "and must not send the user in circles: {notes:?}"
+  );
+}
+
+/// A timeout is not a refusal. Telling the user "re-sending is safe" when a stream died
+/// mid-generation is advice that can be wrong, and the two need different wording.
+#[test]
+fn a_transport_failure_does_not_get_refusal_wording() {
+  use crate::api::ApiError;
+  let dir = scratch("timeout-note");
+  let path = dir.join("1.md");
+  write_session(&path, &session_template(&yolo_cfg(), &[]));
+
+  daemon::record_provider_failure(
+    &path,
+    load(&path),
+    &ApiError::Timeout(std::time::Duration::from_secs(300)),
+  )
+  .unwrap();
+  let text = read_to_string(&path).unwrap();
+  assert!(text.contains("left half-written"), "{text}");
+  assert!(
+    !text.contains("this turn was never answered"),
+    "a timeout is not a refusal: {text}"
+  );
+
+  // And the two must not overwrite each other into one misleading note.
+  daemon::record_provider_failure(
+    &path,
+    load(&path),
+    &ApiError::NonOkStatus(429, r#"{"error":{"message":"nope"}}"#.to_string(), false),
+  )
+  .unwrap();
+  let text = read_to_string(&path).unwrap();
+  assert!(text.contains("this turn was never answered"), "{text}");
+}
+
 #[test]
 fn the_burst_cap_is_reported_in_the_transcript_not_silently() {
   // Going quiet looks identical to "the model finished", which leaves the user guessing why
   // nothing happens until they send again by hand.
-  assert!(daemon::MAX_TURNS_PER_BURST > 0);
-  let note = format!(
-    "[harness] stopped this burst after {} turns without being asked to. Anything you had not \
-     finished is still below; continue, but do it in fewer turns — run long jobs in the background \
-     instead of polling them, and batch work up.",
-    daemon::MAX_TURNS_PER_BURST
-  );
+  // There is no fixed ceiling any more -- `burst_max_turns` defaults to 0, meaning unlimited --
+  // but when one *is* set, the transcript has to say so rather than going quiet.
+  assert_eq!(yolo_cfg().burst_max_turns, 0, "no ceiling unless asked for");
+  // The daemon's own text, not a copy: a hand-written duplicate passes no matter what the daemon
+  // actually says, which is how this drifted out of date without anyone noticing.
+  let cap = 20;
+  let note = daemon::burst_ceiling_note(cap);
   let mut s = Session::default();
   s.system = "sys".into();
   s.add_note(session::NoteBy::Harness, &note);
   let rendered = s.render();
+  assert!(rendered.contains("hit its turn ceiling"), "{rendered}");
   assert!(
-    rendered.contains("[harness] stopped this burst"),
-    "{rendered}"
+    rendered.contains("set `burst_max_turns = 0`"),
+    "the user has to be told how to turn it off: {rendered}"
   );
   // and it must come back as a message, so the model actually reads it next turn
   let msgs = s.request_messages();
@@ -2224,7 +2781,7 @@ fn the_burst_cap_is_reported_in_the_transcript_not_silently() {
     msgs.iter().any(|m| m
       .content
       .as_deref()
-      .is_some_and(|c| c.contains("[harness] stopped"))),
+      .is_some_and(|c| c.contains("hit its turn ceiling"))),
     "the note must reach the model: {msgs:?}"
   );
 }
