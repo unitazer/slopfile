@@ -1,6 +1,32 @@
 use crate::types::AppConfig;
 use std::path::PathBuf;
 
+/// The paragraph explaining `ctx:N`. Built only when the feature is on, so a session with it off
+/// carries zero bytes of it -- there is nothing to strip back out later.
+pub fn context_size_note(cfg: &AppConfig, session_config: &crate::types::SessionConfig) -> String {
+  if !cfg.tell_context_size(session_config) {
+    return String::new();
+  }
+  let budget = crate::tokens::context_budget(
+    &crate::session::Session::new(session_config.clone(), String::new()),
+    cfg,
+  );
+  let (lo, hi) = crate::tokens::context_bands(budget);
+  format!(
+    "\n\nContext size. Every tool result you get back is tagged `ctx:N`, the length of this \
+     conversation window in tokens as of the request that made that call. It tells you how much \
+     room is left so you can prune before you run out, instead of discovering it by being cut off \
+     mid-sentence.\n\n \
+     If you have only just started, stay under {lo} tokens. If you have a long and detailed \
+     context where everything still matters and nothing can be thrown away, try to stay under \
+     {hi}. Either way, prune the file itself -- delete or compress finished turns, drop dead tool \
+     output. Whatever you leave in the file is exactly what comes back on the next call.\n\n \
+     The number may be stale: it is a snapshot from before the call, and it does not move until \
+     the next one. It is a hint about which ballpark you are in, not a live meter -- judge by \
+     trend across calls rather than by any single reading."
+  )
+}
+
 pub fn system_prompt_default(cfg: &AppConfig, tools_excluded: &[String]) -> String {
   let has = |t: &str| !tools_excluded.iter().any(|x| x == t);
   // Without this tool the model can still reach the point where it wants a decision. Saying
@@ -58,6 +84,22 @@ Current working directory: {}",
     "\n\nIf you learn something that took trial and error to discover, write it down as a new skill. Creating skills is how you manage persistent memory, so the next session does not have to rediscover it."
   );
   out
+}
+
+/// `system_prompt_default` plus the context-size paragraph, which needs the session's own fence
+/// (it can override the window the bands are derived from). Kept separate so the note can be built
+/// from a session that already exists.
+pub fn system_prompt_with_context_note(
+  cfg: &AppConfig,
+  session_config: &crate::types::SessionConfig,
+) -> String {
+  let base = system_prompt_default(cfg, &session_config.tools_excluded);
+  let note = context_size_note(cfg, session_config);
+  if note.is_empty() {
+    base
+  } else {
+    format!("{base}{note}")
+  }
 }
 
 fn skills_index(dir: &str) -> String {

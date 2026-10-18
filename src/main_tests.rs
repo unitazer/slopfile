@@ -22,6 +22,7 @@ fn yolo_cfg() -> AppConfig {
     providers: Default::default(),
     provider: None,
     burst_max_turns: 0,
+    tell_model_context_size: true,
     workdir: "/tmp".into(),
     transcripts_dir: "/tmp".into(),
     skills_dir: "/tmp/does-not-exist".into(),
@@ -2588,7 +2589,165 @@ fn a_stopped_session_is_not_rearmed_by_unparking() {
   assert!(!control::snapshot(name).stopped);
 }
 
-/// The percentage is deliberately measured against `usable`/// The percentage is deliberately measured against `usable` (the window minus what the reply
+/// The bands are advice the model can actually follow. Derived from the window rather than the
+/// configured ceiling, because `output_allowance` reserves up to 40k for the reply: at a 65k window
+/// the prompt only gets 25536, so thresholds computed from the configured number would sit above
+/// the point where the model gets truncated anyway.
+#[test]
+fn the_context_bands_are_always_reachable() {
+  use crate::tokens::context_bands;
+  for budget in [
+    16_000u32, 32_000, 65_536, 96_000, 131_072, 200_000, 512_000, 1_000_000,
+  ] {
+    let (lo, hi) = context_bands(budget);
+    let usable = crate::tokens::prompt_budget(budget);
+    assert!(
+      lo <= hi,
+      "the start-pruning mark is above the ceiling at {budget}: {lo} > {hi}"
+    );
+    assert!(
+      hi <= usable,
+      "the ceiling exceeds what the model actually gets at {budget}: {hi} > {usable}"
+    );
+  }
+  // And it scales: a bigger window buys a bigger budget, not a fixed one.
+  let (small_lo, small_hi) = context_bands(65_536);
+  let (big_lo, big_hi) = context_bands(512_000);
+  assert!(
+    big_lo > small_lo && big_hi > small_hi,
+    "bands must follow the window: {small_lo}/{small_hi} vs {big_lo}/{big_hi}"
+  );
+}
+
+/// On by default, and off means the prompt carries nothing at all -- not a stripped paragraph, but
+/// never written in the first place.
+#[test]
+fn the_context_size_note_is_on_by_default_and_absent_when_off() {
+  use crate::prompt::context_size_note;
+  let cfg = yolo_cfg();
+  assert!(
+    cfg.tell_model_context_size,
+    "on unless the user says otherwise"
+  );
+  let on = context_size_note(&cfg, &Default::default());
+  assert!(on.contains("ctx:N"), "{on}");
+  assert!(
+    on.contains("stale"),
+    "the reading is a snapshot, and the model has to be told: {on}"
+  );
+
+  let mut off = yolo_cfg();
+  off.tell_model_context_size = false;
+  assert_eq!(
+    context_size_note(&off, &Default::default()),
+    "",
+    "off means zero bytes, so there is nothing to strip back out"
+  );
+
+  // The fence overrides the app-wide setting either way.
+  let session_on = crate::types::SessionConfig {
+    tell_model_context_size: Some(true),
+    ..Default::default()
+  };
+  assert!(context_size_note(&off, &session_on).contains("ctx:N"));
+}
+
+/// It must not be the last thing in the system prompt: `refresh_paragraph` trims that region's tail,
+/// so a note ending in a newline comes back different depending on which path wrote the file.
+#[test]
+fn the_context_size_note_survives_the_managed_block_rewrite() {
+  let cfg = yolo_cfg();
+  let session = session_template(&cfg, &[]);
+  let once =
+    crate::context::refresh_paragraph(&session.system, std::path::Path::new("/t/1.md"), None);
+  let twice = crate::context::refresh_paragraph(&once, std::path::Path::new("/t/1.md"), None);
+  assert_eq!(once, twice, "the system block must be idempotent");
+}
+
+/// Written once into the transcript. Injected per request it would be re-appended to every earlier
+/// result on every turn, so the file would grow without bound.
+#[test]
+fn a_tool_result_is_tagged_once_and_only_once() {
+  use crate::session::ToolOutcome;
+  let mut outcomes = vec![
+    ToolOutcome {
+      id: "a".into(),
+      name: "read".into(),
+      output: "file body".into(),
+      ok: true,
+      ms: 1,
+    },
+    ToolOutcome {
+      id: "b".into(),
+      name: "bash".into(),
+      output: "line\n".into(),
+      ok: true,
+      ms: 2,
+    },
+  ];
+  crate::flow::annotate_context_size(&mut outcomes, Some(45454));
+  assert!(
+    outcomes[0].output.contains("[ctx:45454]"),
+    "{}",
+    outcomes[0].output
+  );
+  assert!(
+    outcomes[1].output.contains("[ctx:45454]"),
+    "{}",
+    outcomes[1].output
+  );
+
+  // Nothing on the first turn, where there is no measured count to report.
+  let mut blind = vec![ToolOutcome {
+    id: "c".into(),
+    name: "read".into(),
+    output: "body".into(),
+    ok: true,
+    ms: 0,
+  }];
+  crate::flow::annotate_context_size(&mut blind, None);
+  assert_eq!(blind[0].output, "body", "no invented number");
+}
+
+/// The tag goes in the transcript, so it comes back on later turns without being rebuilt -- and the
+/// calibration that measures the payload sees exactly the bytes that go on the wire.
+#[test]
+fn the_tag_survives_into_the_next_request_without_growing() {
+  use crate::session::ToolOutcome;
+  let dir = scratch("ctx-tag");
+  let path = dir.join("1.md");
+  let mut session = session_template(&yolo_cfg(), &[]);
+  session.input = "go".into();
+  session.promote_input();
+  session.begin_round();
+  session.push_text("calling a tool");
+  write_session(&path, &session);
+
+  let mut outcomes = vec![ToolOutcome {
+    id: "t1".into(),
+    name: "read".into(),
+    output: "body".into(),
+    ok: true,
+    ms: 1,
+  }];
+  crate::flow::annotate_context_size(&mut outcomes, Some(12345));
+  session.finish_round(vec![], outcomes);
+  write_session(&path, &session);
+
+  // Two requests built from the same file must carry the tag the same number of times: rebuilding
+  // must not re-append it to the earlier result.
+  let a = load(&path).request_messages();
+  let b = load(&path).request_messages();
+  let count = |m: &[crate::types::ChatMessage]| {
+    m.iter()
+      .filter(|x| x.content.as_deref().is_some_and(|c| c.contains("[ctx:")))
+      .count()
+  };
+  assert_eq!(count(&a), 1, "the tag is written once into the file");
+  assert_eq!(count(&a), count(&b), "and rebuilding must not add another");
+}
+
+/// The percentage is deliberately measured against `usable`/// The percentage is deliberately measured against `usable`/// The percentage is deliberately measured against `usable` (the window minus what the reply
 /// needs), not the full window -- truncation happens at `usable`, so that is the number that
 /// decides when pruning pays. Measured against `total` it could never cross the threshold and the
 /// reminder would never fire at all. These pin the production pairing, where the two differ.

@@ -32,7 +32,8 @@ pub fn session_template(cfg: &AppConfig, excluded: &[String]) -> Session {
     tools_excluded: excluded.to_vec(),
     ..Default::default()
   };
-  Session::new(config, prompt::system_prompt_default(cfg, excluded))
+  let system = prompt::system_prompt_with_context_note(cfg, &config);
+  Session::new(config, system)
 }
 
 pub fn subagent_task_template(cfg: &AppConfig, excluded: &[String], task: &str) -> Session {
@@ -308,6 +309,27 @@ pub fn adopt_model_edit(current: &Session, path: &Path) -> Result<Option<Session
     path.display()
   );
   Ok(Some(edited))
+}
+
+/// Tag each tool result with the context size as of the request that made the call.
+///
+/// Written into the transcript rather than injected into the outgoing request. Injected, it would
+/// be rebuilt from the transcript on every turn and re-appended to every earlier result forever, so
+/// the file would grow without bound -- strictly worse than a fixed few bytes per result. Written
+/// once, it stays put, is visible to anyone reading the session, and shows the trend across calls.
+///
+/// The number is stale by construction: it is from before the call, and it does not move until the
+/// next one. The system prompt says so, rather than the number pretending to be live.
+pub fn annotate_context_size(outcomes: &mut [ToolOutcome], tokens: Option<usize>) {
+  let Some(n) = tokens else {
+    return;
+  };
+  for outcome in outcomes.iter_mut() {
+    if !outcome.output.trim().is_empty() && !outcome.output.ends_with('\n') {
+      outcome.output.push('\n');
+    }
+    outcome.output.push_str(&format!("[ctx:{n}]"));
+  }
 }
 
 pub fn note_rollback(outcomes: &mut [ToolOutcome], why: &str) {

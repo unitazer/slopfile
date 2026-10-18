@@ -81,6 +81,7 @@ fn sample_session() -> Session {
     provider: Some("openrouter".to_string()),
     headers: BTreeMap::new(),
     burst_max_turns: None,
+    tell_model_context_size: None,
     model: Some("qwen3.8-27b".to_string()),
     thinking: Thinking::Auto,
     tool_timeout_ms: None,
@@ -793,6 +794,7 @@ fn toml_fence_round_trips_through_the_parser() {
     provider: Some("openrouter".to_string()),
     headers: BTreeMap::new(),
     burst_max_turns: None,
+    tell_model_context_size: None,
     model: Some("m".to_string()),
     thinking: Thinking::Auto,
     tool_timeout_ms: Some(1234),
@@ -864,6 +866,7 @@ fn the_fence_carries_the_provider_alongside_the_model() {
     provider: Some("openrouter".to_string()),
     headers: BTreeMap::new(),
     burst_max_turns: None,
+    tell_model_context_size: None,
     model: Some("qwen3.8-27b".to_string()),
     thinking: Thinking::Auto,
     tools: Some(

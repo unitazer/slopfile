@@ -310,6 +310,24 @@ pub async fn build_request_messages(
   })
 }
 
+/// The two sizes the model is told to respect, derived from what it will actually get.
+///
+/// `usable` rather than the configured window, and that is the whole point: `output_allowance`
+/// reserves up to 40k of the window for the reply, so at a 65k window the prompt only ever gets
+/// 25536. Thresholds computed from the configured number would then sit *above* the ceiling the
+/// model is truncated at -- advice it can act on and still be cut off, which is worse than no
+/// advice at all. `lo` is where to start pruning; `hi` is the hard ceiling to stay under no
+/// matter how much it wants to keep.
+pub fn context_bands(budget: u32) -> (u32, u32) {
+  let usable = prompt_budget(budget);
+  // `max(20_000)` would exceed a genuinely small window, so the ceiling always wins: a number the
+  // model cannot actually reach is advice it can act on and still be truncated. The floors below
+  // only apply where there is room for them.
+  let hi = (usable / 2).max(20_000).min(usable);
+  let lo = (usable / 4).clamp(8_000, 80_000).min(hi / 2);
+  (lo, hi)
+}
+
 pub fn context_budget(session: &Session, cfg: &AppConfig) -> u32 {
   session
     .config

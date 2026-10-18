@@ -439,6 +439,12 @@ async fn run_generation_turn(
     },
   )
   .await?;
+  // The size of the context this request was built from -- i.e. before the calls it makes. That is
+  // the reading the model can act on, and it is the only one that exists: `usage` for this request
+  // has not come back yet. `None` on the first turn against a new endpoint, where there is nothing
+  // measured to report, and then the results carry no tag at all.
+  let tell_ctx = cfg.tell_context_size(&work.config);
+  let ctx_tokens = plan.token_count;
   let mut messages = plan.messages;
   // Second pass with the real number, so the model knows how much room it has before it decides
   // whether to spend a turn compacting. The line itself costs ~40 tokens, which is noise here.
@@ -624,6 +630,9 @@ async fn run_generation_turn(
                    report instead, or pick a concrete option and say which one and why."
             .to_string(),
         });
+        if tell_ctx {
+          flow::annotate_context_size(&mut outcomes, ctx_tokens);
+        }
         streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
         transcript::save(path, &streamed)?;
         return Ok(TurnOutcome::Done);
@@ -641,12 +650,18 @@ async fn run_generation_turn(
         });
         info!("✓ {path:?}: campaign marked solved");
       }
+      if tell_ctx {
+        flow::annotate_context_size(&mut outcomes, ctx_tokens);
+      }
       streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
       flow::render_question(&mut streamed, question)?;
       transcript::save(path, &streamed)?;
       return Ok(TurnOutcome::AwaitsNextTurn);
     }
     let (mut outcomes, solved) = run_calls(&streamed, &result.tool_calls, cfg, path).await?;
+    if tell_ctx {
+      flow::annotate_context_size(&mut outcomes, ctx_tokens);
+    }
     streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
     transcript::save(path, &streamed)?;
     if solved {

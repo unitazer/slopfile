@@ -485,6 +485,22 @@ confidential. If the key must not be readable by the model, use option 2. Either
 way `shared/transcripts/` should stay out of backups or syncs you don't
 control.
 
+**Context size.** Every tool result is tagged `ctx:N` -- the length of the
+conversation window in tokens as of the request that made that call -- and the
+system prompt explains how to read it, including that the number is a snapshot
+and not a live meter. This is on by default; set `tell_model_context_size =
+false` in `slopfile.toml` (or in a session's fence) to drop it.
+
+The two thresholds in that paragraph are derived from the window, not typed in:
+they scale with `max_context_tokens` and are always below the ceiling the model
+can actually reach, so the advice is always followable.
+
+```toml
+tell_model_context_size = true
+```
+
+In a session fence the same key overrides it for that session only.
+
 **2. In the container's environment.** Add to the `slopfile` service in
 `docker/docker-compose.yml` — the file passes the variable through next to the
 other `SLOPFILE_*` variables:

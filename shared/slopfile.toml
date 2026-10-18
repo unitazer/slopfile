@@ -6,11 +6,17 @@ transcripts_dir = "/shared/transcripts"
 sweep_interval_ms = 250
 default_session_model = "qwen3.8-27b"
 max_context_tokens = 65536
+
+# Tell the model how large its context window is. Every tool result is tagged `ctx:N` and the
+# system prompt explains how to read it, so it can prune before it runs out instead of finding out
+# by being cut off mid-sentence. Set false to keep the file smaller and the prompt shorter.
+tell_model_context_size = true
 tool_timeout_ms = 60000
 abort_restart_server = true
 llama_container = "clanker-llama"
 subagent_max_depth = 2
 # burst_max_turns = 0   # ceiling on turns per `sf send`; 0 (default) means none
+# tell_model_context_size = true   # per-session override of the setting above
 
 # Any OpenAI-compatible endpoint. A session selects one with `provider = "<name>"` in its fence.
 # `${VAR}` in a header value is read from the environment, so a key need not live in this file.

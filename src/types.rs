@@ -556,6 +556,14 @@ pub struct AppConfig {
   /// forced the model to poll backgrounded jobs, and it outlived the bug.
   #[serde(default)]
   pub burst_max_turns: u32,
+  /// Tell the model how large its context window currently is.
+  ///
+  /// On by default. A model that is asked to prune its own transcript has no way to know how full
+  /// it is, and the only other signal arrives mid-response once the answer is already truncated --
+  /// so compaction timing becomes guesswork. Each tool result carries `ctx:N`, the count as of the
+  /// request that made the call, and the system prompt explains how to read it.
+  #[serde(default = "default_true")]
+  pub tell_model_context_size: bool,
   #[serde(default = "default_subagent_max_depth")]
   pub subagent_max_depth: u32,
   #[serde(default = "default_stream_idle_timeout_secs")]
@@ -595,6 +603,10 @@ fn default_llama_container() -> String {
 fn default_subagent_max_depth() -> u32 {
   2
 }
+fn default_true() -> bool {
+  true
+}
+
 fn default_stream_idle_timeout_secs() -> u64 {
   300
 }
@@ -616,6 +628,7 @@ impl Default for AppConfig {
       abort_restart_server: default_abort_restart_server(),
       llama_container: default_llama_container(),
       burst_max_turns: 0,
+      tell_model_context_size: true,
       subagent_max_depth: default_subagent_max_depth(),
       stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
     }
@@ -743,6 +756,18 @@ pub struct SessionConfig {
   /// Per-session override for `AppConfig::burst_max_turns`. 0 means uncapped.
   #[serde(default)]
   pub burst_max_turns: Option<u32>,
+  /// Per-session override for `AppConfig::tell_model_context_size`.
+  #[serde(default)]
+  pub tell_model_context_size: Option<bool>,
+}
+
+impl AppConfig {
+  /// Whether this session is told its context size. The fence wins, then the app-wide setting.
+  pub fn tell_context_size(&self, session: &SessionConfig) -> bool {
+    session
+      .tell_model_context_size
+      .unwrap_or(self.tell_model_context_size)
+  }
 }
 
 impl SessionConfig {
