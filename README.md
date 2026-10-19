@@ -1,708 +1,274 @@
 COMEPLETELY vibecoded, this is a throwaway project, if i feel like its worthy and anyone else
 expresses some interest in it, i might rewrite it on my own.
-the code's definitely questionable at places but if it doesnt work just throw a different clanker at it idgaf
+the code's definitely questionable at places but if it doesnt work just throw a different clanker at it idc
 
+# slopfile
 
-# slopfile — a file-as-UI coding agent
+A coding agent that lives in one Markdown file.
 
-`slopfile` is a small daemon that turns a single Markdown file into a whole
-coding-agent session. You type a request at the bottom of the file, a daemon
-streams a `llama-server` response back into the same file — including tool
-calls (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `question`,
-`subagent`) —
-and marks completion inline. No TUI, no database: the `.md` file *is* the UI.
+Write a request at the bottom of `1.md`. A daemon streams the reply back into
+that file: reasoning, text, tool calls, tool results, as the tokens arrive. The
+file is the whole UI. Edit it while the model works.
 
-```
-clanker/slopfile/            # the single git repo (source + docker + weights)
-├── src/                         # the Rust project (tests live beside the code, in-crate)
-├── nvim/plugin/slopfile.lua     # editor plugin, shells out to sf
-├── docker/                    # compose stack + run.sh wrappers
-│   ├── docker-compose.yml
-│   ├── Dockerfile.slopfile
-│   └── run.sh
-├── shared/                    # runtime volume (bind-mounted into the containers)
-│   ├── models/                # GGUF + mmproj weights (gitignored; mounted in llama-server)
-│   ├── slopfile.toml          # daemon app config (tracked)
-│   └── transcripts/           # one session .md file per conversation (gitignored)
-└── workspace/                 # the model's tool workdir (gitignored)
-```
+The file is also the model's context. It gets parsed into every request, and the
+model is told its own path, so it can `edit`, `write` or `bash` its way through
+the file and delete what it no longer needs. Whatever it leaves is what it gets
+back. No summarizer sits in the middle.
 
-The repo is one git directory: source, docker definitions, the `shared/` runtime
-volume, and a private `workspace/` all live under `slopfile/`. The containers
-mount only `shared/` and `workspace/` — the slopfile source is **not** mounted
-into the agent's container, so the model cannot read or edit its own code.
+## Run it
 
----
+Run the daemon in Docker. Nothing here has any security in it, so the container
+is the only thing standing between the agent and your machine.
 
-## How the file works
+- The control port has no authentication whatsoever. Anything that can reach it
+  can arm a session, start it generating, or abort it.
+- `bash` has no path sandbox. `read`, `write` and `edit` do check paths against
+  `workdir` (canonicalized, symlinks refused), but `bash` is unrestricted, so
+  the agent gets anywhere the daemon's user can get.
+- An API key in a fence is readable by the model, since it can `cat` its own
+  file.
 
-One session = one `.md` file that is a **stack of regions**. A region opens with
-`<!-- slopfile:NAME -->`, closes with `<!-- /slopfile -->`, and its body is
-copied out verbatim — the body is never re-scanned for structure, so nothing a
-model writes can turn into structure.
+On the host, keep the control port on loopback and do not publish it. `sf` is a
+plain TCP client with no login step, so it reaches the daemon over the compose
+network or on localhost without caring which.
 
-```markdown
-```toml
-model = "qwen3.8-27b"
-thinking = "auto"
-tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent"]
-```
-<!-- slopfile:begin -->
-<!-- slopfile:system -->
-You are an expert software engineering assistant…     <- the system prompt
---- context (managed by slopfile) ---                 <- written by the harness, refreshed
-Context file: /shared/transcripts/1.md                  every request: the model is told
-…                                                     <- its path and that this file is
-                                                         its context. Past 70% full it also
-                                                         gets a "Window: … about N used (M%)"
-                                                         line telling it to go prune.
---- end context ---
-<!-- /slopfile -->
-<!-- slopfile:turn -->                                 <- one user turn
-<!-- slopfile:user -->
-a user turn
-<!-- /slopfile -->
-<!-- slopfile:assistant -->
-<!-- slopfile:reasoning -->
-streamed thinking
-<!-- /slopfile -->
-<!-- slopfile:text -->
-streamed reply text
-<!-- /slopfile -->
-<!-- slopfile:call {"id":"c1","name":"bash","arguments":"{\"command\":\"ls\"}"} -->
-<!-- /slopfile -->
-<!-- /slopfile -->                                     <- assistant done
-<!-- slopfile:result {"id":"c1","name":"bash","ok":true,"ms":9} -->
-1: src
-<!-- /slopfile -->
-<!-- /slopfile -->                                     <- turn finished
-<!-- slopfile:input -->
-type your next request here                          <- everything below is yours
-```
-
-- **The fence** — the first ` ```toml ` block. Per-session settings (model,
-  `thinking`, tools, limits); overrides the app config. Human lines around it are
-  kept. A fence that does not parse is left **exactly as written** and warned
-  about, never rewritten: regenerating it would overwrite your settings with
-  defaults slopfile merely guessed at.
-- **`system`** — the system prompt. Required; the daemon refuses edits that drop it.
-- **`turn`** — one exchange. It is **finished exactly when its region is closed**,
-  which is how the daemon knows a turn ended: no `@done` marker, no `### Assistant`
-  headings, no mode tracking.
-- **`note`** — free text with an author: your own scratchpad, or
-  `<!-- slopfile:note {"by":"harness"} -->` for harness messages (for example
-  "you hit the token cap, go prune").
-- **`question`** — a `{"call":…,"questions":[…]}` header. The human-facing table
-  is rendered into the `input` region below.
-- **`input`** — the only opaque region: it runs to the end of the file, so
-  whatever you type there can never become structure.
-- **Any name you invent** inside a `turn` or an `assistant` is kept verbatim,
-  rendered back in place, and handed to the model under its own name. This is
-  deliberate: a model that keeps its own `scratchpad` or `ledger` is the point of
-  the whole design, so the harness refuses to invent names on its behalf. A
-  misplaced *known* region is still refused, with the grammar in the error.
-
-#### `thinking` — how hard the model reasons
-
-`thinking` is sent as the OpenAI-compatible `reasoning_effort` on every request.
-Whether it *does* anything is up to the model's chat template, and for
-Qwen3.8-27B the levels are not all equal. Measured with
-`POST /apply-template` (renders the prompt without generating):
-
-| `thinking` | sent as | effect on this model |
-|---|---|---|
-| `auto` (default) | *field omitted* | same as `xhigh` — the template's own default |
-| `low` | `low` | injects "keep your thinking brief and focused" |
-| `medium` | `medium` | **accepted but injects nothing** — the template has `xhigh` and `low` branches and none for `medium`, so it behaves like no instruction at all |
-| `high` | `high` | template aliases it to `xhigh` |
-| `xhigh` | `xhigh` | injects "think carefully, validate assumptions, consider alternatives" |
-| `none` | `none` | `enable_thinking=false`: no thinking at all |
-| anything else | — | **HTTP 500** — the template raises on an unknown level |
-
-So on this model `auto`/`high`/`xhigh` are one setting, `low` and `none` are
-distinct, and `medium` is currently indistinguishable from unset. A rejected
-level is loud, which is the point: the knob used to be a single `Auto` variant
-behind `#[serde(other)]`, so `thinking = "meduim"` parsed fine, did nothing, and
-looked correct.
-
-Two server-side facts this depends on, both of which can change under you:
-
-- llama-server forwards `reasoning_effort` into the chat template as a kwarg,
-  and special-cases `none` into `enable_thinking=false`. A model whose template
-  does not read the kwarg **ignores the request silently**.
-- Qwen's own API docs add `thinking_budget` (low 4096 / medium 16384 /
-  xhigh 262144). llama-server also has `--reasoning-budget`, but that is a
-  *separate* mechanism and is not what this sets.
-
-Anything the daemon writes into a body is escaped: a literal `<` is wrapped as
-`<!--slopfile:ESC[<<!--/slopfile:ESC-->`. Both wrapper delimiters start with
-`<`, so escaping that one character makes it impossible for content to forge a
-marker, even by gluing two fragments together.
-
-**All daemon state lives in the daemon, not in the file.** There is no status
-line, no send marker, no abort marker: `armed`, `phase`, `parked`, `solved` and
-friends are process memory, reachable over the control channel (`sf status`).
-The trade-off is that arming a session does not survive a daemon restart — press
-send again.
-
-### Turn flow
-
-1. Type a request below the `input` marker → `sf send` (or `:Send`).
-2. The daemon promotes that text to a `user` region, opens an `assistant`
-   region, and streams `reasoning` / `text` into it as tokens arrive.
-3. Tool calls land as `call` + `result` regions; the daemon loops until the
-   model stops asking for tools. One `sf send` opens a **burst**, and a burst
-   has no turn limit — it ends when the model stops, or when you `sf abort` /
-   `sf stop`. (There used to be a fixed 20-turn cap; it was a band-aid for a
-   `bash` bug that forced the model to poll backgrounded jobs, and it outlived
-   the bug. `burst_max_turns` sets an opt-in ceiling if you want one.)
-4. On clean completion the `turn` region is closed.
-5. `question` → the daemon renders a `QUESTIONS` table into `input` and waits.
-   Answer below the `>` line (indices, comma separated, or free text) and
-   `sf question <session> <answers…>`; `/skip` takes the defaults. In
-   `confirmations = "yolo"` they auto-resolve.
-
-## Skills — capability as a file, not as code
-
-`shared/skills/*.md` is indexed into the system prompt (name + one-line
-description), and the model reads a file fully when a task matches it. This is
-the paper's design choice: keep as little as possible hard-coded at the harness
-level, so tools can be defined, added or revised at inference time. Adding a
-skill is adding a file — no rebuild, no tool schema in every request.
-
-| skill | what it is |
-|---|---|
-| `web-search.md` + `websearch.py` | key-free web search and page reading (DuckDuckGo lite + HTML→text) |
-| `session-edit.md` + `session-edit.py` | address regions of your own context file by name, never typing a marker |
-| `caveman.md`, `susycore.md`, `thermo-nuclear-…md` | yours |
-
-A skill may ship a helper script next to it; the model runs it with `bash`, so
-no new tool is registered.
-
-**They have to be chosen.** A skill the model does not decide to read does not
-happen, which is the cost of this design. The descriptions carry the trigger
-words for a reason.
-
-## The research driver (`research`)
-
-An unattended campaign driver on top of the same daemon: one LLM iteration per
-fresh transcript, a numeric score deciding commit-or-restore, so a long run
-cannot be poisoned by a single bad turn.
+Needs a Rust toolchain and something that speaks the OpenAI chat completions API.
 
 ```bash
-research --workdir /workspace \
-         --eval-cmd 'cargo run --release --bin eval' \
-         --max-iters 100 --maximize
+cargo build --release
+
+export SLOPFILE_CONFIG=shared/slopfile.toml
+export SLOPFILE_API_BASE=http://127.0.0.1:8080
+export SLOPFILE_WORKDIR=/path/to/a/codebase
+export SLOPFILE_TRANSCRIPTS=./transcripts
+
+./target/release/sf init 1
+./target/release/slopfile &
+
+# write a request at the bottom of the file, then:
+./target/release/sf send 1
 ```
 
-Each iteration seeds a fresh transcript with the task, the `AGENTS.md` journal
-and the best score so far, then arms it over the control channel. It stops on
-`solve`, on `context_full`, or at the iteration cap. `--iter-timeout-secs`
-(default 2h) bounds a single wedged iteration.
-
-Note it is a **separate process** from the daemon and cannot see the daemon's
-in-memory state — it asks over the control channel instead. (Getting that wrong
-once made its stop condition dead code.)
-
-## Run 1 — host (quick, no Docker for the daemon)
-
-You need a `llama-server` reachable at the `api_base` from the config, or one of
-the `[providers.*]` endpoints — see [Providers](#providers).
+The daemon watches the transcripts directory and waits. Nothing happens until
+`sf send` arms a session.
 
 ```bash
-# 1. Build both binaries
-cd slopfile
-cargo build --release                 # -> target/release/{slopfile,sf}
-
-# 2. (optional) create a session file
-sf init t1                             # -> shared/transcripts/t1.md
-
-# 3. start the daemon (watches the transcripts dir, drives every file)
-slopfile
+sf init <session>                # create a session file
+sf send <session>                # arm + generate
+sf stop <session>                # let the turn finish, then idle
+sf abort <session>               # kill the in-flight stream
+sf status <session>              # one line of daemon state
+sf question <session> <answers…> # answer a question
+sf tokens <session>              # token footprint
 ```
 
-The daemon also speaks the control protocol, so `slopfile send|stop|abort|status`
-work identically to `sf` — handy inside the container, where `sf` is not built.
+`sf` reaches the daemon over `--addr`, `SF_ADDR`, or the default
+`127.0.0.1:8787`.
 
-The daemon reads `SLOPFILE_CONFIG` (default
-`slopfile/shared/slopfile.toml`) and can be overridden per-launch:
+Docker also works, and needs an NVIDIA GPU:
 
 ```bash
-SLOPFILE_CONFIG=/path/to/slopfile.toml            \
-SLOPFILE_API_BASE=http://127.0.0.1:8080           \
-SLOPFILE_TRANSCRIPTS=/path/to/transcripts         \
-SLOPFILE_WORKDIR=/path/to/workspace               \
-SLOPFILE_ABORT_RESTART=1                          \
-SLOPFILE_SKILLS_DIR=/path/to/skills               \
-SLOPFILE_LLAMA_CONTAINER=clanker-llama            \
-slopfile
+./start.sh                  # daemon + llama-server, then nvim on the newest session
+docker/run.sh logs slopfile # follow the daemon
+docker/run.sh down          # stop
 ```
 
-### nvim plugin
+`start.sh` wants a running docker daemon and `nvim` on `$PATH`. Skipping it
+entirely and pointing at a hosted API is the easier path.
 
-Load the plugin once per nvim session, then open a session `.md`:
+## OpenRouter
 
-```vim
-:source ~/things/clanker/slopfile/nvim/plugin/slopfile.lua
-```
-
-(Or add `~/things/clanker/slopfile/nvim/plugin` to your `runtimepath` instead,
-in which case it loads automatically.) The plugin shells out to the `sf` CLI; if
-it isn't on `$PATH`, point the plugin at it first:
-
-```vim
-let g:sf_bin = '~/things/clanker/slopfile/target/release/sf'
-```
-
-A 1s timer reloads the buffer while the
-daemon streams; the view follows the stream when your cursor is on the last
-line. Save before expecting updates — `:checktime` refuses to clobber unsaved
-text.
-
-| Command     | Action |
-|-------------|--------|
-| `:Init`     | `sf init <session>` for this buffer |
-| `:Send`     | save the buffer, then `sf send` — arms and starts/resumes generating |
-| `:Resume`   | alias for `:Send` |
-| `:Stop`     | `sf stop` — let the current turn finish, then go idle |
-| `:Abort`    | `sf abort` — kill the in-flight stream now |
-| `:Status`   | `sf status` — one line of live daemon state |
-| `:Question` | prompt for answers, then `sf question` |
-| `:Tokens`   | `sf tokens` — token/budget report |
-
-The plugin finds the CLI via `g:sf_bin` (or the older `g:slopfile_bin`),
-defaulting to `sf` on `$PATH`.
-
-### The `sf` CLI
-
-```bash
-sf init <session>                      # create a session file (local)
-sf send <session>                      # arm + start generating
-sf stop <session>                      # finish the current turn, then idle
-sf abort <session>                     # kill the in-flight stream now
-sf status <session>                    # phase/running/armed/parked/solved/…
-sf question <session> <answers…>       # one argument per pending question
-sf tokens <session>                    # token footprint vs the context budget
-```
-
-`<session>` is a bare name (`1`, `1.md`) resolved inside the daemon's
-transcripts dir; path separators are refused. `--addr` (or `SF_ADDR`, default
-`SLOPFILE_ADDR`) points at the daemon, `--transcripts` (or
-`SLOPFILE_TRANSCRIPTS`) at the local session dir used by `init` and `tokens`.
-The client has a 10s deadline, so it errors rather than hanging on a dead daemon.
-
-The wire is newline-delimited JSON, one request per TCP connection, on
-`127.0.0.1:8787` inside the container's compose network — see the
-`ports:`/`SF_ADDR:` entries in `docker/docker-compose.yml`.
-
----
-
-## Run 2 — Docker (`llama-server` + daemon in containers)
-
-The compose stack in `docker/` runs the model server and the slopfile
-daemon as containers. The `pi` service is a legacy scratch container and is
-not needed for slopfile.
-
-### Requirements
-
-- NVIDIA GPU + `nvidia-container-toolkit` installed (llama-server asks for the
-  GPU device).
-- Host docker daemon, with the docker socket reachable by the `slopfile`
-  container, *only* if you want abort → `docker restart clanker-llama`
-  (`abort_restart_server = true`). The socket is mounted with the host docker
-  group's gid via `DOCKER_GID`.
-
-### Config the container overrides
-
-The compose `slopfile` service sets these env vars (overriding the config
-paths below so they work inside the compose network):
-
-| Env                      | Value                    | Meaning |
-|--------------------------|--------------------------|---------|
-| `SLOPFILE_CONFIG`        | `/shared/slopfile.toml`  | app config, by the container path |
-| `SLOPFILE_API_BASE`      | `http://llama-server:8080` | talks to the `llama-server` service by name |
-| `SLOPFILE_TRANSCRIPTS`   | `/shared/transcripts`    | session files, on the shared volume |
-| `SLOPFILE_WORKDIR`       | `/workspace`    | where tool calls run/edit |
-| `SLOPFILE_SKILLS_DIR`    | `/shared/skills` | `*.md` here are indexed into the system prompt |
-| `SF_ADDR`                | `0.0.0.0:8787`  | control port, published as `127.0.0.1:8787` on the host |
-
-`SLOPFILE_WORKDIR` matches the `workspace/` bind mount.
-
-`shared/` is mounted read-write in both containers; `models/` is read-only in
-`llama-server`.
-
-### Start
-
-```bash
-cd slopfile           # repo root
-./start.sh            # boot the stack + open nvim (plugin loaded) on the latest session
-```
-
-`start.sh` is idempotent — it errors out if the docker daemon is down, uses
-`docker compose up -d` (harmless if containers are already running, and waits
-for llama-server to be healthy), builds the `slopfile` binary in release mode
-inside a throwaway `rust:1-slim` container (no host toolchain needed, so it
-works on NixOS) and deploys it into the running container
-(`docker/run.sh deploy`), then opens nvim with the plugin loaded on the most
-recent transcript (creating one via `slopfile init` if none exist). The nvim
-plugin also needs a host-side binary (`target/release/slopfile`); `start.sh`
-builds one via `cargo` or `nix develop -c cargo` when it's missing.
-
-Or manually:
-
-```bash
-cd slopfile/docker
-./run.sh up           # build slopfile, pull llama-server, start both
-./run.sh logs slopfile   # follow the daemon logs
-./run.sh down            # stop
-```
-
-`./run.sh up` loads `DOCKER_GID` automatically so the `slopfile` container can
-`docker restart clanker-llama` on abort. Then create a transcript and use it
-exactly as in the host flow (edit `shared/transcripts/*.md` from the host, or
-open it in nvim on the host — it's the same file on the shared volume):
-
-```bash
-slopfile init "$HOME/things/clanker/slopfile/shared/transcripts/t1.md"   # from the host
-nvim "$HOME/things/clanker/slopfile/shared/transcripts/t1.md"            # edit, :Send
-```
-
-### Model weights
-
-`llama-server` runs in **router mode** (`--models-preset`), so models are
-declared in `slopfile/shared/models/presets.ini` instead of a single `-m` flag.
-Each `[name]` section advertises one model — drop the GGUF (and optional
-mmproj) into `slopfile/shared/models/` and add a section. The preset ships with
-one model, `qwen3.8-27b` (Qwen3.8-27B multimodal, Q4_K_XL, 131k context).
-
-The daemon routes each request to the model named in the session's
-` ```toml model = "..." `` block. To use a different model in a session, set
-its preset-section name there. The server auto-loads on demand and the daemon
-best-effort preloads it before streaming.
-
-`slopfile.toml`'s `default_session_model` is where a *new* session's fence gets
-its model from. It is not a global override — a session pins its model when it
-is created, so changing this setting does not move existing sessions. To move
-one, edit its fence. (The old key `model` is still accepted in `slopfile.toml`
-and means the same thing.)
-
-That same header block can name a provider — see [Providers](#providers) —
-which is how one transcript talks to OpenRouter while its neighbour stays
-local.
-
----
-
-## App config reference (`slopfile.toml`)
+In `slopfile.toml`:
 
 ```toml
-confirmations = "ask"          # questions only: "ask" waits for you, "yolo" auto-resolves with
-                               # the question's default. It does NOT gate any tool -- nothing here
-                               # asks before running bash. An unrecognized value silently
-                               # becomes "ask", so check for typos.
-api_base = "http://127.0.0.1:8080"          # the implicit llama-server endpoint
-provider = "openrouter"                      # optional app-wide default; see "Providers"
-workdir = "/home/unitazer/things/clanker"      # tool-call root; edits are restricted to it
-transcripts_dir = ".../shared/transcripts"     # session files the daemon watches
-sweep_interval_ms = 250                        # poll cadence
-default_session_model = "qwen3.8-27b"          # model stamped into each NEW session's fence;
-                                                # it does not override existing sessions
-tool_timeout_ms = 30000                        # per-tool bash timeout
-max_context_tokens = 65536                     # must equal ctx-size in presets.ini (see below)
-abort_restart_server = true                    # docker restart llama-server on abort
-llama_container = "clanker-llama"              # container to restart on abort
-burst_max_turns = 0                            # ceiling on turns per `sf send`; 0 = none
-
-# Any OpenAI-compatible endpoint, selectable per session. Headers are where the API key goes.
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
 reasoning_style = "object"
-headers = { Authorization = "Bearer ${OPENROUTER_API_KEY}", "X-Title" = "slopfile" }
-```
-
-`max_context_tokens` is the slopfile-side half of a pair — see
-[Things that must be kept in sync](#things-that-must-be-kept-in-sync-by-hand).
-
-## Providers
-
-`api_base` is always available and is assumed to be a llama-server. Anything
-else — OpenRouter, OpenAI, a gateway, your own server — goes in
-`[providers.<name>]` and a session asks for it by name:
-
-```toml
-provider = "openrouter"
-model = "qwen/qwen3-235b-a22b"
-thinking = "auto"
-tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent"]
-```
-
-`provider` is optional. Omitted, a session takes the app-wide `provider`, and
-failing that `api_base` — so existing transcripts are unaffected by any of this.
-
-One caveat, the same one `default_session_model` has: the app-wide `provider`
-is stamped into each new session's fence, and that is a one-way latch. Clearing
-it from `slopfile.toml` afterwards does not move existing sessions back to
-`api_base`; edit their fences if you want that.
-
-`base_url` may be written with or without the trailing `/v1`; it is normalized
-away, since the request paths carry the version themselves.
-
-`headers` go out on every request to that provider. **`${VAR}` is expanded from
-the environment**, which is where the key belongs:
-
-```toml
 headers = { Authorization = "Bearer ${OPENROUTER_API_KEY}" }
 ```
 
-An unset *or empty* variable is an error, not a dropped header — otherwise a
-missing key surfaces as `Authorization: Bearer ` and a 401 that reads like a
-wrong key rather than a missing one.
+Then in the session's fence, the `` ```toml `` block at the top of the transcript:
 
-### Where the key actually goes
+````markdown
+```toml
+provider = "openrouter"
+model = "dots-studio/dots-3-note-preview:free"
+thinking = "high"
+tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "question", "subagent"]
+```
+````
 
-`${VAR}` is expanded by the **daemon process**, so under Docker it is read from
-the *container's* environment, not your shell. Two ways to get it in, laziest first:
+`base_url` can carry `/v1` or not, it normalizes either way. `${VAR}` is
+expanded by the daemon from its own environment, so under Docker that means the
+container's. Add this to the `slopfile` service:
 
-**1. In the transcript.** The session's fence takes its own `headers`, applied
-on top of the provider's, so the key never has to leave the file:
+```yaml
+OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+```
+
+The free tier, which covers ids ending in `:free` like the one above, is 50
+requests a day and one tool-calling turn spends several. Ten credits buys
+1000/day. When you hit it the session parks and a note in the transcript says
+so.
+
+An unset or empty `${VAR}` is a hard error rather than a dropped header, since
+an empty `Authorization: Bearer ` comes back as a 401 that reads like a wrong key
+rather than a missing one.
+
+## Any OpenAI-compatible endpoint
+
+Same shape, any provider with `POST /chat/completions`:
+
+```toml
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+headers = { Authorization = "Bearer ${OPENAI_API_KEY}" }
+
+[providers.mylocal]
+base_url = "http://192.168.1.50:8080"
+```
+
+A fence naming `provider = "openai"` picks it. Leaving `provider` out falls back
+to the app-wide `provider`, then to `api_base`. An unknown name errors out rather
+than falling back, since quietly answering on the wrong model costs money.
+
+A provider that is a llama-server wants `llama = true`, which turns back
+on the llama.cpp routes (`/models/load`, `/abort`, `/tokenize`) that hosted
+endpoints skip.
+
+### Keys
+
+Two places, and they differ in one way that matters.
+
+The environment, via `${VAR}` in `slopfile.toml` as above. The model cannot read
+it from any file.
+
+Or in the fence:
 
 ```toml
 provider = "openrouter"
-headers = { Authorization = "Bearer sk-or-v1-REAL-KEY" }
-model = "qwen/qwen3-235b-a22b"
+headers = { Authorization = "Bearer sk-or-v1-..." }
 ```
 
-The fence is not part of any request — `request_messages()` builds them from the
-`system` region and the turns alone, and it is not in the context paragraph
-either. Transcripts are gitignored.
+Fences are gitignored and go out in no request. The model can still read them
+though, since `bash` has no path sandbox, so treat this as convenience rather
+than secrecy.
 
-But **the model can still read it.** `read`/`write`/`edit` deliberately exempt
-the session's own transcript, the context paragraph names its path, and `bash`
-has no path sandbox, so `cat /shared/transcripts/<name>.md` works regardless. A
-prompt injection — or just a curious model — can surface a fence header and put
-it anywhere `bash` can reach. That is the same exposure as any secret in a file
-the agent can read, so weigh it accordingly: option 1 is convenient, not
-confidential. If the key must not be readable by the model, use option 2. Either
-way `shared/transcripts/` should stay out of backups or syncs you don't
-control.
+## Config
 
-**Context size.** Every tool result is tagged `ctx:N` -- the length of the
-conversation window in tokens as of the request that made that call -- and the
-system prompt explains how to read it, including that the number is a snapshot
-and not a live meter. This is on by default; set `tell_model_context_size =
-false` in `slopfile.toml` (or in a session's fence) to drop it.
+These only work in `slopfile.toml`:
 
-The two thresholds in that paragraph are derived from the window, not typed in:
-they scale with `max_context_tokens` and are always below the ceiling the model
-can actually reach, so the advice is always followable.
+| key | |
+|---|---|
+| `api_base` | implicit endpoint, assumed to be a llama-server |
+| `workdir` | root the tools stay inside |
+| `transcripts_dir` | session files the daemon watches |
+| `default_session_model` | model stamped into new sessions |
+| `confirmations` | `ask` waits for answers, `yolo` picks the default. Gates nothing else, `bash` runs either way. A misspelling parses as `ask` |
+| `abort_restart_server` | restart the llama container on abort |
 
-```toml
-tell_model_context_size = true
-```
+These also work per session, in the fence:
 
-In a session fence the same key overrides it for that session only.
+| key | meaning |
+|---|---|
+| `provider` | endpoint for that session |
+| `model` | model for that session |
+| `headers` | sent on top of the provider's |
+| `thinking` | reasoning effort |
+| `tools` | which tools the model gets |
+| `max_context_tokens` | see below |
+| `tell_model_context_size` | tell the model how full it is (default true) |
+| `burst_max_turns` | turns per send, 0 for no ceiling |
 
-**2. In the container's environment.** Add to the `slopfile` service in
-`docker/docker-compose.yml` — the file passes the variable through next to the
-other `SLOPFILE_*` variables:
+A fence key the daemon does not know is ignored without a word, so a typo there
+does nothing rather than erroring.
 
-```yaml
-OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}   # empty is fine unless you use OpenRouter
-```
+### max_context_tokens
 
-If you would rather have a missing key fail loudly, use `${VAR:?}` instead of the
-default `${VAR:-}` above. Compose substitutes an empty string for an
-unset variable, which is what the empty-check above exists to catch.
+The one setting slopfile and the model server can quietly disagree about. It is
+the window slopfile assumes, so match the server's real one, which for
+llama-server is `ctx-size` in `shared/models/presets.ini`. Set it too high and
+requests overflow the KV cache and get rejected mid-session with nothing in the
+log; too low and slopfile prunes while the server has room.
 
-`slopfile.toml` itself is tracked, so don't put a literal key there — option 1
-or 2, not a plain `headers` line in the config.
+Up to 40,000 tokens go to the reply, the rest to the conversation. 65,536 leaves
+about 25,500.
 
-### Thinking
-
-`thinking` in the fence sets the effort. OpenAI and llama-server read a
-`reasoning_effort` field; OpenRouter's unified interface is a `reasoning` object.
-They are not interchangeable — a model can advertise one and not the other — so
-the shape is a per-provider setting:
-
-```toml
-[providers.openrouter]
-base_url = "https://openrouter.ai/api/v1"
-reasoning_style = "object"   # default is "effort"
-```
-
-`none`, `low`, `medium`, `high` and `xhigh` all mean the same thing in both
-shapes. `auto` omits the field either way, so the model keeps its own default.
-
-Reasoning tokens come out of the same `max_tokens` allowance as the reply. A
-model that spends the whole allowance thinking comes back with
-`finish_reason: "length"` and nothing visible written — which slopfile tells
-apart from a full context window, because the advice is the opposite: leave the
-transcript alone, lower `thinking` or raise `max_context_tokens`.
+The model gets told where it stands. From the second tool call on, each result
+carries a `ctx:N` tag, and the system prompt explains that the number is a
+snapshot rather than a live meter. `tell_model_context_size = false` turns it
+off.
 
 ### Counting tokens
 
-There is no `/tokenize` on a hosted endpoint, and slopfile does not guess. OpenRouter
-bills and reports with the model's **native** tokenizer and returns
-`usage.prompt_tokens` on every response, so the ratio between the bytes sent and
-the tokens counted is *measured*, per model, per session — not a constant.
-(`stream_options: {include_usage: true}` is sent for hosted endpoints to get the
-same from OpenAI; llama-server's request is unchanged.)
+llama-server has `/tokenize`, so slopfile asks it directly for local models.
+Hosted endpoints have nothing like it, so it measures instead: it keeps the bytes
+it sent next to the provider's `usage.prompt_tokens` and takes the ratio from
+those. No fixed bytes-per-token constant, which would be wrong for most models.
 
-That means the **first** turn against a new endpoint has nothing to measure
-against. It sends the transcript whole and reports `tokens=?` rather than a made-up
-number, and the budget applies from turn two on. The sample is in-memory, so a
-daemon restart costs one such turn.
+A sample only counts for the endpoint and model that produced it. The first turn
+against a new endpoint, or after switching model, has nothing to compare against:
+slopfile sends the transcript whole and logs `tokens=?` rather than guessing.
+Budget enforcement starts on the turn after.
 
-Consequence worth knowing: `max_context_tokens` is load-bearing for hosted
-endpoints, and enforcement is back on there. If you set a small one, sessions
-will start pruning themselves — which you want, but not as a surprise.
+### thinking
 
-Other things that differ from a local llama-server, all handled:
-`reasoning_content` is stripped from the request (OpenAI rejects the field) and
-read back from `reasoning` instead; llama.cpp's private routes (`/models/load`,
-`/abort`, `/tokenize`) are skipped; and a `llama-server`'s own `/tokenize` is
-still preferred for local models, since `max_context_tokens` there is tuned by
-hand against `ctx-size`. Setting `llama = true` on a provider that *is* a
-llama-server re-enables all of it.
+`none`, `low`, `medium`, `high`, `xhigh`, or `auto` to leave it alone. The wire
+name differs: OpenAI and llama-server read `reasoning_effort`, OpenRouter reads
+a `reasoning` object. `reasoning_style` picks which, per provider.
 
-## Things that must be kept in sync by hand
+Reasoning tokens come out of the same allowance as the reply, so a model can
+spend it all thinking and return nothing. slopfile spots that case and tells the
+model its transcript was fine, since the advice is the opposite.
 
-Nothing enforces these four. All of them have bitten already, so check them
-whenever you touch either side.
+## File format
 
-### 1. `max_context_tokens` must equal the server's `ctx-size`
+One session, one `.md`, built from regions. `<!-- slopfile:NAME -->` opens one,
+`<!-- /slopfile -->` closes it, and the body is copied out verbatim. Nothing in
+it gets re-read as structure, so the model cannot forge a region by writing
+one.
 
-```diff
-  # shared/slopfile.toml
-  max_context_tokens = 65536
-
-  # shared/models/presets.ini
-  [qwen3.8-27b]
-  ctx-size = 65536
+```
+system      the system prompt, required
+turn        one exchange; finished when its region closes
+  assistant reasoning, text, call
+  result    paired to its call by id
+  note      free text, yours or the harness's
+input       everything below, runs to end of file
 ```
 
-These are independent numbers in two different files, and slopfile's is only its
-*guess* at how much room the request has. The server's is authoritative.
+Names you invent inside a `turn` or `assistant` are kept and handed back under
+that name, so `scratchpad` works as a scratchpad.
 
-- **toml too high** — slopfile thinks it has room, builds a prompt that overflows
-  the real KV cache, and the server rejects it. This is the dangerous direction:
-  it fails at request time on whatever long session happens to hit it, with no
-  clue why.
-- **toml too low** — slopfile truncates history early and leaves the server's
-  context unused. Silent waste, no error.
+Every `<` in a body is escaped. That is the whole of the forgery defence, since
+a marker needs one and content cannot produce an unescaped one. Edits that would
+break the structure are refused with a reason, then rolled back.
 
-`ctx-size` only applies when the model loads, so a preset change needs the
-llama-server container restarted. Sessions that already carry a
-`max_context_tokens` line in their own ` ```toml ` fence override the app value,
-so those files need editing too.
+The nvim plugin in `nvim/plugin/slopfile.lua` adds `:Send`, `:Stop`, `:Abort`,
+`:Status`, `:Question` and `:Tokens` over `sf`, and reloads the buffer while the
+daemon streams.
 
-### 2. `shared/skills/session-edit.py` must match the Rust parser
+`subagent` spawns a worker with its own file, `<parent>.sub-01.md`, and its
+report lands back in the parent. Workers get no `question` tool; if one calls it
+anyway it gets told to decide for itself.
 
-The skill parses the marker format independently of `src/session.rs`. Nothing
-keeps them in agreement except this note, so changing one without the other
-means the model writes edits the harness then refuses.
+`shared/skills/*.md` gets indexed into the system prompt by name and
+description, and the model reads one when a task matches. A skill it decides not
+to read is a skill that does not happen.
 
-Shared between them:
+## When it breaks
 
-| what | where |
-|---|---|
-| marker delimiters `<!-- slopfile:NAME -->` / `<!-- /slopfile -->` | `TOKEN_OPEN`/`TOKEN_CLOSE` in `src/session.rs`, `OPEN`/`CLOSE` in the script |
-| `<` escaping (`ESC_OPEN` + `<` + `ESC_CLOSE`) | `src/session.rs`, `escape()` in the script |
-| the grammar: `system`/`turn`/`input` at the top level, `user`/`note`/`assistant` in a turn, `reasoning`/`text`/`call` in an assistant | `LEAF_REGIONS`/`CONTAINER_REGIONS` in `src/session.rs`, `TOP_LEVEL`/`IN_TURN`/`IN_ASSISTANT` in the script |
-| `begin` and `input` being legitimately left open | both |
-| which names are reserved vs. model-invented roles | `RESERVED` in `src/session.rs`, `KNOWN` in the script |
+`sf status` first. It reports phase (`idle`, `generating`, `running_tools`,
+`waiting_answer`, `waiting_subagents`) plus `armed`, `parked`, `blocked` and
+`stopped`.
 
-The script's `check` deliberately duplicates the placement rules so it refuses a
-bad edit *before* writing, instead of writing one the daemon rolls back. If you
-add a region to the Rust grammar, add it to both.
+- Nothing after `sf send`: check status. `blocked` means the provider refused
+  outright, and `sf send` clears it. `parked` means five failures in a row, and
+  editing the file clears that one.
+- `waiting_answer`: answer under the `>` line in the file, or add ` /skip`.
+- `failed to parse session file`: regions are broken and the message names the
+  region. Fix by hand, then send.
+- Provider refused the request: a `[harness]` note in the transcript explains
+  it. Read it before retrying.
 
-Note the escaped form on disk is
-`<!--slopfile:ESC[<<!--/slopfile:ESC-->!-- slopfile:note -->`, which is why the
-script keys markers off `<!-- slopfile:` *with* the space: the escaped form has
-no space after `<!--`, so the two can never be confused.
-
-### 3. `thinking` vs. what the model's chat template accepts
-
-The level names slopfile sends are **not** the set the model accepts — that is
-the template's, and it can change with the weights. `src/types.rs::Thinking` and
-the Qwen3.8 template currently agree, and `medium` is the sharp edge: slopfile
-offers it, the template validates it, and then ignores it.
-
-llama-server is the middleman: it forwards `reasoning_effort` to the template
-and maps `none` to `enable_thinking=false`. If the template stops reading the
-kwarg, `thinking` goes back to being inert with no error anywhere — so after
-changing weights, check with `POST /apply-template` that the level still
-changes the prompt, and check the table in `thinking` above still matches.
-
-### 4. The context paragraph in `src/context.rs` vs. what the parser accepts
-
-The managed block tells the model things like "keep a running `note` region".
-When that text and the grammar disagree, the model writes something valid-looking
-that gets refused — which is how the word `notes` (plural) ended up in a session
-that only accepts `note`. When you change one, re-read the other.
-
-## The model owns its own context
-
-The session file *is* the model's context — it is parsed back into the request on
-every call — so the model is told its file's path in the system prompt and may
-edit it directly with `read`/`edit`/`write` or with bash. It decides what to drop,
-compress or delete, and the edit becomes its context on the next call. There is no
-summarizer, no successor transcript, and no compaction step: nothing is ever
-rewritten behind the model's back.
-
-- Compress a long turn, delete a dead tool round, keep a running `note` region, or
-  wipe whole turns — whatever it leaves in the file is what it gets back.
-- Subagents (`subagent` tool) get their own file named `<parent>.sub-NN.md`, so
-  they manage their own context too, and their final reply is delivered back into
-  the parent automatically. They are **not** offered the `question` tool — nobody
-  is watching a worker — and if the model invents the call anyway it gets a
-  refusal rather than a default answer invented on your behalf. A subagent is
-  also never `sf send`-able, so it runs autonomously until it stops calling
-  tools; the parent blocks on its report.
-- If the model fills the context mid-response, a harness `note` tells it to prune
-  the file itself; if it doesn't, the usual drop-oldest truncation keeps the
-  request inside the budget.
-- The harness owns the structure and nothing else. An edit that would leave the
-  file unparseable (an unknown region, a `<!-- /slopfile -->` with nothing open, a
-  corrupt `call`/`result`/`question` header) or that drops the ` ```toml ` fence or
-  the `system` region is refused by `edit`/`write` with the reason, and rolled back
-  after a bash edit with the reason appended to that tool's result.
-
-## Troubleshooting
-
-- **No response / stuck** — ask the daemon: `sf status <session>` (or `:Status`)
-  reports `phase` (`idle`, `generating`, `running_tools`, `waiting_answer`,
-  `waiting_subagents`) plus `armed`, `abort`, `parked`, `solved`, `context_full`.
-  Watch `./run.sh logs slopfile` for what the daemon is doing.
-- **The model never starts** — nothing arms a session on its own. `sf send` (or
-  `:Send`) is what sets `armed`, and arming does not survive a daemon restart.
-- **`failed to parse session file`** — the daemon refuses to drive a file whose
-  regions are broken; the message names the region and states the grammar. Note
-  that an unknown name is only an error at the *top level* — inside a `turn` or
-  an `assistant` it is kept as a role you invented. Fix it by hand, then send.
-- **`this burst hit its turn ceiling (N)`** — only reachable if you set
-  `burst_max_turns`, which is 0 (no ceiling) by default. The session continues
-  from wherever it stopped; raise or drop the number in the fence.
-- **`refusing to write`** from `session-edit.py` — the edit would not parse or
-  put a region where it has no meaning. It never wrote anything, so the
-  transcript is untouched; use `session-edit.py list` to get the real path.
-- **the file just stops, with an empty `input` region** — it used to be ambiguous between "the
-  model finished" and "the request never happened". A refusal now writes itself into the
-  transcript as a `[harness]` note naming the provider's own explanation, and the session parks
-  until you `sf send` again rather than spending more of a spent quota retrying.
-- **`the provider refused the request (429)`** — OpenRouter's free tier allows 50 model requests
-  per day, and one tool-calling turn can be several. It resets at 00:00 UTC; adding 10 credits
-  raises it to 1000/day. `sf abort` / `sf stop` end a burst early.
-- **`context_full`** — the model hit the token cap. It is told to prune its own
-  file; if it does not, the harness drops old turns. Consider `max_context_tokens`
-  (see the sync section above).
-- **"waiting_answer"** — the model asked a question; answer below the `> `
-  line and `:Send`, or add ` /skip`.
-- **Abort does nothing / can't restart server** — the container can't reach
-  the docker socket (gid mismatch or socket not mounted). Either `DOCKER_GID`
-  is wrong, or set `abort_restart_server = false`.
-- **Empty buffer gets clobbered** — `slopfile init` refuses to touch a
-  non-empty file; the nvim plugin never overwrites unsaved text.
-- **Daemon ignoring a file** — errors are throttled: a failing session is
-  skipped briefly, and after 5 consecutive failures it is *parked* until the
-  file changes on disk. `sf status` shows `parked=true`; edit the file to unpark.
-  Check `logs slopfile`.
+MIT licensed.
