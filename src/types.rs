@@ -566,8 +566,6 @@ pub struct AppConfig {
   pub tell_model_context_size: bool,
   #[serde(default = "default_subagent_max_depth")]
   pub subagent_max_depth: u32,
-  #[serde(default = "default_stream_idle_timeout_secs")]
-  pub stream_idle_timeout_secs: u64,
 }
 
 fn default_api_base() -> String {
@@ -607,10 +605,6 @@ fn default_true() -> bool {
   true
 }
 
-fn default_stream_idle_timeout_secs() -> u64 {
-  300
-}
-
 impl Default for AppConfig {
   fn default() -> Self {
     Self {
@@ -630,7 +624,6 @@ impl Default for AppConfig {
       burst_max_turns: 0,
       tell_model_context_size: true,
       subagent_max_depth: default_subagent_max_depth(),
-      stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
     }
   }
 }

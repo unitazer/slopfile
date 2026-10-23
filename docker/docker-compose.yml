@@ -1,15 +1,9 @@
 services:
   llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    # CPU build. Swap to :server-cuda (plus the nvidia device reservation) if a
+    # GPU goes back in.
+    image: ghcr.io/ggml-org/llama.cpp:server
     container_name: clanker-llama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: cdi
-              device_ids:
-                - nvidia.com/gpu=all
-              capabilities: [all]
     ulimits:
       memlock: -1
     volumes:
@@ -17,8 +11,8 @@ services:
     command: [
       "--models-preset", "/models/presets.ini",
       "--models-max", "2",
-      "--mlock",
-      "--no-mmap",
+      #"--mlock",
+      #"--no-mmap",
       "--host", "0.0.0.0",
       "--port", "8080"
     ]

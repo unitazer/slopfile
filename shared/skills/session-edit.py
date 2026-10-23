@@ -10,12 +10,26 @@ you name a region, you get or set its body, and this handles the markers and the
   ./session-edit.py read   SESSION turn[3].assistant.text
   ./session-edit.py set    SESSION turn[3].note --body "..."
   ./session-edit.py append SESSION turn[3].note --body "..."
-  ./session-edit.py drop   SESSION turn[1].rounds            (removes matching regions)
+  ./session-edit.py drop   SESSION turn[1]                   (removes matching regions)
+  ./session-edit.py drop   SESSION 'turn[1].*'
   ./session-edit.py check  SESSION
+  ./session-edit.py batch  SESSION <<'EOF'
+  drop 'turn[*].assistant[*].call[*]'
+  set 'turn[*].assistant.reasoning' | one-line summary
+  add turn.note | compaction: dropped dead tool output
+  EOF
+
+`batch` is one parse, one write and one line of output however many edits there are, and a failing
+line aborts the whole batch without touching the file. Each line is `op path` or `op path | body`;
+bodies are one line (use `set ... --body -` for a multi-line body). Paths mean what they did in the
+`list` you ran before the batch, so order does not matter and drops cannot renumber later lines.
+Prefer it over shell `&&` chains, which re-parse, rewrite and re-print for every edit.
 
 A path is `name` or `name[n]` segments joined by dots, outermost first. `list` prints every path
-you can address. Repeated names need an index; the ones that always repeat can use `[*]` to mean
-"all of them" for `drop`.
+you can address. Indices count same-named siblings at that level, so a bare name is the first one;
+after a single `drop` run `list` again. A wildcard applies only to its own segment, so `[*]` (or a
+bare `*`) must be repeated on every level you mean to sweep. A batch resolves every path against
+the snapshot before it, so there order does not matter.
 
 Every write is atomic (temp file plus rename) and leaves the transcript untouched if the edit
 would not parse.
@@ -133,21 +147,25 @@ def find_input(nodes):
     return None
 
 
-def walk(nodes, index_of, out, counters):
+def walk(nodes, index_of, out):
     for node in nodes:
-        idx = counters.get(node.name, 0)
-        counters[node.name] = idx + 1
+        # Index among same-named siblings, not globally: deleting a result in one turn must not
+        # renumber the results of every turn after it.
+        idx = [n for n in nodes if n.name == node.name].index(node)
         index_of[node] = idx
         p = path_of(node, index_of)
         if node.parent is not None:
             out.append((p, node))
-        walk(node.children, index_of, out, counters)
+        walk(node.children, index_of, out)
 
 
 def resolve(entries, spec):
     """`turn[3].assistant.text` -> that node. A bare name matches its first occurrence."""
     parts = []
     for seg in spec.split("."):
+        if seg == "*":
+            parts.append((None, "*"))
+            continue
         m = re.match(r"^([A-Za-z0-9_-]+)(?:\[(\d+|\*)\])?$", seg)
         if not m:
             raise SystemExit(f"bad path segment: {seg!r}")
@@ -159,11 +177,17 @@ def resolve(entries, spec):
             continue
         ok = True
         for got, (want, ix) in zip(segs, parts):
-            name = got.split("[")[0]
-            if name != want:
+            m = re.match(r"^([A-Za-z0-9_-]+)(?:\[(\d+)\])?$", got)
+            name, index = m.group(1), int(m.group(2) or 0)
+            if want is not None and name != want:
                 ok = False
                 break
-            if ix is not None and ix != "*" and got != f"{want}[{ix}]":
+            # A bare name is the first occurrence, not every occurrence. Without this a
+            # `set turn.assistant.reasoning` rewrites the first reasoning of every turn.
+            if ix is None and index != 0:
+                ok = False
+                break
+            if ix not in (None, "*") and index != int(ix):
                 ok = False
                 break
         if ok:
@@ -179,63 +203,87 @@ def body_text(lines, node):
 
 
 TOP_LEVEL = {"system", "turn", "input", "begin"}
-IN_TURN = {"user", "note", "assistant"}
+IN_TURN = {"user", "note", "assistant", "result", "question"}
 IN_ASSISTANT = {"reasoning", "text", "call"}
+CONTAINERS = {"turn", "assistant"}
+# The parser reports a second `user` in a turn, or a second `reasoning`/`text` in an assistant, and
+# a write carrying one would be rolled back. Same names are fine in different containers.
+ONCE_PER_TURN = {"user"}
+ONCE_PER_ASSISTANT = {"reasoning", "text"}
+# The harness renders a live session with its last turn, current assistant and the section being
+# streamed still open, then the human's `input` after them.
+LIVE_TAILS = {
+    (),
+    ("turn",),
+    ("turn", "assistant"),
+    ("turn", "assistant", "reasoning"),
+    ("turn", "assistant", "text"),
+}
 
 
-def check(lines, original):
+def check(lines):
     """Refuse anything the harness would roll back, so a bad edit never reaches disk."""
     if not lines:
         return "edit produced an empty file"
-    if not original.split("---")[0].strip() == "".join(lines[:1]).strip() and "```toml" not in original:
-        pass
-    stack = []
-    for line in lines:
-        if is_open(line):
-            name, _ = parse_name(line)
-            if name is None:
-                return f"unreadable region marker: {line.strip()[:60]}"
-            if name in ("call", "result", "question"):
-                pass
-            stack.append(name)
-        elif is_close(line):
-            if not stack:
-                return f"{CLOSE} closes a region that was never opened"
-            stack.pop()
-    # `begin` and `input` are legitimately open: a live session always ends inside the input
-    # region so the user can keep typing. Anything else left open is a real break.
-    leftover = [n for n in stack if n not in ("begin", "input")]
-    if leftover:
-        return f"unclosed region(s): {', '.join(leftover)}"
     text = "".join(lines)
     if text.count("```toml") == 1 and not text.lstrip().startswith("```toml"):
         head = text.split("```toml")[0].strip()
         if head:
             return "the ```toml fence must stay at the top of the file"
-    # Placement, not just balance: the harness refuses a region that sits somewhere it has no
-    # meaning, and an edit that gets rolled back is worse than one that never ran.
     stack = []
+    # Identity of the enclosing turn/assistant for the singleton checks: two siblings with the
+    # same name are different containers, and both may hold a `reasoning`.
+    ids = []
+    next_id = 0
+    opened = set()
     for line in lines:
-        if is_open(line):
-            name, payload = parse_name(line)
-            if payload:
-                try:
-                    json.loads(payload)
-                except Exception as exc:
-                    return f"the {name} header is not valid JSON: {exc}"
-            parent = stack[-1] if stack else None
-            if parent is None:
-                if name not in TOP_LEVEL:
-                    return f"`{name}` may not sit at the top level (allowed: {', '.join(sorted(TOP_LEVEL - {'begin'}))})"
-            elif parent == "turn":
-                if name not in IN_TURN and name in KNOWN:
-                    return f"`{name}` does not belong inside a `turn`; allowed: {', '.join(sorted(IN_TURN))}, or a role of your own"
-            elif parent == "assistant":
-                if name not in IN_ASSISTANT and name in KNOWN:
-                    return f"`{name}` does not belong inside an `assistant`; allowed: {', '.join(sorted(IN_ASSISTANT))}, or a role of your own"
-            stack.append(name)
-        elif is_close(line) and stack:
+        if is_close(line):
+            if not stack:
+                return f"{CLOSE} closes a region that was never opened"
             stack.pop()
+            ids.pop()
+            continue
+        if not is_open(line):
+            continue
+        name, payload = parse_name(line)
+        if name is None:
+            return f"unreadable region marker: {line.strip()[:60]}"
+        if name == "begin":
+            continue
+        # `input` is the human's tail and runs to EOF. The renderer can put it inside the live
+        # turn/assistant, so stop here rather than reading that as nesting.
+        if name == "input":
+            break
+        parent = stack[-1] if stack else None
+        if parent is not None and parent not in CONTAINERS:
+            return f"`{parent}` was left unclosed before `{name}`"
+        if payload:
+            try:
+                json.loads(payload)
+            except Exception as exc:
+                return f"the {name} header is not valid JSON: {exc}"
+        if parent is None:
+            if name not in TOP_LEVEL:
+                return f"`{name}` may not sit at the top level (allowed: system, turn, input)"
+        elif parent == "turn":
+            if name not in IN_TURN and name in KNOWN:
+                return f"`{name}` does not belong inside a `turn`; allowed: {', '.join(sorted(IN_TURN))}, or a role of your own"
+            if name in ONCE_PER_TURN and (ids[-1], name) in opened:
+                return f"a second `{name}` in the same `turn`"
+        elif parent == "assistant":
+            if name not in IN_ASSISTANT and name in KNOWN:
+                return f"`{name}` does not belong inside an `assistant`; allowed: {', '.join(sorted(IN_ASSISTANT))}, or a role of your own"
+            if name in ONCE_PER_ASSISTANT and (ids[-1], name) in opened:
+                return f"a second `{name}` in the same `assistant`"
+        opened.add((ids[-1] if ids else None, name))
+        stack.append(name)
+        if name in CONTAINERS:
+            ids.append(next_id)
+            next_id += 1
+        else:
+            ids.append(None)
+    if tuple(stack) not in LIVE_TAILS:
+        return f"unclosed region(s): {', '.join(stack)}"
     return None
 
 
@@ -246,143 +294,345 @@ def write_atomic(path, text):
     os.replace(tmp, path)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["list", "read", "set", "append", "add", "drop", "check"])
-    ap.add_argument("session")
-    ap.add_argument("path", nargs="?")
-    ap.add_argument("--body", help="new body text; use '-' to read the body from stdin")
-    args = ap.parse_args()
+class Editor:
+    """A parsed transcript mutated in memory; `save` is the only thing that touches disk."""
 
-    if args.cmd not in ("list", "check") and not args.path:
-        ap.error(f"{args.cmd} needs a region path")
+    def __init__(self, path):
+        self.path = path
+        with open(path) as fh:
+            self.lines = fh.read().splitlines(keepends=True)
+        self.reindex()
 
-    with open(args.session) as fh:
-        original = fh.read()
-    lines = original.splitlines(keepends=True)
-    roots, stack = build_tree(lines)
-    entries, index_of, counters = [], {}, {}
-    walk(roots, index_of, entries, counters)
+    def reindex(self):
+        self.roots, self.stack = build_tree(self.lines)
+        self.entries, self.index_of = [], {}
+        walk(self.roots, self.index_of, self.entries)
 
-    if args.cmd == "list":
-        print(f"{len(lines)} lines, {'unclosed: ' + ','.join(n.name for n in stack) if stack else 'balanced'}")
-        for path, node in entries:
-            payload = f"  {node.payload[:60]}" if node.payload else ""
-            print(f"  {path}{payload}")
-        return
-    if args.cmd == "check":
-        why = check(lines, original)
-        print(why or "ok")
-        raise SystemExit(1 if why else 0)
+    def text(self):
+        return "".join(self.lines)
 
-    if args.cmd == "add":
-        parent_spec, _, new_name = args.path.rpartition(".")
+    def targets(self, spec, closed=True):
+        hits = resolve(self.entries, spec)
+        if closed:
+            for node in hits:
+                if node.close_line is None:
+                    raise SystemExit(
+                        f"{spec} is unclosed; the file is mid-generation, try again shortly"
+                    )
+        return hits
+
+    def commit(self, new_lines):
+        """Check the whole file, adopt it and reindex, all before anything reaches disk."""
+        why = check(new_lines)
+        if why:
+            raise SystemExit(f"refusing to write: {why}")
+        self.lines = new_lines
+        self.reindex()
+
+    def drop(self, spec):
+        targets = self.targets(spec)
+        # Both markers go, or the open is left dangling and the file stops parsing.
+        doomed = set()
+        for node in targets:
+            doomed.update(range(node.open_line, node.close_line + 1))
+        self.commit([line for i, line in enumerate(self.lines) if i not in doomed])
+        return len(targets), f"dropped {len(targets)} region(s)"
+
+    def write(self, spec, raw, append=False):
+        targets = self.targets(spec)
+        edits = []
+        for node in targets:
+            if append:
+                new = body_text(self.lines, node).rstrip("\n") + "\n" + escape(raw)
+            else:
+                new = escape(raw)
+            edits.append((node.body_start, node.close_line, to_lines(new)))
+        keep = list(self.lines)
+        for start, end, body in sorted(edits, reverse=True):
+            keep[start:end] = body
+        self.commit(keep)
+        verb = "appended to" if append else "set"
+        return len(targets), f"{verb} {spec} ({len(targets)} region(s))"
+
+    def begin(self):
+        tops = [n for n in self.roots if n.name == BEGIN]
+        if not tops:
+            raise SystemExit("this file has no <!-- slopfile:begin --> region")
+        return tops[0]
+
+    def insert_into(self, holder, seg, body_lines):
+        """Put a new region inside `holder`, above the input region when holder is open."""
+        at, closes = insert_point(self, holder)
+        if at is None:
+            raise SystemExit(f"cannot find where to create {seg!r}")
+        self.lines[at:at] = closes + body_lines
+
+    def add(self, spec, raw):
+        parent_spec, _, new_name = spec.rpartition(".")
         if not new_name:
             raise SystemExit("add needs a full path like turn.note or turn.assistant.scratchpad")
-        raw = sys.stdin.read() if args.body == "-" else (args.body or "")
-
-        def reindex():
-            nonlocal lines, original, roots, entries, index_of, counters
-            original = "".join(lines)
-            roots, stack = build_tree(lines)
-            entries, index_of, counters = [], {}, {}
-            walk(roots, index_of, entries, counters)
-            return stack
-
-        def insert_into(holder, seg, body_lines):
-            """Put a new region inside `holder`, above the input region when it sits under begin."""
-            if holder.name == BEGIN:
-                inp = find_input(roots)
-                at = inp.open_line if inp is not None else (holder.close_line or len(lines))
-            else:
-                at = holder.close_line
-            if at is None:
-                raise SystemExit(f"cannot find where to create {seg!r}")
-            lines[at:at] = body_lines
-
         # Walk the path one segment at a time, creating any container that is missing, so
         # `turn.assistant.scratchpad` works on a session that has neither yet.
         segments = parent_spec.split(".") if parent_spec else []
         holder = None
         for depth, seg in enumerate(segments):
-            spec = ".".join(segments[: depth + 1])
+            prefix = ".".join(segments[: depth + 1])
             try:
-                holder = resolve(entries, spec)[0]
+                holder = resolve(self.entries, prefix)[0]
                 continue
             except SystemExit:
                 pass
-            if seg not in ("turn", "assistant"):
+            if seg not in CONTAINERS:
                 raise SystemExit(
                     f"cannot create {seg!r}; only `turn` and `assistant` are created for you"
                 )
             if holder is None:
-                tops = [n for n in roots if n.name == BEGIN]
-                if not tops:
-                    raise SystemExit("this file has no <!-- slopfile:begin --> region")
-                holder = tops[0]
-            insert_into(holder, seg, [f"{OPEN}{seg} -->\n", f"{CLOSE}\n"])
-            reindex()
-            holder = resolve(entries, spec)[0]
+                holder = self.begin()
+            self.insert_into(holder, seg, [f"{OPEN}{seg} -->\n", f"{CLOSE}\n"])
+            self.reindex()
+            holder = resolve(self.entries, prefix)[0]
         if holder is None:
-            tops = [n for n in roots if n.name == BEGIN]
-            if not tops:
-                raise SystemExit("this file has no <!-- slopfile:begin --> region")
-            holder = tops[0]
+            holder = self.begin()
 
-        if new_name not in KNOWN and holder.name not in ("turn", "assistant"):
+        if new_name not in KNOWN and holder.name not in CONTAINERS:
             raise SystemExit(
                 f"{new_name!r} may only be invented inside a turn or an assistant, not inside "
                 f"{holder.name!r}"
             )
         block = [f"{OPEN}{new_name} -->\n"] + to_lines(escape(raw)) + [f"{CLOSE}\n"]
-        insert_into(holder, new_name, block)
-        original = "".join(lines)
-        why = check(lines, original)
-        if why:
-            raise SystemExit(f"refusing to write: {why}")
-        write_atomic(args.session, original)
-        print(f"added {new_name} inside {parent_spec or 'the top level'}")
+        self.insert_into(holder, new_name, block)
+        self.commit(list(self.lines))
+        return 1, f"added {new_name} inside {parent_spec or 'the top level'}"
+
+    def save(self):
+        write_atomic(self.path, self.text())
+
+
+def insert_point(view, holder):
+    """Where a new child of `holder` goes, plus the closes needed to leave the live tail."""
+    if holder.name == BEGIN:
+        inp = find_input(view.roots)
+        return (inp.open_line if inp is not None else len(view.lines)), []
+    if holder.close_line is not None:
+        return holder.close_line, []
+    if holder.name == INPUT:
+        raise SystemExit("cannot add a region inside the input region")
+    inp = find_input(view.roots)
+    at = inp.open_line if inp is not None else len(view.lines)
+    # The new region must be a child of `holder`, not of whatever section is still open under it,
+    # so close that tail first. Otherwise a note added mid-turn lands inside the assistant and the
+    # harness rejects it on the next parse.
+    at_holder = [i for i, node in enumerate(view.stack) if node is holder]
+    if not at_holder:
+        raise SystemExit(f"`{holder.name}` is not on the open path")
+    closes = max(0, len(view.stack) - at_holder[0] - 1)
+    if view.stack and view.stack[-1].name == INPUT:
+        closes = max(0, closes - 1)
+    return at, [CLOSE + "\n"] * closes
+
+
+BATCH_OPS = ("drop", "set", "append", "add")
+
+
+def parse_batch(text):
+    """`drop PATH` / `set PATH | BODY` lines -> ops. One line per edit, no shell chaining."""
+    ops = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, sep, body = raw.partition("|")
+        op, _, spec = head.strip().partition(" ")
+        op, spec = op.strip(), spec.strip()
+        if op not in BATCH_OPS:
+            raise SystemExit(
+                f"batch line {lineno}: unknown op {op!r}; use drop, set, append or add"
+            )
+        if not spec:
+            raise SystemExit(f"batch line {lineno}: {op} needs a region path")
+        if op == "drop" and sep:
+            raise SystemExit(f"batch line {lineno}: drop takes no body")
+        if op != "drop" and not sep:
+            raise SystemExit(f"batch line {lineno}: {op} needs `| body`")
+        if body.startswith(" "):
+            body = body[1:]
+        if len(spec) > 1 and spec[0] == spec[-1] and spec[0] in "'\"":
+            spec = spec[1:-1]
+        ops.append((lineno, op, spec, body))
+    return ops
+
+
+def plan_batch(editor, ops):
+    """Turn the whole batch into line replacements against the pre-batch snapshot.
+
+    Resolving every op up front is the point: paths keep the meaning they had in the `list` that
+    preceded the batch, so dropping `turn[0].result` cannot renumber `turn[1].result`.
+    """
+    drops = []  # (start, end, lineno) end exclusive
+    edits = []  # (start, end, seq, lines, lineno)
+    inserts = []  # (at, seq, closes, block, lineno, holder)
+    regions = 0
+    for seq, (lineno, op, spec, body) in enumerate(ops):
+        try:
+            if op == "drop":
+                nodes = editor.targets(spec)
+                drops.extend((n.open_line, n.close_line + 1, lineno) for n in nodes)
+                regions += len(nodes)
+            elif op in ("set", "append"):
+                nodes = editor.targets(spec)
+                for node in nodes:
+                    if op == "append":
+                        new = body_text(editor.lines, node).rstrip("\n") + "\n" + escape(body)
+                    else:
+                        new = escape(body)
+                    edits.append((node.body_start, node.close_line, seq, to_lines(new), lineno))
+                regions += len(nodes)
+            else:
+                parent_spec, _, new_name = spec.rpartition(".")
+                if not new_name:
+                    raise SystemExit("add needs a full path like turn.note")
+                if parent_spec:
+                    holder = resolve(editor.entries, parent_spec)[0]
+                else:
+                    holder = editor.begin()
+                if new_name not in KNOWN and holder.name not in CONTAINERS:
+                    raise SystemExit(
+                        f"{new_name!r} may only be invented inside a turn or an assistant"
+                    )
+                at, closes = insert_point(editor, holder)
+                block = [f"{OPEN}{new_name} -->\n"] + to_lines(escape(body)) + [f"{CLOSE}\n"]
+                inserts.append((at, seq, closes, block, lineno, holder))
+                regions += 1
+        except SystemExit as exc:
+            raise SystemExit(f"batch line {lineno} ({op} {spec}): {exc}")
+
+    # Edits must not touch a region the batch drops, and no two edits may share lines.
+    for start, end, _, _, lineno in edits:
+        for dstart, dend, dlineno in drops:
+            if start < dend and dstart < end:
+                raise SystemExit(
+                    f"batch lines {dlineno} and {lineno}: one drops a region the other edits"
+                )
+    for i, (start, end, _, _, lineno) in enumerate(edits):
+        for ostart, oend, _, _, olineno in edits[i + 1 :]:
+            if start < oend and ostart < end:
+                raise SystemExit(f"batch lines {lineno} and {olineno}: edits overlap")
+    for at, _, _, _, lineno, _ in inserts:
+        for start, end, dlineno in drops:
+            if start <= at < end:
+                raise SystemExit(f"batch lines {dlineno} and {lineno}: add lands in a dropped region")
+        for start, end, _, _, elineno in edits:
+            if start <= at < end:
+                raise SystemExit(f"batch lines {elineno} and {lineno}: add lands in an edited region")
+
+    # Nested drops (a turn and a child) are fine, but they must become disjoint line ranges before
+    # they are applied: two slice assignments computed on the original numbering would otherwise
+    # delete past the first one's end.
+    merged = []
+    for start, end, _ in sorted(drops):
+        if merged and start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    # Additions at the same point are one insert; they must all go into the same holder, or the
+    # first close-marker block would already have closed the second one's parent.
+    grouped = {}
+    for at, seq, closes, block, lineno, holder in inserts:
+        grouped.setdefault(at, []).append((seq, closes, block, lineno, holder))
+    mods = [(start, end, 0, []) for start, end in merged]
+    mods += [(start, end, seq, lines) for start, end, seq, lines, _ in edits]
+    for at, group in grouped.items():
+        group.sort()
+        holders = {id(entry[4]) for entry in group}
+        if len(holders) > 1:
+            linenos = ", ".join(str(entry[3]) for entry in group)
+            raise SystemExit(
+                f"batch lines {linenos}: add to different regions at the same spot; split the batch"
+            )
+        seq, closes, _, _, _ = group[0]
+        lines = list(closes)
+        for _, _, block, _, _ in group:
+            lines.extend(block)
+        mods.append((at, at, seq, lines))
+
+    out = list(editor.lines)
+    for start, end, seq, lines in sorted(mods, key=lambda m: (m[0], m[2]), reverse=True):
+        out[start:end] = lines
+    return out, regions
+
+
+def body_arg(value):
+    return sys.stdin.read() if value == "-" else (value or "")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "cmd", choices=["list", "read", "set", "append", "add", "drop", "check", "batch"]
+    )
+    ap.add_argument("session")
+    ap.add_argument("path", nargs="?")
+    ap.add_argument("--body", help="new body text; use '-' to read the body from stdin")
+    args = ap.parse_args()
+
+    if args.cmd not in ("list", "check", "batch") and not args.path:
+        ap.error(f"{args.cmd} needs a region path")
+
+    editor = Editor(args.session)
+
+    if args.cmd == "batch":
+        if args.path or args.body:
+            ap.error("batch reads its edits from stdin; pass only the session")
+        ops = parse_batch(sys.stdin.read())
+        if not ops:
+            raise SystemExit("batch: no edits on stdin")
+        new_lines, regions = plan_batch(editor, ops)
+        editor.commit(new_lines)
+        editor.save()
+        state = (
+            "unclosed: " + ",".join(node.name for node in editor.stack)
+            if editor.stack
+            else "balanced"
+        )
+        print(
+            f"applied {len(ops)} {'edit' if len(ops) == 1 else 'edits'} ({regions} regions): "
+            f"{len(editor.lines)} lines, {state}"
+        )
         return
 
-    targets = resolve(entries, args.path)
+    if args.cmd == "list":
+        state = (
+            "unclosed: " + ",".join(node.name for node in editor.stack)
+            if editor.stack
+            else "balanced"
+        )
+        print(f"{len(editor.lines)} lines, {state}")
+        for path, node in editor.entries:
+            payload = f"  {node.payload[:60]}" if node.payload else ""
+            print(f"  {path}{payload}")
+        return
+
+    if args.cmd == "check":
+        why = check(editor.lines)
+        print(why or "ok")
+        raise SystemExit(1 if why else 0)
+
     if args.cmd == "read":
-        for node in targets:
-            sys.stdout.write(unescape(body_text(lines, node)))
+        for node in editor.targets(args.path, closed=False):
+            sys.stdout.write(unescape(body_text(editor.lines, node)))
         return
 
-    if args.cmd == "drop":
-        # Both markers go, or the open is left dangling and the file stops parsing.
-        doomed = set()
-        for node in targets:
-            if node.close_line is None:
-                raise SystemExit(f"{args.path} is unclosed; the file is mid-generation, try again shortly")
-            end = node.close_line
-            for i in range(node.open_line, end + 1):
-                doomed.add(i)
-        keep = [l for i, l in enumerate(lines) if i not in doomed]
-        why = check(keep, original)
-        if why:
-            raise SystemExit(f"refusing to write: {why}")
-        write_atomic(args.session, "".join(keep))
-        print(f"dropped {len(targets)} region(s)")
-        return
-
-    raw = sys.stdin.read() if args.body == "-" else (args.body or "")
-    edits = []
-    for node in targets:
-        if node.close_line is None:
-            raise SystemExit(f"{args.path} is unclosed; the file is mid-generation, try again shortly")
-        new = escape(raw) if args.cmd == "set" else body_text(lines, node).rstrip("\n") + "\n" + escape(raw)
-        edits.append((node.body_start, node.close_line, to_lines(new)))
-    keep = list(lines)
-    for start, end, body in sorted(edits, reverse=True):
-        keep[start:end] = body
-    why = check(keep, original)
-    if why:
-        raise SystemExit(f"refusing to write: {why}")
-    write_atomic(args.session, "".join(keep))
-    verb = "set" if args.cmd == "set" else "appended to"
-    print(f"{verb} {args.path} ({len(targets)} region(s))")
+    if args.cmd == "add":
+        _, message = editor.add(args.path, body_arg(args.body))
+    elif args.cmd == "drop":
+        _, message = editor.drop(args.path)
+    else:
+        _, message = editor.write(args.path, body_arg(args.body), append=(args.cmd == "append"))
+    editor.save()
+    print(message)
 
 
 if __name__ == "__main__":

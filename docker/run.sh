@@ -32,6 +32,11 @@ case "${1:-}" in
     ;;
   deploy)
     shift
+    no_deps=""
+    if [ "${1:-}" = "--no-deps" ]; then
+      no_deps="--no-deps"
+      shift
+    fi
     echo "building slopfile (release, in rust:1-slim)…"
     bin="$(mktemp)"
     trap 'rm -f "$bin"' EXIT
@@ -44,13 +49,17 @@ case "${1:-}" in
       rust:1-slim \
       sh -c 'cargo build --release --locked && cat /target/release/slopfile' > "$bin"
     chmod 755 "$bin"
-    compose up -d slopfile
+    if [ -n "$no_deps" ]; then
+      compose up -d --no-deps slopfile
+    else
+      compose up -d slopfile
+    fi
     compose cp "$bin" slopfile:/usr/local/bin/slopfile
     compose restart slopfile
     echo "deployed slopfile; container restarted"
     ;;
   *)
-    echo "usage: $0 {up|logs [svc]|shell|down|deploy}" >&2
+    echo "usage: $0 {up|logs [svc]|shell|down|deploy [--no-deps]}" >&2
     exit 1
     ;;
 esac

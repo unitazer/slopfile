@@ -33,7 +33,6 @@ fn yolo_cfg() -> AppConfig {
     abort_restart_server: false,
     llama_container: "test-llama".into(),
     subagent_max_depth: 2,
-    stream_idle_timeout_secs: 300,
   }
 }
 

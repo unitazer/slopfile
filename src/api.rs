@@ -7,11 +7,9 @@ use futures_util::StreamExt;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const KEEP_GOING_INTERVAL: Duration = Duration::from_millis(500);
-/// How long a stream may go without a frame before it counts as dead.
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -235,7 +233,6 @@ pub struct LlamaClient {
   endpoint: Endpoint,
   headers: reqwest::header::HeaderMap,
   client: reqwest::Client,
-  idle_timeout: Duration,
 }
 
 impl LlamaClient {
@@ -255,18 +252,6 @@ impl LlamaClient {
   }
 
   fn with_endpoint(endpoint: Endpoint, client: reqwest::Client) -> Self {
-    Self::with_endpoint_and_timeout(endpoint, client, DEFAULT_IDLE_TIMEOUT)
-  }
-
-  /// The same as `with_endpoint` but carrying a caller-chosen idle timeout. Every generation turn
-  /// resolves its provider through `for_provider`, so a timeout dropped there silently reverted
-  /// to the default -- which meant `stream_idle_timeout_secs` did nothing at all, and a model that
-  /// paused for longer than the default was cut off mid-answer.
-  fn with_endpoint_and_timeout(
-    endpoint: Endpoint,
-    client: reqwest::Client,
-    idle_timeout: Duration,
-  ) -> Self {
     // Build the map once rather than per request: a bad header name is a config error, and
     // catching it here means one clear message instead of a 431 on every turn.
     let headers = endpoint
@@ -292,7 +277,6 @@ impl LlamaClient {
       endpoint,
       headers,
       client,
-      idle_timeout,
     }
   }
 
@@ -311,25 +295,11 @@ impl LlamaClient {
       endpoint.headers.len(),
       endpoint.llama
     );
-    Ok(Self::with_endpoint_and_timeout(
-      endpoint,
-      self.client.clone(),
-      self.idle_timeout,
-    ))
-  }
-
-  #[cfg(test)]
-  pub(crate) fn idle_timeout_for_test(&self) -> Duration {
-    self.idle_timeout
+    Ok(Self::with_endpoint(endpoint, self.client.clone()))
   }
 
   pub fn endpoint(&self) -> &Endpoint {
     &self.endpoint
-  }
-
-  pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
-    self.idle_timeout = idle_timeout;
-    self
   }
 
   pub fn rest(&self) -> &reqwest::Client {
@@ -437,7 +407,6 @@ impl LlamaClient {
     let mut result = StreamResult::default();
     let mut acc = ToolCallAccumulator::default();
     let mut chunk_stream = stream_chunks(raw);
-    let mut last_data = Instant::now();
 
     loop {
       tokio::select! {
@@ -451,7 +420,6 @@ impl LlamaClient {
                   break;
               }
               let chunk = chunk.map_err(ApiError::from)?;
-              last_data = Instant::now();
               if let Some(usage) = &chunk.usage {
                   result.usage = Some(usage.clone());
               }
@@ -483,10 +451,6 @@ impl LlamaClient {
                   result.aborted = true;
                   self.cancel_generation().await;
                   break;
-              }
-              if last_data.elapsed() >= self.idle_timeout {
-                  self.cancel_generation().await;
-                  return Err(ApiError::Timeout(last_data.elapsed()));
               }
           }
       }
@@ -738,33 +702,6 @@ mod tests {
     }
   }
 
-  /// `for_provider` runs on every generation turn, so anything it drops is dropped for the whole
-  /// session. The idle timeout used to be one of those things: the setting was applied in `main`
-  /// and then thrown away here, leaving the hardcoded default -- so a model that paused longer
-  /// than that got cut off mid-answer and the setting appeared to do nothing.
-  #[test]
-  fn resolving_a_provider_keeps_the_configured_idle_timeout() {
-    let mut cfg = AppConfig::default();
-    cfg.providers.insert(
-      "p".to_string(),
-      crate::types::Provider {
-        base_url: "https://example.invalid/api".into(),
-        headers: Default::default(),
-        llama: false,
-        reasoning_style: Default::default(),
-      },
-    );
-    let client = dead_client().with_idle_timeout(Duration::from_secs(900));
-    let resolved = client
-      .for_provider(&cfg, Some("p"), &Default::default())
-      .unwrap();
-    assert_eq!(
-      resolved.idle_timeout_for_test(),
-      Duration::from_secs(900),
-      "a configured idle timeout must survive provider resolution"
-    );
-  }
-
   /// A gateway that sends `reasoning` as a content-block array must not cost us the whole answer.
   /// Reading it as a typed String fails deserialization of the entire chunk, which aborts the
   /// stream mid-generation and discards the text that had already arrived -- the exact failure
@@ -846,15 +783,26 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn stalled_stream_times_out() {
-    let client = dead_client().with_idle_timeout(Duration::from_millis(150));
+  async fn a_stalled_stream_is_not_timed_out() {
+    let client = dead_client();
     let sse = vec!["data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"];
+    let t0 = std::time::Instant::now();
     let result = client
-      .consume_stream(SlowBytesStream::new(sse), |_| {}, || true)
-      .await;
+      .consume_stream(
+        SlowBytesStream::new(sse),
+        |_| {},
+        || t0.elapsed().as_millis() < 400,
+      )
+      .await
+      .expect("stream");
     assert!(
-      matches!(result, Err(ApiError::Timeout(_))),
-      "stall must surface as a timeout: {result:?}"
+      result.aborted,
+      "keep_going should still be the only way out"
+    );
+    assert_eq!(result.content, "one");
+    assert!(
+      t0.elapsed() < std::time::Duration::from_millis(900),
+      "the abort check must not wait for another chunk"
     );
   }
 

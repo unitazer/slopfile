@@ -115,13 +115,6 @@ async fn main() {
     });
   }
 
-  let idle_secs = if app_cfg.stream_idle_timeout_secs == 0 {
-    u64::MAX
-  } else {
-    app_cfg.stream_idle_timeout_secs
-  };
-  let idle_timeout = Duration::from_secs(idle_secs);
-
   let busy: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
   let throttled: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
   let failures: Arc<Mutex<HashMap<PathBuf, u32>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -231,7 +224,7 @@ async fn main() {
       let parked = parked.clone();
       let parked_at_token = parked_at_token.clone();
       tokio::spawn(async move {
-        let client = LlamaClient::new(&cfg).with_idle_timeout(idle_timeout);
+        let client = LlamaClient::new(&cfg);
         match daemon::drive_file(&path, &cfg, &client).await {
           Ok(()) => {
             failures.lock().await.remove(&path);
