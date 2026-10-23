@@ -1279,8 +1279,8 @@ fn every_session_name_normalizes_once() {
     Path::new("/tmp").join("1.md")
   );
   assert_eq!(
-    control::session_name(Path::new("/tmp/research-007.md")),
-    "research-007"
+    control::session_name(Path::new("/tmp/draft-007.md")),
+    "draft-007"
   );
 }
 
@@ -1470,21 +1470,6 @@ async fn concurrent_writes_leave_the_file_intact() {
     parsed.render() == final_text,
     "the survivor is a fixed point"
   );
-}
-
-#[tokio::test]
-async fn research_asks_the_daemon_for_status_instead_of_reading_its_own_registry() {
-  // The driver is a different process, so `control::snapshot` here would always be empty.
-  let source = include_str!("../src/research.rs");
-  assert!(
-    !source.contains("control::snapshot"),
-    "research must not read this process's registry"
-  );
-  assert!(
-    source.contains("ask_status"),
-    "research must ask over the control channel"
-  );
-  assert!(source.contains("Cmd::Status"));
 }
 
 // ---- round-3 review regressions

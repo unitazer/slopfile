@@ -117,6 +117,15 @@ def build_tree(lines):
             name, payload = parse_name(line)
             if name is None:
                 continue
+            # `input` is the human's tail: a root that runs to EOF. The harness stops reading
+            # structure at that marker, so the live assistant stays open above it without the
+            # input becoming its child. Treating it as a child instead puts an extra close on the
+            # stack, and every edit made through that stack closes one container too many.
+            if name == INPUT:
+                while stack and stack[-1].name not in CONTAINERS:
+                    stack.pop()
+                roots.append(Node(name, payload, i, None))
+                break
             parent = stack[-1] if stack else None
             node = Node(name, payload, i, parent)
             (parent.children if parent else roots).append(node)

@@ -558,7 +558,7 @@ async fn run_generation_turn(
     // filling up. When reasoning tokens are billed out of that same allowance, a turn can stop
     // with nothing visible written at all -- and telling the model to prune its transcript would
     // be advice that cannot possibly help. `context_full` stays false here for the same reason:
-    // the research driver discards a whole attempt when it sees it.
+    // the output allowance ran out, not the context window.
     let by_reasoning = result
       .usage
       .as_ref()

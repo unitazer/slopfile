@@ -6,7 +6,6 @@ pub mod docker;
 pub mod flow;
 pub mod prompt;
 pub mod questions;
-pub mod research;
 pub mod session;
 mod sse;
 pub mod stream;

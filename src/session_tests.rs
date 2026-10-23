@@ -273,6 +273,44 @@ fn render_parse_round_trip() {
 }
 
 #[test]
+fn custom_assistant_regions_render_closed_and_round_trip() {
+  let file = session_file(&container(
+    "turn",
+    &format!(
+      "{}{}{}",
+      region("user", "hi"),
+      container(
+        "assistant",
+        &format!(
+          "{}{}",
+          region("reasoning", "think"),
+          region("scratchpad", "trying two approaches")
+        )
+      ),
+      result_region("c1", "bash", true, 1, "ok")
+    ),
+  ));
+  let (session, report) = parse(&file);
+  assert!(report.is_clean(), "{report:?}");
+  assert_eq!(
+    session.turns[0].rounds[0].assistant.custom,
+    vec![(
+      "scratchpad".to_string(),
+      "trying two approaches".to_string()
+    )]
+  );
+
+  let rendered = session.render();
+  let (parsed, report) = parse(&rendered);
+  assert!(report.is_clean(), "{report:?}\n{rendered}");
+  assert_eq!(parsed.turns[0].rounds[0].results.len(), 1);
+  assert_eq!(
+    parsed.turns[0].rounds[0].assistant.custom,
+    session.turns[0].rounds[0].assistant.custom
+  );
+}
+
+#[test]
 fn render_marks_the_open_section_and_leaves_it_unclosed() {
   let mut session = sample_session();
   session.turns.push(Turn::default());

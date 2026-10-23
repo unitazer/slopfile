@@ -3,3 +3,9 @@
 /shared/transcripts
 /workspace
 /result
+/shared/skills/*
+!/shared/skills/session-edit.py
+!/shared/skills/session-edit.md
+!/shared/skills/web-search.md
+!/shared/skills/thermo-nuclear-code-quality-review.md
+!/shared/skills/websearch.py

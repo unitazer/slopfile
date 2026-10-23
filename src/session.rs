@@ -896,7 +896,7 @@ impl Session {
           out.push_str(&close_line());
         }
         for (name, body) in &round.assistant.custom {
-          out.push_str(&leaf_inner(body, name, None, false));
+          out.push_str(&leaf(body, name, None));
         }
         if !open_asst {
           out.push_str(&close_line());
