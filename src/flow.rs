@@ -110,53 +110,33 @@ pub fn inject_subagent_report(session: &mut Session, name: &str, report: &str, o
   true
 }
 
-pub enum ToolPass {
-  Outcomes {
-    outcomes: Vec<ToolOutcome>,
-    solved: bool,
-  },
-  Question,
-}
-
 pub async fn execute_tool_calls(
   calls: &[ToolCall],
   session: &Session,
   cfg: &AppConfig,
   path: &Path,
-) -> Result<ToolPass, String> {
-  if calls.iter().any(|c| c.name == "question") {
-    return Ok(ToolPass::Question);
-  }
+) -> Result<Vec<ToolOutcome>, String> {
   let mut outcomes = Vec::new();
-  let mut solved = false;
   for call in calls {
     let started = std::time::Instant::now();
     let timeout = session
       .config
       .tool_timeout_ms
       .unwrap_or(cfg.tool_timeout_ms);
-    let (result, is_solve) = if !session.config.allows_tool(&call.name) {
-      (
-        ToolResult::err(format!("{}: tool is disabled in this session", call.name)),
-        false,
-      )
+    let result = if !session.config.allows_tool(&call.name) {
+      ToolResult::err(format!("{}: tool is disabled in this session", call.name))
     } else if call.name == "subagent" {
-      (handle_subagent_call(path, call, cfg), false)
-    } else if call.name == "solve" {
-      (handle_solve_call(call), true)
+      handle_subagent_call(path, call, cfg)
     } else {
-      (
-        tools::run(
-          &call.name,
-          &call.arguments,
-          PathBuf::from(&cfg.workdir),
-          timeout,
-          &[PathBuf::from(&cfg.skills_dir)],
-          Some(path),
-        )
-        .await,
-        false,
+      tools::run(
+        &call.name,
+        &call.arguments,
+        PathBuf::from(&cfg.workdir),
+        timeout,
+        &[PathBuf::from(&cfg.skills_dir)],
+        Some(path),
       )
+      .await
     };
     let ms = started.elapsed().as_millis();
     outcomes.push(ToolOutcome {
@@ -166,12 +146,8 @@ pub async fn execute_tool_calls(
       ms: ms as u64,
       output: result.output,
     });
-    if is_solve && result.ok {
-      solved = true;
-      break;
-    }
   }
-  Ok(ToolPass::Outcomes { outcomes, solved })
+  Ok(outcomes)
 }
 
 fn handle_subagent_call(parent: &Path, call: &ToolCall, cfg: &AppConfig) -> ToolResult {
@@ -197,19 +173,6 @@ fn handle_subagent_call(parent: &Path, call: &ToolCall, cfg: &AppConfig) -> Tool
       child.display()
     )),
     Err(e) => ToolResult::err(e),
-  }
-}
-
-fn handle_solve_call(call: &ToolCall) -> ToolResult {
-  let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
-    Ok(v) => v,
-    Err(e) => return ToolResult::err(format!("solve: bad arguments json: {e}")),
-  };
-  match args.get("summary").and_then(serde_json::Value::as_str) {
-    Some(s) if !s.trim().is_empty() => ToolResult::ok(format!(
-      "campaign marked as solved: {s}\nThe harness takes over from here."
-    )),
-    _ => ToolResult::err("solve: missing non-empty string argument \"summary\""),
   }
 }
 

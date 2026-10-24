@@ -8,13 +8,15 @@ services:
       memlock: -1
     volumes:
       - ../shared/models:/models:ro
+      - ../shared/llama-cache:/cache
     command: [
       "--models-preset", "/models/presets.ini",
       "--models-max", "2",
       #"--mlock",
       #"--no-mmap",
       "--host", "0.0.0.0",
-      "--port", "8080"
+      "--port", "8080",
+      "--slot-save-path", "/cache",
     ]
     ports:
       - "8080:8080"
@@ -48,7 +50,7 @@ services:
       SLOPFILE_SKILLS_DIR: /shared/skills
       SLOPFILE_WORKDIR: /workspace
       SF_ADDR: 0.0.0.0:8787
-      RUST_LOG: slopfile=info,warn
+      RUST_LOG: slopfile=debug
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       # `${...:?}` makes a missing key an error at `docker compose up` rather than an empty
       # string in the container, which would otherwise reach the model host as

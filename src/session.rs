@@ -135,15 +135,6 @@ pub struct Assistant {
   pub custom: Vec<(String, String)>,
 }
 
-impl Assistant {
-  pub fn has_output(&self) -> bool {
-    self.reasoning.is_some()
-      || self.text.is_some()
-      || !self.calls.is_empty()
-      || !self.custom.is_empty()
-  }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultHeader {
   #[serde(default)]
@@ -201,13 +192,6 @@ impl Turn {
       && self.question.is_none()
   }
 
-  pub fn has_output(&self) -> bool {
-    self
-      .rounds
-      .iter()
-      .any(|r| r.assistant.has_output() || !r.results.is_empty())
-  }
-
   /// The model still owes a reply when its last round came back with tool results it has not
   /// reacted to yet. A round that produced nothing owes nothing: retrying an empty response just
   /// burns the GPU forever. An interrupted round is caught by `Session::turn_in_progress`.
@@ -216,11 +200,6 @@ impl Turn {
       Some(round) => !round.results.is_empty(),
       None => self.user.is_some() || !self.notes.is_empty(),
     }
-  }
-
-  /// A turn is finished once its last round answered everything it was asked to.
-  pub fn is_complete(&self) -> bool {
-    !self.needs_reply()
   }
 }
 
@@ -1099,10 +1078,6 @@ impl Session {
       .is_some_and(|path| path.first().is_some_and(|n| n == TURN))
   }
 
-  pub fn dangling(&self) -> bool {
-    self.open.is_some()
-  }
-
   pub fn section(&self) -> Option<&'static str> {
     match self.open.as_deref().and_then(|path| path.last()) {
       Some(n) if n == REASONING => Some(REASONING),
@@ -1119,19 +1094,10 @@ impl Session {
     !self.input.trim().is_empty()
   }
 
-  pub fn last_turn_complete(&self) -> bool {
-    !self.turn_in_progress()
-  }
-
   /// True when the model owes the user a reply: a dangling stream, a user message with nothing
   /// after it, or tool results it has not reacted to yet.
   pub fn needs_generation(&self) -> bool {
     self.turn_in_progress() || self.turns.last().is_some_and(Turn::needs_reply)
-  }
-
-  /// True when nothing is pending anywhere: no open region, no typed input, no owed reply.
-  pub fn is_finished(&self) -> bool {
-    !self.dangling() && !self.has_input() && self.turns.last().is_some_and(Turn::is_complete)
   }
 
   pub fn promote_input(&mut self) -> bool {
@@ -1150,14 +1116,6 @@ impl Session {
       }),
     }
     true
-  }
-
-  pub fn resume_round(&mut self) {
-    let round = self.last_round();
-    round.assistant.reasoning = None;
-    round.assistant.text = None;
-    round.results.clear();
-    self.open = open_assistant();
   }
 
   pub fn begin_round(&mut self) {
@@ -1231,7 +1189,6 @@ impl Session {
     let (calls, results) = pair_calls_with_results(calls, results);
     round.assistant.calls = calls;
     round.results = results;
-    let _ = round;
     self.shorten_ids();
     self.close_section();
     self.open = None;
@@ -1270,25 +1227,6 @@ impl Session {
       by,
       text: text.into(),
     });
-  }
-
-  pub fn add_result(&mut self, result: ToolOutcome) {
-    if self.turns.is_empty() {
-      self.turns.push(Turn::default());
-    }
-    let turn = self.turns.last_mut().expect("turn");
-    if turn.rounds.is_empty() {
-      turn.rounds.push(Round::default());
-    }
-    let round = turn.rounds.last_mut().expect("round");
-    if !round.results.is_empty() {
-      turn.rounds.push(Round {
-        assistant: Assistant::default(),
-        results: vec![result],
-      });
-      return;
-    }
-    round.results.push(result);
   }
 
   /// Asking a question is a tool call with a result that says it is waiting, so the call/result
@@ -1395,7 +1333,7 @@ fn open_of(stack: &[Node]) -> Vec<String> {
 /// Two assistant messages in a row (a model note followed by a reply, or a turn whose user region
 /// was pruned) are folded into one, because that sequence is not a valid conversation.
 /// Every call must get exactly one result, with a unique id. A model that omits ids, repeats one,
-/// or (via an early `break` such as `solve`) leaves calls unexecuted would otherwise produce a
+/// or (via a `question` that ends the round early) leaves calls unexecuted would otherwise produce a
 /// message stream the server rejects.
 /// Map an id onto `c1`, `c2`, ... within a round, reusing the mapping for ids already seen so a
 /// call and its result keep agreeing.

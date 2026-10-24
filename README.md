@@ -23,7 +23,7 @@ also a big note is that this is not intended to run outside of docker because th
 
 all of the functionality related to llm self context editing is inspired by https://youtube.com/watch?v=aYGN4yDYDvk
 the claims made in the video might not work for this thing though, but i belive that its flexible enough to just be solved by prompting enough. see prompt.rs for the default system prompt. 
-the file format that i have is a little stupid because i didnt build it from ground up to be llm readable, only human readable, but by the time i got to actually having the model edit its own context the format became unreadable shit anyways so ¯\_(ツ)_/¯ 
+the file format that i have is a little stupid because i didnt build it from ground up to be llm readable, only human readable, but by the time i got to actually having the model edit its own context the format became unreadable shit anyways so ¯\\_(ツ)_/¯ 
 because the file format is rather ass, there is a python tool for parsing it + skill included in /shared/skills by default. its probably possible to get the model to edit it if you ask idk tho its pretty good as is i think
 also if you dont tell the model to cut down its own context its pretty unlikely for it to just remember randomly to do that on its own
 # running
@@ -111,6 +111,7 @@ on the llama.cpp routes (`/models/load`, `/abort`, `/tokenize`) that hosted
 endpoints skip.
 
 # misc
-there is a known issue of the clanker running out of max token output sometimes, not sure if thats something i can fix
-this does not implement any image/video reading capabilities yet, maybe one day ill get deepseek to do it with something like @/path/to/image, but that messes with the entire context window as a fole thing, but i also dont want to have it as a base64 string or anything like that. the only real way of doing this entirely in file that i see would be to store the relatively low res latent state of the vision encoder, but i dont think there is an api for that
-the file format should have been json instead of the markdown comment bullshit i went with, maybe one day ill get deepseek to rewrite that too. a moddified version of json would go hard. rn its some weird pseudo json but instead of {} "" [] i have the dumb comment marker
+- there is a known issue of the clanker running out of max token output sometimes, not sure if thats something i can fix
+- if a model edits its own context window so that its some custom tag like "notes" at the end, execution stalls
+- this does not implement any image/video reading capabilities yet, maybe one day ill get deepseek to do it with something like @/path/to/image, but that messes with the entire context window as a fole thing, but i also dont want to have it as a base64 string or anything like that. the only real way of doing this entirely in file that i see would be to store the relatively low res latent state of the vision encoder, but i dont think there is an api for that
+- the file format should have been json instead of the markdown comment bullshit i went with, maybe one day ill get deepseek to rewrite that too. a moddified version of json would go hard. rn its some weird pseudo json but instead of {} "" [] i have the dumb comment marker

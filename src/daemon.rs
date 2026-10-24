@@ -619,7 +619,7 @@ async fn run_generation_turn(
       // `question` is not advertised to subagents, so reaching here means the model invented it.
       // Recording a default answer would put a decision in the report that nobody ever made.
       if flow::is_subagent_path(path) {
-        let (mut outcomes, _) = run_calls(&streamed, &result.tool_calls[..at], cfg, path).await?;
+        let mut outcomes = run_calls(&streamed, &result.tool_calls[..at], cfg, path).await?;
         outcomes.push(ToolOutcome {
           id: question.id.clone(),
           name: "question".to_string(),
@@ -642,14 +642,7 @@ async fn run_generation_turn(
       // Calls that shared the message with the question still run; the question itself is recorded
       // as a result that says it is waiting, and any call left over gets an honest placeholder.
       let before = &result.tool_calls[..at];
-      let (mut outcomes, solved) = run_calls(&streamed, before, cfg, path).await?;
-      if solved {
-        control::update(name, |s| {
-          s.solved = true;
-          s.phase = Phase::Idle;
-        });
-        info!("✓ {path:?}: campaign marked solved");
-      }
+      let mut outcomes = run_calls(&streamed, before, cfg, path).await?;
       if tell_ctx {
         flow::annotate_context_size(&mut outcomes, ctx_tokens);
       }
@@ -658,22 +651,12 @@ async fn run_generation_turn(
       transcript::save(path, &streamed)?;
       return Ok(TurnOutcome::AwaitsNextTurn);
     }
-    let (mut outcomes, solved) = run_calls(&streamed, &result.tool_calls, cfg, path).await?;
+    let mut outcomes = run_calls(&streamed, &result.tool_calls, cfg, path).await?;
     if tell_ctx {
       flow::annotate_context_size(&mut outcomes, ctx_tokens);
     }
     streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
     transcript::save(path, &streamed)?;
-    if solved {
-      control::update(name, |s| {
-        s.solved = true;
-        s.phase = Phase::Idle;
-      });
-      streamed.close_turn();
-      transcript::save(path, &streamed)?;
-      info!("✓ {path:?}: campaign marked solved");
-      return Ok(TurnOutcome::Done);
-    }
     info!("→ {path:?}: {} tool call(s) executed", outcomes.len());
     return Ok(TurnOutcome::AwaitsNextTurn);
   }
@@ -690,14 +673,11 @@ pub(crate) async fn run_calls(
   calls: &[crate::types::ToolCall],
   cfg: &AppConfig,
   path: &Path,
-) -> Result<(Vec<session::ToolOutcome>, bool), String> {
+) -> Result<Vec<session::ToolOutcome>, String> {
   if calls.is_empty() {
-    return Ok((Vec::new(), false));
+    return Ok(Vec::new());
   }
-  match flow::execute_tool_calls(calls, session, cfg, path).await? {
-    flow::ToolPass::Outcomes { outcomes, solved } => Ok((outcomes, solved)),
-    flow::ToolPass::Question => Ok((Vec::new(), false)),
-  }
+  flow::execute_tool_calls(calls, session, cfg, path).await
 }
 
 pub(crate) fn settle_tool_round(

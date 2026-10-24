@@ -23,7 +23,6 @@ pub struct SessionState {
   pub abort: bool,
   pub parked: bool,
   pub running: bool,
-  pub solved: bool,
   pub context_full: bool,
   pub delivered: bool,
   pub phase: Phase,
@@ -52,7 +51,6 @@ impl Default for SessionState {
       abort: false,
       parked: false,
       running: false,
-      solved: false,
       context_full: false,
       delivered: false,
       phase: Phase::Idle,
@@ -117,7 +115,6 @@ impl SessionState {
       parked: self.parked,
       blocked: self.blocked,
       stopped: self.stopped,
-      solved: self.solved,
       context_full: self.context_full,
       pending_questions: self.pending_questions,
       model: self.model.clone(),
@@ -205,7 +202,6 @@ pub struct Status {
   pub blocked: bool,
   /// The user asked for this session to stop. Un-parking must not quietly undo that.
   pub stopped: bool,
-  pub solved: bool,
   pub context_full: bool,
   pub pending_questions: usize,
   pub model: String,
@@ -216,7 +212,7 @@ impl std::fmt::Display for Status {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     write!(
       f,
-      "task {} phase={} running={} armed={} abort={} parked={} blocked={} stopped={} solved={} context_full={} pending_questions={} model={} endpoint={}",
+      "task {} phase={} running={} armed={} abort={} parked={} blocked={} stopped={} context_full={} pending_questions={} model={} endpoint={}",
       self.session,
       self.phase.label(),
       self.running,
@@ -225,7 +221,6 @@ impl std::fmt::Display for Status {
       self.parked,
       self.blocked,
       self.stopped,
-      self.solved,
       self.context_full,
       self.pending_questions,
       self.model,

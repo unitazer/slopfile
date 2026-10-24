@@ -374,14 +374,12 @@ fn turn_complete_iff_closed() {
   let (session, report) = parse(&closed);
   assert!(report.is_clean(), "{report:?}");
   assert!(!session.turn_in_progress());
-  assert!(session.last_turn_complete());
   assert_eq!(session.open, None);
 
   let open =
     format!("{FENCE}{BEGIN_LINE}<!-- slopfile:turn -->\n<!-- slopfile:assistant -->\nthinking\n");
   let (session, _) = parse(&open);
   assert!(session.turn_in_progress());
-  assert!(!session.last_turn_complete());
   assert_eq!(
     session.open.as_deref(),
     Some(["turn".to_string(), "assistant".to_string()].as_slice())
@@ -450,7 +448,7 @@ fn unknown_region_is_reported() {
   assert!(report.problems()[0].contains("unknown region `thinkin`"));
   assert_eq!(session.turns.len(), 0, "unknown regions are not turns");
   assert!(
-    !session.dangling(),
+    session.open.is_none(),
     "the region was closed, so nothing dangles"
   );
 }
@@ -872,7 +870,7 @@ fn the_fence_can_carry_a_key_and_survives_the_round_trip() {
     rendered.contains(r#"headers = { "Authorization" = "Bearer sk-or-v1-\"quoted\"", "HTTP-Referer" = "http://localhost" }"#),
     "{rendered}"
   );
-  assert_eq!(config_from_fence(&rendered), config);
+  assert_eq!(fence_config(&rendered).unwrap().unwrap(), config);
 }
 
 /// A provider name or model containing a quote used to write a fence that would not parse -- and
@@ -888,14 +886,14 @@ fn awkward_provider_and_model_names_survive_a_round_trip() {
   };
   let rendered = toml_fence(&config);
   assert!(
-    !config_from_fence(&rendered)
+    !fence_config(&rendered).unwrap().unwrap()
       .provider
       .as_deref()
       .unwrap()
       .is_empty(),
     "{rendered}"
   );
-  assert_eq!(config_from_fence(&rendered), config);
+  assert_eq!(fence_config(&rendered).unwrap().unwrap(), config);
 }
 
 #[test]
@@ -920,11 +918,11 @@ fn the_fence_carries_the_provider_alongside_the_model() {
     rendered.contains("provider = \"openrouter\"\nmodel = \"qwen3.8-27b\"\n"),
     "the provider is the outer choice and belongs above the model: {rendered}"
   );
-  assert_eq!(config_from_fence(&rendered), config);
+  assert_eq!(fence_config(&rendered).unwrap().unwrap(), config);
 
   // A fence that never heard of providers still parses, with no provider claimed.
   let legacy = "```toml\nmodel = \"qwen3.8-27b\"\nthinking = \"auto\"\n```\n";
-  assert_eq!(config_from_fence(legacy).provider, None);
+  assert_eq!(fence_config(legacy).unwrap().unwrap().provider, None);
 }
 
 #[test]
@@ -971,10 +969,9 @@ fn closing_a_turn_leaves_the_file_complete() {
   assert!(session.turn_in_progress());
   session.close_turn();
   assert!(!session.turn_in_progress());
-  assert!(session.last_turn_complete());
   let (parsed, report) = parse(&session.render());
   assert!(report.is_clean(), "{report:?}");
-  assert!(parsed.last_turn_complete());
+  assert!(!parsed.turn_in_progress());
 }
 
 #[test]
@@ -1288,7 +1285,7 @@ fn every_call_gets_exactly_one_result() {
 
 #[test]
 fn a_call_the_harness_skips_still_gets_a_result() {
-  // `solve` stops the round early, so later calls have no outcome of their own.
+  // A question stops the round early, so later calls have no outcome of their own.
   let mut session = Session::default();
   session.turns.push(Turn {
     custom: Vec::new(),
@@ -1300,7 +1297,7 @@ fn a_call_the_harness_skips_still_gets_a_result() {
     vec![
       Call {
         id: "c1".into(),
-        name: "solve".into(),
+        name: "question".into(),
         arguments: "{}".into(),
       },
       Call {
@@ -1311,10 +1308,10 @@ fn a_call_the_harness_skips_still_gets_a_result() {
     ],
     vec![ToolOutcome {
       id: "c1".into(),
-      name: "solve".into(),
+      name: "question".into(),
       ok: true,
       ms: 1,
-      output: "solved".into(),
+      output: "waiting for an answer".into(),
     }],
   );
   let messages = session.request_messages();

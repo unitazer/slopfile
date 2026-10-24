@@ -7,7 +7,7 @@ use crate::control::{self, Cmd, Req, SessionState};
 use crate::daemon::{Action, next_action, run_calls, settle_tool_round};
 use crate::docker::restart_llama_server;
 use crate::flow::{
-  ToolPass, execute_tool_calls, has_report, questions_resolvable, resolve_questions,
+  execute_tool_calls, has_report, questions_resolvable, resolve_questions,
   session_template, spawn_subagent, subagent_depth,
 };
 use crate::session::{self, Session};
@@ -112,23 +112,16 @@ fn last_text(session: &Session) -> Option<&str> {
     .and_then(|r| r.assistant.text.as_deref())
 }
 
-async fn tool_round(path: &Path, cfg: &AppConfig, calls: &[ToolCall]) -> (Session, bool) {
+async fn tool_round(path: &Path, cfg: &AppConfig, calls: &[ToolCall]) -> Session {
   let mut session = load(path);
   if !session.turn_in_progress() {
     session.begin_round();
   }
   session.push_text("working on it");
   write_session(path, &session);
-  let pass = execute_tool_calls(calls, &session, cfg, path)
+  let mut outcomes = execute_tool_calls(calls, &session, cfg, path)
     .await
     .expect("tools run");
-  let ToolPass::Outcomes {
-    mut outcomes,
-    solved,
-  } = pass
-  else {
-    panic!("expected outcomes");
-  };
   let calls: Vec<session::Call> = calls
     .iter()
     .map(|c| session::Call {
@@ -139,7 +132,7 @@ async fn tool_round(path: &Path, cfg: &AppConfig, calls: &[ToolCall]) -> (Sessio
     .collect();
   let settled = settle_tool_round(session, calls, &mut outcomes, path);
   write_session(path, &settled);
-  (settled, solved)
+  settled
 }
 
 #[test]
@@ -487,7 +480,6 @@ fn session_template_has_default_header_and_prompt() {
   assert!(text.contains(
     "tools = [\"read\", \"write\", \"edit\", \"bash\", \"grep\", \"find\", \"ls\", \"question\", \"subagent\"]"
   ));
-  assert!(!text.contains("solve"), "solve is campaign-only: {text}");
   assert!(text.contains("<!-- slopfile:begin -->"), "{text}");
   assert!(text.contains("<!-- slopfile:system -->"), "{text}");
   assert!(text.ends_with("<!-- slopfile:input -->\n"), "{text}");
@@ -611,20 +603,19 @@ async fn tool_calls_enforce_exclusions_and_spawn_subagents() {
   session.promote_input();
   write_session(&parent, &session);
 
-  let (after, solved) = tool_round(
+  let after = tool_round(
     &parent,
     &cfg,
     &[ToolCall::new("1", "bash", r#"{"command":"echo hi"}"#)],
   )
   .await;
-  assert!(!solved);
   assert!(
     last_results(&after)[0].output.contains("tool is disabled"),
     "{:?}",
     last_results(&after)
   );
 
-  let (after, _) = tool_round(
+  let after = tool_round(
     &parent,
     &cfg,
     &[ToolCall::new(
@@ -636,36 +627,6 @@ async fn tool_calls_enforce_exclusions_and_spawn_subagents() {
   .await;
   assert!(last_results(&after)[0].output.contains("spawned at"));
   assert!(dir.join("blocks.sub-01.md").exists());
-}
-
-#[tokio::test]
-async fn the_solve_tool_is_gated_by_the_allowlist() {
-  let dir = scratch("solve");
-  let cfg = yolo_cfg();
-  let parent = dir.join("solve.md");
-  let mut session = session_template(&cfg, &[]);
-  session.config.tools = Some(vec!["read".to_string(), "bash".to_string()]);
-  write_session(&parent, &session);
-
-  let (_, solved) = tool_round(
-    &parent,
-    &cfg,
-    &[ToolCall::new("2", "solve", r#"{"summary":"done"}"#)],
-  )
-  .await;
-  assert!(!solved, "solve is not in this session's allowlist");
-
-  let mut allowed = load(&parent);
-  allowed.config.tools = Some(vec!["solve".to_string()]);
-  write_session(&parent, &allowed);
-  let (after, solved) = tool_round(
-    &parent,
-    &cfg,
-    &[ToolCall::new("3", "solve", r#"{"summary":"done"}"#)],
-  )
-  .await;
-  assert!(solved);
-  assert!(last_results(&after)[0].output.contains("marked as solved"));
 }
 
 #[tokio::test]
@@ -688,7 +649,7 @@ async fn model_edits_of_its_own_context_file_are_synced() {
     )})
     .to_string(),
   );
-  let (after, _) = tool_round(&session, &cfg, &[call]).await;
+  let after = tool_round(&session, &cfg, &[call]).await;
   let text = after.render();
   assert_eq!(
     last_text(&after),
@@ -704,7 +665,7 @@ async fn model_edits_of_its_own_context_file_are_synced() {
     &json!({"command": format!("printf 'everything is gone\\n' > {}", session.display())})
       .to_string(),
   );
-  let (rolled, _) = tool_round(&session, &cfg, &[wipe]).await;
+  let rolled = tool_round(&session, &cfg, &[wipe]).await;
   let results = last_results(&rolled);
   assert!(
     results[0].output.contains("context edit rolled back"),
@@ -1072,7 +1033,7 @@ async fn tool_calls_next_to_a_question_are_still_executed_and_recorded() {
   write_session(&path, &session);
 
   let at = calls.iter().position(|c| c.name == "question").unwrap();
-  let (mut outcomes, _) = run_calls(&session, &calls[..at], &cfg, &path)
+  let mut outcomes = run_calls(&session, &calls[..at], &cfg, &path)
     .await
     .expect("before the question");
   let call_regions: Vec<session::Call> = calls
@@ -1144,8 +1105,8 @@ fn only_the_tools_the_session_allows_are_advertised() {
   }
   assert!(!names.iter().any(|n| n == "subagent" || n == "question"));
 
-  cfg.config.tools = Some(vec!["solve".to_string()]);
-  cfg.config.tools_excluded = vec!["solve".to_string()];
+  cfg.config.tools = Some(vec!["read".to_string()]);
+  cfg.config.tools_excluded = vec!["read".to_string()];
   assert!(
     crate::tools::advertised(&cfg.config).is_empty(),
     "an excluded tool is not advertised even when allowlisted"

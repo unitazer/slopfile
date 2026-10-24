@@ -320,9 +320,16 @@ impl LlamaClient {
     let mut last_err = String::new();
     for path in ["models/load", "v1/models/load"] {
       let url = self.endpoint.raw_url(path);
+      tracing::debug!("sending request {body:#?} to {url}");
       match self.request(&url).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => return,
-        Ok(resp) => last_err = format!("{}: HTTP {}", url, resp.status()),
+        Ok(resp) => {
+          let status = resp.status();
+          tracing::debug!("response from {url}: status:{status:?}");
+          if status.is_success() {
+            return;
+          }
+          last_err = format!("{}: HTTP {}", url, status);
+        }
         Err(e) => last_err = format!("{url}: {e}"),
       }
     }
@@ -372,6 +379,7 @@ impl LlamaClient {
     }
 
     let url = self.endpoint.url("chat/completions");
+    tracing::debug!("sending request {body:#?} to {url}");
     let resp = tokio::time::timeout(
       std::time::Duration::from_secs(60),
       self.request(&url).json(&body).send(),
@@ -387,8 +395,10 @@ impl LlamaClient {
       // almost never carries it.
       let retry_after = resp.headers().contains_key(reqwest::header::RETRY_AFTER);
       let snippet = resp.text().await.unwrap_or_default();
+      tracing::warn!("request failed: status:{status:?} snippet:{snippet}");
       return Err(ApiError::NonOkStatus(status.as_u16(), snippet, retry_after));
     }
+    tracing::debug!("response from {url}: status:{status:?}");
 
     self
       .consume_stream(resp.bytes_stream(), on_event, keep_going)
@@ -420,6 +430,7 @@ impl LlamaClient {
                   break;
               }
               let chunk = chunk.map_err(ApiError::from)?;
+              tracing::debug!("response chunk: {chunk:?}");
               if let Some(usage) = &chunk.usage {
                   result.usage = Some(usage.clone());
               }
@@ -472,13 +483,14 @@ impl LlamaClient {
       return;
     }
     let url = self.endpoint.raw_url("abort");
+    tracing::debug!("sending request to {url}");
     match self
       .request(&url)
       .timeout(std::time::Duration::from_millis(2000))
       .send()
       .await
     {
-      Ok(_) => tracing::debug!("cancel_generation: {url} → ok"),
+      Ok(resp) => tracing::debug!("response from {url}: status:{:?}", resp.status()),
       Err(e) => tracing::warn!("cancel_generation: {url}: {e}"),
     }
   }

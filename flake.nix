@@ -20,6 +20,7 @@
           docker
           docker-compose
           neovim
+          rustup
         ];
         shellHook = ''
           export DOCKER_CLI_PLUGINS_DIR="${pkgs.docker-compose}/libexec/docker/cli-plugins"

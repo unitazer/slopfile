@@ -116,17 +116,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
       }),
     ),
     tool_def(
-      "solve",
-      "End the optimization campaign. Call this ONLY when you are certain nothing worthwhile remains to explore and the problem is solved as defined by the task. Requires a summary of the final state.",
-      json!({
-          "type": "object",
-          "properties": {
-              "summary": { "type": "string", "description": "Short summary of why the problem is considered solved / nothing is left to explore" }
-          },
-          "required": ["summary"]
-      }),
-    ),
-    tool_def(
       "question",
       "Ask the user multiple questions. Blocks until the user answers; not executed directly by the tool runner.",
       json!({
@@ -185,7 +174,6 @@ pub async fn run(
     "find" => find(&workdir, &args),
     "ls" => ls(&workdir, &args),
     "question" => ToolResult::err("question tool is handled by the agent loop, not executed here"),
-    "solve" => ToolResult::err("solve is handled by the agent loop, not executed here"),
     other => ToolResult::err(format!("unknown tool: {other}")),
   }
 }
