@@ -323,9 +323,7 @@ pub struct StreamResult {
 pub enum StreamEvent {
   Text(String),
   Reasoning(String),
-  #[allow(dead_code)]
   ToolCallFragment(SseToolCallDelta),
-  #[allow(dead_code)]
   Done(StreamResult),
 }
 

@@ -90,10 +90,10 @@ pub(crate) fn record_provider_failure(
   }
   // Only a refusal is the provider saying no. A timeout or a dropped connection is a different
   // thing entirely, and promising "it will come back on the next send" there is advice that can be
-  // wrong -- a stream that died mid-generation may have lost the turn it was writing.
-  // A 408, a 425, or anything with `Retry-After` is a refusal that expires, not a dropped
-  // connection. Describing it as the latter sends the user looking at their network instead of at
-  // the rate limit that just hit them.
+  // wrong -- a stream that died mid-generation may have lost the turn it was writing. A 408, a
+  // 425, or anything with `Retry-After` is a refusal that expires, not a dropped connection;
+  // describing it as the latter sends the user looking at their network instead of at the rate
+  // limit that just hit them.
   let is_refusal = matches!(e, ApiError::NonOkStatus(..));
   let note = if e.is_context_overflow() {
     // The single most likely first-turn failure on a hosted endpoint, and the one case where
@@ -213,7 +213,7 @@ pub(crate) fn record_config_failure(path: &Path, e: &str) -> Result<(), String> 
 /// in `bash` made a correctly-backgrounded job inherit the pipe, so the call hung to timeout and
 /// then killed the job it had just launched, and the model responded the only way it could -- by
 /// polling in 28-second sleeps. Every poll was a turn, so a 23-call session spent its whole budget
-/// watching a job that had already finished. The bug is fixed (2d56f21); the scar was not, and by
+/// watching a job that had already finished. The bug is long fixed; the scar was not, and by
 /// then a turn was worth ~5s on a hosted model, so the cap was stopping legitimate work.
 ///
 /// `AppConfig::burst_max_turns` is still there for anyone who wants a ceiling -- it defaults to
@@ -221,7 +221,6 @@ pub(crate) fn record_config_failure(path: &Path, e: &str) -> Result<(), String> 
 pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> Result<(), String> {
   let name = control::session_name(path);
   let is_sub = flow::is_subagent_path(path);
-  let eff_cfg = cfg.clone();
   let mut turns = 0;
   let token_at_entry = control::update(&name, |s| s.arm_token());
   loop {
@@ -289,9 +288,9 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       // so waiting for an armed flag would wedge it after one round and hang the parent that is
       // blocked on its report. This is about liveness, not about answering questions for it.
     }) || is_sub
-      || eff_cfg.confirmations == Confirmations::Yolo;
+      || cfg.confirmations == Confirmations::Yolo;
 
-    match next_action(&session, &eff_cfg, armed) {
+    match next_action(&session, &cfg, armed) {
       Action::Idle => {
         control::update(&name, |s| {
           s.phase = Phase::Idle;
@@ -304,7 +303,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
         return Ok(());
       }
       Action::ResolveQuestions => {
-        if flow::resolve_questions(&mut session, &eff_cfg)? {
+        if flow::resolve_questions(&mut session, &cfg)? {
           transcript::save(path, &session)?;
           continue;
         }
@@ -318,7 +317,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       Action::Generate => {}
     }
 
-    match run_generation_turn(path, session, &eff_cfg, client, &name).await? {
+    match run_generation_turn(path, session, &cfg, client, &name).await? {
       TurnOutcome::Done => {
         control::update(&name, |s| s.settle(token_at_entry));
         return Ok(());
@@ -637,8 +636,6 @@ async fn run_generation_turn(
         transcript::save(path, &streamed)?;
         return Ok(TurnOutcome::Done);
       }
-      // Calls that shared the message with the question still have to happen, or the model is
-      // later shown an answer with no record that it ever asked for them.
       // Calls that shared the message with the question still run; the question itself is recorded
       // as a result that says it is waiting, and any call left over gets an honest placeholder.
       let before = &result.tool_calls[..at];

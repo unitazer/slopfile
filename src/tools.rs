@@ -464,60 +464,37 @@ async fn bash(workdir: &Path, args: &Value, timeout_ms: u64) -> ToolResult {
   let truncated = out.len() > BASH_OUTPUT_CAP || err.len() > BASH_OUTPUT_CAP;
   let out = cap_string(out);
   let err = cap_string(err);
-  let outcome = Some((out, err, status, truncated));
-  match outcome {
-    None => {
-      let group_id = child.id();
-      let _ = child.kill().await;
-      if let Some(id) = group_id {
-        let _ = std::process::Command::new("kill")
-          .args(["-9", &format!("-{id}")])
-          .stderr(Stdio::null())
-          .status();
-      }
-      ToolResult::err(format!(
-        "bash: timeout after {timeout_ms}ms, process killed: {command}"
-      ))
+
+  let mut combined = out;
+  if !err.is_empty() {
+    if !combined.is_empty() {
+      combined.push('\n');
     }
-    Some((stdout_s, stderr_s, status, truncated)) => {
-      let mut combined = stdout_s;
-      if !stderr_s.is_empty() {
-        if !combined.is_empty() {
-          combined.push('\n');
-        }
-        combined.push_str(&stderr_s);
-      }
-      let combined = truncate(&combined);
-      let real_code = status.code();
-      let note = if truncated {
-        format!(
-          "\n[output truncated at {BASH_OUTPUT_CAP} chars; the command ran to completion and its \
+    combined.push_str(&err);
+  }
+  let combined = truncate(&combined);
+  let real_code = status.code();
+  let note = if truncated {
+    format!(
+      "\n[output truncated at {BASH_OUTPUT_CAP} chars; the command ran to completion and its \
            exit status is real, but re-run with output redirected to a file if you need the rest]"
-        )
-      } else {
-        String::new()
-      };
-      match (status.success(), real_code, truncated) {
-        // It exited cleanly, so it succeeded even though we only kept the first N chars.
-        (true, _, true) => return ToolResult::ok(format!("{combined}{note}")),
-        (true, _, false) => return ToolResult::ok(combined),
-        // A real exit code is the command's own verdict, truncation or not: it failed.
-        (false, Some(code), _) => {
-          return ToolResult::err(format!("bash: exit {code}:\n{combined}{note}"));
-        }
-        // Unreachable in practice: we drain to EOF rather than closing the pipe at the cap, so
-        // there is no SIGPIPE and a signal death is a genuine crash.
-        (false, None, true) => {
-          return ToolResult::err(format!(
-            "bash: killed by signal after {BASH_OUTPUT_CAP} chars:\n{combined}{note}"
-          ));
-        }
-        // A signal death we did not cause is a genuine crash.
-        (false, None, false) => {
-          return ToolResult::err(format!("bash: killed by signal:\n{combined}"));
-        }
-      }
-    }
+    )
+  } else {
+    String::new()
+  };
+  match (status.success(), real_code, truncated) {
+    // It exited cleanly, so it succeeded even though we only kept the first N chars.
+    (true, _, true) => ToolResult::ok(format!("{combined}{note}")),
+    (true, _, false) => ToolResult::ok(combined),
+    // A real exit code is the command's own verdict, truncation or not: it failed.
+    (false, Some(code), _) => ToolResult::err(format!("bash: exit {code}:\n{combined}{note}")),
+    // Unreachable in practice: we drain to EOF rather than closing the pipe at the cap, so
+    // there is no SIGPIPE and a signal death is a genuine crash.
+    (false, None, true) => ToolResult::err(format!(
+      "bash: killed by signal after {BASH_OUTPUT_CAP} chars:\n{combined}{note}"
+    )),
+    // A signal death we did not cause is a genuine crash.
+    (false, None, false) => ToolResult::err(format!("bash: killed by signal:\n{combined}")),
   }
 }
 

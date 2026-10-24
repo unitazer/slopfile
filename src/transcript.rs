@@ -1,4 +1,6 @@
-use crate::session::{self, ParseReport, Session};
+#[cfg(test)]
+use crate::session::ParseReport;
+use crate::session::{self, Session};
 use std::path::Path;
 
 pub fn read_file(path: &Path) -> Result<String, String> {
@@ -56,7 +58,8 @@ pub fn load(path: &Path) -> Result<Session, String> {
     .map_err(|why| format!("failed to parse session file `{}`: {why}", path.display()))
 }
 
-pub fn load_lenient(path: &Path) -> Result<(Session, ParseReport), String> {
+#[cfg(test)]
+pub(crate) fn load_lenient(path: &Path) -> Result<(Session, ParseReport), String> {
   let text = read_file(path)?;
   Ok(session::parse(&text))
 }
