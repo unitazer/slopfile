@@ -17,6 +17,7 @@
           cargo
           rustfmt
           rust-analyzer
+          clippy
           docker
           docker-compose
           neovim

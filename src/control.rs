@@ -188,7 +188,7 @@ impl Phase {
   }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
   pub session: String,
   pub phase: Phase,

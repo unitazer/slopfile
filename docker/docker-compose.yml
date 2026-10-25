@@ -17,6 +17,8 @@ services:
       "--host", "0.0.0.0",
       "--port", "8080",
       "--slot-save-path", "/cache",
+      "--cache-ram", "0",
+      "--no-cache-idle-slots",
     ]
     ports:
       - "8080:8080"

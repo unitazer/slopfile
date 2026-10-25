@@ -203,8 +203,6 @@ pub struct SseToolCallDelta {
   #[serde(default)]
   pub id: Option<String>,
   #[serde(default)]
-  pub r#type: Option<String>,
-  #[serde(default)]
   pub function: Option<SseFunctionDelta>,
 }
 
@@ -312,7 +310,6 @@ impl PromptSample {
 #[derive(Debug, Clone, Default)]
 pub struct StreamResult {
   pub content: String,
-  pub reasoning: String,
   pub tool_calls: Vec<ToolCall>,
   pub finish_reason: Option<String>,
   pub usage: Option<Usage>,
@@ -323,8 +320,6 @@ pub struct StreamResult {
 pub enum StreamEvent {
   Text(String),
   Reasoning(String),
-  ToolCallFragment(SseToolCallDelta),
-  Done(StreamResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -771,12 +766,10 @@ impl SessionConfig {
   }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ToolResult {
   pub ok: bool,
   pub output: String,
-  #[serde(default)]
-  pub meta: Value,
 }
 
 impl ToolResult {
@@ -784,14 +777,12 @@ impl ToolResult {
     Self {
       ok: true,
       output: output.into(),
-      meta: Value::Null,
     }
   }
   pub fn err(output: impl Into<String>) -> Self {
     Self {
       ok: false,
       output: output.into(),
-      meta: Value::Null,
     }
   }
 }

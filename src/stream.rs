@@ -35,7 +35,6 @@ impl StreamWriter {
     match ev {
       StreamEvent::Text(t) => self.write_tag_aware(t, false),
       StreamEvent::Reasoning(r) => self.emit(r, REASONING),
-      StreamEvent::ToolCallFragment(_) | StreamEvent::Done(_) => {}
     }
   }
 

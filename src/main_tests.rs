@@ -7,8 +7,8 @@ use crate::control::{self, Cmd, Req, SessionState};
 use crate::daemon::{Action, next_action, run_calls, settle_tool_round};
 use crate::docker::restart_llama_server;
 use crate::flow::{
-  execute_tool_calls, has_report, questions_resolvable, resolve_questions,
-  session_template, spawn_subagent, subagent_depth,
+  execute_tool_calls, has_report, questions_resolvable, resolve_questions, session_template,
+  spawn_subagent, subagent_depth,
 };
 use crate::session::{self, Session};
 use crate::stream::StreamWriter;
@@ -48,9 +48,7 @@ fn write_session(path: &Path, session: &Session) {
 }
 
 fn load(path: &Path) -> Session {
-  let (session, report) = transcript::load_lenient(path).expect("load");
-  assert!(report.is_clean(), "unclean parse: {:?}", report.problems());
-  session
+  transcript::load(path).expect("load")
 }
 
 fn with_question(input_tail: &str) -> Session {
@@ -2940,7 +2938,8 @@ next: clone with --depth 1
     again.contains("<!-- slopfile:scratchpad -->\nnext: clone with --depth 1\n<!-- /slopfile -->"),
     "{again}"
   );
-  let reparsed = transcript::load_str(&again);
+  let (reparsed, report) = session::parse(&again);
+  assert!(report.is_clean(), "{report:?}");
   assert_eq!(reparsed.turns[0].custom[0].0, "notes", "{again}");
 
   // And comes back as context under its own name.

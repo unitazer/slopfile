@@ -176,16 +176,12 @@ impl ToolCallAccumulator {
       self.calls.push(SseToolCallDelta {
         index: Some(self.calls.len()),
         id: None,
-        r#type: None,
         function: None,
       });
     }
     let slot = &mut self.calls[idx];
     if let Some(id) = &delta.id {
       slot.id = Some(id.clone());
-    }
-    if let Some(t) = &delta.r#type {
-      slot.r#type = Some(t.clone());
     }
     match (&delta.function, &mut slot.function) {
       (Some(f), Some(sf)) => {
@@ -300,10 +296,6 @@ impl LlamaClient {
 
   pub fn endpoint(&self) -> &Endpoint {
     &self.endpoint
-  }
-
-  pub fn rest(&self) -> &reqwest::Client {
-    &self.client
   }
 
   pub(crate) fn request(&self, url: &str) -> reqwest::RequestBuilder {
@@ -446,13 +438,11 @@ impl LlamaClient {
                   // llama.cpp calls it `reasoning_content`, OpenAI and OpenRouter call it
                   // `reasoning`. Same thing, so take whichever arrived.
                   if let Some(r) = d.reasoning_content.as_ref().or(d.reasoning.as_ref()) {
-                      result.reasoning.push_str(r);
                       on_event(StreamEvent::Reasoning(r.clone()));
                   }
                   if let Some(tools) = &d.tool_calls {
                       for t in tools {
                           acc.accumulate(t);
-                          on_event(StreamEvent::ToolCallFragment(t.clone()));
                       }
                   }
               }
@@ -468,7 +458,6 @@ impl LlamaClient {
     }
 
     result.tool_calls = acc.assemble();
-    on_event(StreamEvent::Done(result.clone()));
     Ok(result)
   }
 
@@ -624,15 +613,8 @@ mod tests {
       "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
       "data: [DONE]\n\n",
     ];
-    let mut events = Vec::new();
     let result = client
-      .consume_stream(
-        fake_bytes_stream(sse),
-        |e| {
-          events.push(e);
-        },
-        || true,
-      )
+      .consume_stream(fake_bytes_stream(sse), |_| {}, || true)
       .await
       .expect("stream");
 
@@ -650,12 +632,6 @@ mod tests {
         completion_tokens_details: None
       })
     );
-    assert!(
-      events
-        .iter()
-        .any(|e| matches!(e, StreamEvent::ToolCallFragment(_)))
-    );
-    assert!(events.iter().any(|e| matches!(e, StreamEvent::Done(_))));
   }
 
   #[tokio::test]
@@ -672,7 +648,6 @@ mod tests {
       .await
       .expect("stream");
     assert_eq!(result.content, "Hi there");
-    assert_eq!(result.reasoning, "Let me think.");
     assert_eq!(result.finish_reason.as_deref(), Some("stop"));
   }
 
@@ -852,7 +827,6 @@ mod tests {
     acc.accumulate(&SseToolCallDelta {
       index: Some(0),
       id: Some("x".into()),
-      r#type: Some("function".into()),
       function: Some(crate::types::SseFunctionDelta {
         name: Some("sh".into()),
         arguments: Some("{\"a\":".into()),
@@ -861,7 +835,6 @@ mod tests {
     acc.accumulate(&SseToolCallDelta {
       index: Some(0),
       id: None,
-      r#type: None,
       function: Some(crate::types::SseFunctionDelta {
         name: None,
         arguments: Some("1}".into()),
@@ -884,7 +857,6 @@ mod accumulator_robustness_tests {
     acc.accumulate(&SseToolCallDelta {
       index: Some(10_000_000),
       id: Some("a".into()),
-      r#type: None,
       function: Some(SseFunctionDelta {
         name: Some("bash".into()),
         arguments: Some("{}".into()),
@@ -902,7 +874,6 @@ mod accumulator_robustness_tests {
       acc.accumulate(&SseToolCallDelta {
         index: Some(ix),
         id: None,
-        r#type: None,
         function: Some(SseFunctionDelta {
           name: Some(name.into()),
           arguments: Some("{}".into()),
@@ -1454,7 +1425,7 @@ mod accumulator_robustness_tests {
         vec![Ok(bytes::Bytes::from(format!("{sse}\n\ndata: [DONE]\n\n")))];
       let mut seen = String::new();
       let client = dead_client();
-      let out = client
+      let _out = client
         .consume_stream(
           futures_util::stream::iter(chunks),
           |ev| {
@@ -1466,8 +1437,7 @@ mod accumulator_robustness_tests {
         )
         .await
         .unwrap();
-      assert_eq!(out.reasoning, "thinking", "from the `{field}` field");
-      assert_eq!(seen, "thinking");
+      assert_eq!(seen, "thinking", "from the `{field}` field");
     }
   }
 }

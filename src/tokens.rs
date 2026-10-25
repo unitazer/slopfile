@@ -187,7 +187,7 @@ pub fn output_allowance(budget: u32) -> u32 {
   // at or below it would leave nothing for the prompt, and every turn would fail with "request
   // exceeds the context budget" no matter how short the transcript. Capped at three quarters so
   // any budget above the floor behaves exactly as before and only the broken range changes.
-  (budget / 4).max(24_000).min(budget - budget / 4)
+  (budget / 4).max(40_000).min(budget - budget / 4)
 }
 
 /// How to turn a message list into a size, and what we last learned from the provider.

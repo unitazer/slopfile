@@ -886,7 +886,9 @@ fn awkward_provider_and_model_names_survive_a_round_trip() {
   };
   let rendered = toml_fence(&config);
   assert!(
-    !fence_config(&rendered).unwrap().unwrap()
+    !fence_config(&rendered)
+      .unwrap()
+      .unwrap()
       .provider
       .as_deref()
       .unwrap()
@@ -1425,6 +1427,46 @@ fn a_model_note_never_produces_two_adjacent_assistant_messages() {
   let content = messages[0].content.as_deref().unwrap();
   assert!(content.contains("remember"), "{content}");
   assert!(content.contains("Understood"), "{content}");
+}
+
+#[test]
+fn a_model_note_does_not_trail_the_tool_results_it_was_written_after() {
+  let mut session = Session::default();
+  session.turns.push(Turn {
+    custom: Vec::new(),
+    user: Some("go".to_string()),
+    notes: vec![Note {
+      by: NoteBy::Model,
+      text: "remember: the next step is to re-run the tests".to_string(),
+    }],
+    rounds: vec![Round {
+      assistant: Assistant {
+        custom: Vec::new(),
+        reasoning: None,
+        text: None,
+        calls: vec![Call {
+          id: "c1".to_string(),
+          name: "bash".to_string(),
+          arguments: r#"{"command":"ls"}"#.to_string(),
+        }],
+      },
+      results: vec![ToolOutcome {
+        id: "c1".to_string(),
+        name: "bash".to_string(),
+        ok: true,
+        ms: 0,
+        output: "src".to_string(),
+      }],
+    }],
+    question: None,
+  });
+  let messages = session.request_messages();
+  assert_eq!(
+    messages.last().unwrap().role,
+    Role::Tool,
+    "the tool result must be the prompt, not the model's own note: {messages:?}"
+  );
+  assert!(session.needs_generation());
 }
 
 #[test]

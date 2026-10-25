@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::session::ParseReport;
 use crate::session::{self, Session};
 use std::path::Path;
 
@@ -38,11 +36,6 @@ pub fn save(path: &Path, session: &Session) -> Result<(), String> {
   write_file(path, session.render())
 }
 
-/// Parse a transcript we already hold in memory, applying the same refusal as `load`.
-pub fn load_str(text: &str) -> Session {
-  transcript_load_checked(text).expect("re-parsing our own render must stay clean")
-}
-
 fn transcript_load_checked(text: &str) -> Result<Session, String> {
   let (session, report) = session::parse(text);
   if !report.is_clean() {
@@ -56,10 +49,4 @@ pub fn load(path: &Path) -> Result<Session, String> {
   let text = read_file(path)?;
   transcript_load_checked(&text)
     .map_err(|why| format!("failed to parse session file `{}`: {why}", path.display()))
-}
-
-#[cfg(test)]
-pub(crate) fn load_lenient(path: &Path) -> Result<(Session, ParseReport), String> {
-  let text = read_file(path)?;
-  Ok(session::parse(&text))
 }

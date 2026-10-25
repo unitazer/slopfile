@@ -74,8 +74,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
           "type": "object",
           "properties": {
               "pattern": { "type": "string", "description": "Plain substring to search for" },
-              "path": { "type": "string", "description": "Directory to search, relative to the workdir", "default": "." },
-              "glob": { "type": ["string", "null"], "description": "Unused optional filename filter" }
+              "path": { "type": "string", "description": "Directory to search, relative to the workdir", "default": "." }
           },
           "required": ["pattern"]
       }),
@@ -121,7 +120,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
       json!({
           "type": "object",
           "properties": {
-              "desc": { "type": "string", "description": "Context for the questions" },
               "data": {
                   "type": "array",
                   "description": "Questions to ask",
@@ -136,7 +134,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                   }
               }
           },
-          "required": ["desc", "data"]
+          "required": ["data"]
       }),
     ),
   ]
@@ -1344,7 +1342,7 @@ mod tests {
     let wd = test_dir("question");
     let r = t(
       "question",
-      json!({"desc": "d", "data": [{"question": "red or blue", "answers": ["red", "blue"]}]}),
+      json!({"data": [{"question": "red or blue", "answers": ["red", "blue"]}]}),
       wd.clone(),
     )
     .await;
@@ -1364,7 +1362,7 @@ mod tests {
     assert_eq!(
       names,
       [
-        "read", "write", "edit", "bash", "grep", "find", "ls", "subagent", "solve", "question"
+        "read", "write", "edit", "bash", "grep", "find", "ls", "subagent", "question"
       ]
     );
     for d in &defs {
@@ -1378,8 +1376,7 @@ mod tests {
     }
     let q = defs.iter().find(|d| d.function.name == "question").unwrap();
     let p = &q.function.parameters;
-    assert_eq!(p["required"], json!(["desc", "data"]));
-    assert_eq!(p["properties"]["desc"]["type"], json!("string"));
+    assert_eq!(p["required"], json!(["data"]));
     let items = &p["properties"]["data"]["items"];
     assert_eq!(items["required"], json!(["question", "answers"]));
     assert_eq!(items["properties"]["question"]["type"], json!("string"));

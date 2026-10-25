@@ -65,10 +65,6 @@ fn pressure_line(window: Option<Window>) -> String {
   )
 }
 
-pub fn context_paragraph(path: &Path) -> String {
-  context_paragraph_with(path, None)
-}
-
 pub fn context_paragraph_with(path: &Path, window: Option<Window>) -> String {
   format!(
     "{CONTEXT_BEGIN}
@@ -179,7 +175,7 @@ mod tests {
 
   #[test]
   fn paragraph_names_the_path_and_the_region_rules() {
-    let p = context_paragraph(Path::new("/t/shared/transcripts/1.md"));
+    let p = context_paragraph_with(Path::new("/t/shared/transcripts/1.md"), None);
     assert!(
       p.contains("Context file: /t/shared/transcripts/1.md"),
       "{p}"

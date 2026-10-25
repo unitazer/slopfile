@@ -485,10 +485,6 @@ pub fn fence_body(preamble: &str) -> Option<String> {
   None
 }
 
-pub fn config_from_fence(preamble: &str) -> SessionConfig {
-  fence_config(preamble).ok().flatten().unwrap_or_default()
-}
-
 /// `Ok(None)` means there is no fence at all. `Err` means a fence is present but does not parse,
 /// which the caller must not paper over by regenerating the fence: that would silently delete the
 /// human's settings.
@@ -1006,7 +1002,15 @@ impl Session {
           out.push(assistant_message(Some(text), None, Vec::new()));
         }
       }
-      for round in turn.rounds.iter() {
+      // A model note must not be the last message after tool results. It *is* an assistant turn,
+      // so ending the request with it tells the model it already replied; the next call comes back
+      // empty and the tool loop stops. Keep the note near the end, but before the last round's
+      // output (and therefore before its results).
+      let last_round = turn.rounds.len().checked_sub(1);
+      for (ri, round) in turn.rounds.iter().enumerate() {
+        if Some(ri) == last_round {
+          push_model_notes(&mut out, &turn.notes);
+        }
         let mut calls = round.assistant.calls.clone();
         for result in &round.results {
           if !calls.iter().any(|c| c.id == result.id) {
@@ -1045,20 +1049,19 @@ impl Session {
           ));
         }
       }
-      // Notes come after the rounds, matching `render`. These notes exist to change what the model
-      // does *next* -- "your context filled, prune the file" -- so they have to arrive as the most
+      if last_round.is_none() {
+        push_model_notes(&mut out, &turn.notes);
+      }
+      // Harness notes come after the rounds. These notes exist to change what the model does
+      // *next* -- "your context filled, prune the file" -- so they have to arrive as the most
       // recent thing it read. Sent first they were message #2 with the entire rest of the history
       // after them, the weakest place to put an instruction, and it made "the old turns above"
       // point at the system prompt rather than the transcript.
       for note in &turn.notes {
         let text = note.text.trim();
-        if text.is_empty() {
-          continue;
+        if note.by == NoteBy::Harness && !text.is_empty() {
+          out.push(ChatMessage::user(text));
         }
-        out.push(match note.by {
-          NoteBy::Harness => ChatMessage::user(text),
-          NoteBy::Model => assistant_message(Some(text), None, Vec::new()),
-        });
       }
     }
     if !self.input.trim().is_empty() {
@@ -1454,6 +1457,15 @@ fn coalesce_assistants(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
   }
   out
+}
+
+fn push_model_notes(out: &mut Vec<ChatMessage>, notes: &[Note]) {
+  for note in notes {
+    let text = note.text.trim();
+    if note.by == NoteBy::Model && !text.is_empty() {
+      out.push(assistant_message(Some(text), None, Vec::new()));
+    }
+  }
 }
 
 fn assistant_message(
