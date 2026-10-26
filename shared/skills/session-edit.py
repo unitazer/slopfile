@@ -7,16 +7,16 @@ so a targeted `edit` has to reproduce that wrapper exactly. This does the same j
 you name a region, you get or set its body, and this handles the markers and the escaping.
 
   ./session-edit.py list   SESSION
-  ./session-edit.py read   SESSION turn[3].assistant.text
-  ./session-edit.py set    SESSION turn[3].note --body "..."
-  ./session-edit.py append SESSION turn[3].note --body "..."
-  ./session-edit.py drop   SESSION turn[1]                   (removes matching regions)
-  ./session-edit.py drop   SESSION 'turn[1].*'
+  ./session-edit.py read   SESSION turn[0].assistant[0].text
+  ./session-edit.py set    SESSION turn[0].note[0] --body "..."
+  ./session-edit.py append SESSION turn[0].note[0] --body "..."
+  ./session-edit.py drop   SESSION 'turn[0]'                 (removes matching regions)
+  ./session-edit.py drop   SESSION 'turn[0].*'
   ./session-edit.py check  SESSION
   ./session-edit.py batch  SESSION <<'EOF'
   drop 'turn[*].assistant[*].call[*]'
-  set 'turn[*].assistant.reasoning' | one-line summary
-  add turn.note | compaction: dropped dead tool output
+  set 'turn[*].assistant[*].reasoning' | one-line summary
+  add turn[0].note | compaction: dropped dead tool output
   EOF
 
 `batch` is one parse, one write and one line of output however many edits there are, and a failing
@@ -25,11 +25,12 @@ bodies are one line (use `set ... --body -` for a multi-line body). Paths mean w
 `list` you ran before the batch, so order does not matter and drops cannot renumber later lines.
 Prefer it over shell `&&` chains, which re-parse, rewrite and re-print for every edit.
 
-A path is `name` or `name[n]` segments joined by dots, outermost first. `list` prints every path
-you can address. Indices count same-named siblings at that level, so a bare name is the first one;
-after a single `drop` run `list` again. A wildcard applies only to its own segment, so `[*]` (or a
-bare `*`) must be repeated on every level you mean to sweep. A batch resolves every path against
-the snapshot before it, so there order does not matter.
+`list` prints a tree. Every addressable segment carries a 0-based index, including the first one:
+`turn[0]`, then `turn[0].assistant[0]`, `turn[0].assistant[0].call[0]`. A bare name is shorthand
+for `[0]` (`turn.note` means `turn[0].note`), but the tree always writes the index. Indices count
+same-named siblings at that level; after a single `drop`, run `list` again. A wildcard applies only
+to its own segment, so `[*]` (or a bare `*`) must be repeated on every level you mean to sweep. A
+batch resolves every path against the snapshot before it, so order does not matter.
 
 Every write is atomic (temp file plus rename) and leaves the transcript untouched if the edit
 would not parse.
@@ -138,9 +139,10 @@ def build_tree(lines):
 
 def path_of(node, index_of):
     parts = []
-    while node is not None and node.parent is not None:
-        n = index_of[node]
-        parts.append(node.name if n == 0 else f"{node.name}[{n}]")
+    while node is not None:
+        if node.parent is None and node.name in (BEGIN, INPUT):
+            break
+        parts.append(f"{node.name}[{index_of[node]}]")
         node = node.parent
     return ".".join(reversed(parts))
 
@@ -163,13 +165,108 @@ def walk(nodes, index_of, out):
         idx = [n for n in nodes if n.name == node.name].index(node)
         index_of[node] = idx
         p = path_of(node, index_of)
-        if node.parent is not None:
+        if p:
             out.append((p, node))
         walk(node.children, index_of, out)
 
 
+def parse_payload(node):
+    if not node.payload:
+        return {}
+    try:
+        payload = json.loads(node.payload)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def parse_arguments(payload):
+    raw = payload.get("arguments")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def short_words(value, limit=20):
+    words = str(value).split()
+    if len(words) > limit:
+        return " ".join(words[:limit]) + " ..."
+    return " ".join(words)
+
+
+def quoted(value):
+    return json.dumps(str(value))
+
+
+def call_summary(node, limit=20):
+    """Render a call as `bash("first words")` or `read("/path")`, never as raw JSON."""
+    payload = parse_payload(node)
+    name = payload.get("name") or "?"
+    args = parse_arguments(payload)
+    if name == "bash":
+        return f"bash({quoted(short_words(args.get('command') or '', limit))})"
+    if name in ("read", "write", "edit"):
+        return f"{name}({quoted(args.get('path') or '')})"
+    if name in ("grep", "find"):
+        pattern = short_words(args.get("pattern") or "", limit)
+        path = args.get("path") or "."
+        if path != ".":
+            return f"{name}({quoted(pattern)}, {quoted(path)})"
+        return f"{name}({quoted(pattern)})"
+    if name == "ls":
+        return f"ls({quoted(args.get('path') or '.')})"
+    if name == "question":
+        data = args.get("data")
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            question = data[0].get("question") or ""
+            return f"question({quoted(short_words(question, limit))})"
+        return "question()"
+    if name == "subagent":
+        return f"subagent({quoted(short_words(args.get('task') or '', limit))})"
+    if args:
+        return f"{name}({quoted(short_words(json.dumps(args, sort_keys=True), min(limit, 12)))})"
+    return f"{name}()"
+
+
+def result_summary(node, lines):
+    """Show the outcome, never the id or raw JSON; failures also show the first words of the error."""
+    payload = parse_payload(node)
+    name = payload.get("name") or "?"
+    failed = payload.get("ok") is False
+    status = "FAILED" if failed else "ok"
+    ms = payload.get("ms")
+    if isinstance(ms, int):
+        status += f" {ms}ms"
+    if failed:
+        preview = short_words(unescape(body_text(lines, node)), 12)
+        if preview:
+            status += f": {preview}"
+    return f"{name} {status}"
+
+
+def render_tree(nodes, depth, index_of, lines, out):
+    for node in nodes:
+        detail = ""
+        if node.name == "call":
+            detail = f"  {call_summary(node)}"
+        elif node.name == "result":
+            detail = f"  {result_summary(node, lines)}"
+        out.append(f"{'  ' * depth}{node.name}[{index_of[node]}]{detail}")
+        render_tree(node.children, depth + 1, index_of, lines, out)
+
+
+def split_segment(seg):
+    m = re.match(r"^([A-Za-z0-9_-]+)(?:\[(\d+)\])?$", seg)
+    if not m:
+        raise SystemExit(f"bad path segment: {seg!r}")
+    return m.group(1), m.group(2)
+
+
 def resolve(entries, spec):
-    """`turn[3].assistant.text` -> that node. A bare name matches its first occurrence."""
+    """`turn[3].assistant[0].text` -> that node. A bare name matches its first occurrence."""
     parts = []
     for seg in spec.split("."):
         if seg == "*":
@@ -380,8 +477,13 @@ class Editor:
         parent_spec, _, new_name = spec.rpartition(".")
         if not new_name:
             raise SystemExit("add needs a full path like turn.note or turn.assistant.scratchpad")
+        new_base, new_index = split_segment(new_name)
+        if new_index is not None:
+            raise SystemExit(
+                "add creates a new region; omit its index (use set or drop for an existing one)"
+            )
         # Walk the path one segment at a time, creating any container that is missing, so
-        # `turn.assistant.scratchpad` works on a session that has neither yet.
+        # `turn[0].assistant[0].scratchpad` works on a session that has neither yet.
         segments = parent_spec.split(".") if parent_spec else []
         holder = None
         for depth, seg in enumerate(segments):
@@ -391,27 +493,33 @@ class Editor:
                 continue
             except SystemExit:
                 pass
-            if seg not in CONTAINERS:
+            base, _ = split_segment(seg)
+            if base not in CONTAINERS:
                 raise SystemExit(
-                    f"cannot create {seg!r}; only `turn` and `assistant` are created for you"
+                    f"cannot create {base!r}; only `turn` and `assistant` are created for you"
                 )
             if holder is None:
                 holder = self.begin()
-            self.insert_into(holder, seg, [f"{OPEN}{seg} -->\n", f"{CLOSE}\n"])
+            self.insert_into(holder, base, [f"{OPEN}{base} -->\n", f"{CLOSE}\n"])
             self.reindex()
-            holder = resolve(self.entries, prefix)[0]
+            try:
+                holder = resolve(self.entries, prefix)[0]
+            except SystemExit:
+                raise SystemExit(
+                    f"created {base!r}, but {prefix!r} does not exist; check the index"
+                )
         if holder is None:
             holder = self.begin()
 
-        if new_name not in KNOWN and holder.name not in CONTAINERS:
+        if new_base not in KNOWN and holder.name not in CONTAINERS:
             raise SystemExit(
-                f"{new_name!r} may only be invented inside a turn or an assistant, not inside "
+                f"{new_base!r} may only be invented inside a turn or an assistant, not inside "
                 f"{holder.name!r}"
             )
-        block = [f"{OPEN}{new_name} -->\n"] + to_lines(escape(raw)) + [f"{CLOSE}\n"]
-        self.insert_into(holder, new_name, block)
+        block = [f"{OPEN}{new_base} -->\n"] + to_lines(escape(raw)) + [f"{CLOSE}\n"]
+        self.insert_into(holder, new_base, block)
         self.commit(list(self.lines))
-        return 1, f"added {new_name} inside {parent_spec or 'the top level'}"
+        return 1, f"added {new_base} inside {parent_spec or 'the top level'}"
 
     def save(self):
         write_atomic(self.path, self.text())
@@ -500,16 +608,21 @@ def plan_batch(editor, ops):
                 parent_spec, _, new_name = spec.rpartition(".")
                 if not new_name:
                     raise SystemExit("add needs a full path like turn.note")
+                new_base, new_index = split_segment(new_name)
+                if new_index is not None:
+                    raise SystemExit(
+                        "add creates a new region; omit its index (use set or drop for an existing one)"
+                    )
                 if parent_spec:
                     holder = resolve(editor.entries, parent_spec)[0]
                 else:
                     holder = editor.begin()
-                if new_name not in KNOWN and holder.name not in CONTAINERS:
+                if new_base not in KNOWN and holder.name not in CONTAINERS:
                     raise SystemExit(
-                        f"{new_name!r} may only be invented inside a turn or an assistant"
+                        f"{new_base!r} may only be invented inside a turn or an assistant"
                     )
                 at, closes = insert_point(editor, holder)
-                block = [f"{OPEN}{new_name} -->\n"] + to_lines(escape(body)) + [f"{CLOSE}\n"]
+                block = [f"{OPEN}{new_base} -->\n"] + to_lines(escape(body)) + [f"{CLOSE}\n"]
                 inserts.append((at, seq, closes, block, lineno, holder))
                 regions += 1
         except SystemExit as exc:
@@ -619,9 +732,15 @@ def main():
             else "balanced"
         )
         print(f"{len(editor.lines)} lines, {state}")
-        for path, node in editor.entries:
-            payload = f"  {node.payload[:60]}" if node.payload else ""
-            print(f"  {path}{payload}")
+        top = []
+        for root in editor.roots:
+            if root.name == BEGIN:
+                top.extend(root.children)
+            elif root.name != INPUT:
+                top.append(root)
+        out = []
+        render_tree(top, 0, editor.index_of, editor.lines, out)
+        print("\n".join(out))
         return
 
     if args.cmd == "check":

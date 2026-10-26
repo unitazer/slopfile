@@ -482,10 +482,6 @@ fn session_template_has_default_header_and_prompt() {
   assert!(text.contains("<!-- slopfile:system -->"), "{text}");
   assert!(text.ends_with("<!-- slopfile:input -->\n"), "{text}");
   assert!(!text.contains("# Session"), "{text}");
-  assert!(
-    text.contains("- read: Read files as numbered lines"),
-    "{text}"
-  );
   assert!(text.contains("Current working directory: /tmp"), "{text}");
 
   let messages = tpl.request_messages();
@@ -641,7 +637,7 @@ async fn model_edits_of_its_own_context_file_are_synced() {
   let call = ToolCall::new(
     "1",
     "bash",
-    &json!({"command": format!(
+    json!({"command": format!(
       "sed -i 's/working on it/NOTES: only this matters/' {}",
       session.display()
     )})
@@ -660,7 +656,7 @@ async fn model_edits_of_its_own_context_file_are_synced() {
   let wipe = ToolCall::new(
     "2",
     "bash",
-    &json!({"command": format!("printf 'everything is gone\\n' > {}", session.display())})
+    json!({"command": format!("printf 'everything is gone\\n' > {}", session.display())})
       .to_string(),
   );
   let rolled = tool_round(&session, &cfg, &[wipe]).await;
@@ -1016,7 +1012,7 @@ async fn tool_calls_next_to_a_question_are_still_executed_and_recorded() {
   start.promote_input();
   write_session(&path, &start);
 
-  let calls = vec![
+  let calls = [
     ToolCall::new("a1", "bash", r#"{"command":"echo ran"}"#),
     ToolCall::new(
       "a2",
@@ -1463,7 +1459,7 @@ fn a_truncated_window_never_opens_with_the_assistant() {
     let (window, kept) = tokens::truncate_messages(msgs.clone(), &counts, budget as u32);
     let roles: Vec<Role> = window.iter().map(|m| m.role).collect();
     assert_eq!(roles[0], Role::System, "budget {budget}");
-    if kept <= budget as usize {
+    if kept <= budget {
       assert_ne!(
         roles.get(1),
         Some(&Role::Assistant),
@@ -1495,7 +1491,7 @@ async fn a_relative_extra_read_root_resolves_for_read() {
     r#"{"path":"shared/skills/guide.md"}"#,
     workdir.clone(),
     30_000,
-    &[root.clone()],
+    std::slice::from_ref(&root),
     None,
   )
   .await;
@@ -1513,7 +1509,7 @@ async fn a_relative_extra_read_root_resolves_for_read() {
     ),
     workdir.clone(),
     30_000,
-    &[root.clone()],
+    std::slice::from_ref(&root),
     None,
   )
   .await;
@@ -2868,8 +2864,10 @@ fn the_burst_cap_is_reported_in_the_transcript_not_silently() {
   // actually says, which is how this drifted out of date without anyone noticing.
   let cap = 20;
   let note = daemon::burst_ceiling_note(cap);
-  let mut s = Session::default();
-  s.system = "sys".into();
+  let mut s = Session {
+    system: "sys".into(),
+    ..Default::default()
+  };
   s.add_note(session::NoteBy::Harness, &note);
   let rendered = s.render();
   assert!(rendered.contains("hit its turn ceiling"), "{rendered}");

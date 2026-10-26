@@ -130,8 +130,8 @@ async fn request_token_counts(
   todo.dedup_by(|a, b| a.1 == b.1);
   let mut error = None;
   const FAN_OUT: usize = 8;
-  let mut chunks = todo.chunks(FAN_OUT);
-  while let Some(batch) = chunks.next() {
+  let chunks = todo.chunks(FAN_OUT);
+  for batch in chunks {
     let futs = batch.iter().map(|(ix, key)| async move {
       let counted = request_token_count(
         endpoint,
@@ -457,7 +457,7 @@ mod tests {
       cfg,
       endpoint,
       &crate::api::test_client_at(endpoint.base.clone()),
-      &counting,
+      counting,
     )
     .await
     .expect("a plan")

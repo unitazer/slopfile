@@ -32,7 +32,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
     ),
     tool_def(
       "write",
-      "Create or overwrite a file. Parent directories are created as needed. Paths are resolved relative to the workdir and must stay inside it, except for your own context file, which you may rewrite to manage your context.",
+      "Create or overwrite a file. Parent directories are created as needed. Paths are resolved relative to the workdir and must stay inside it; writing elsewhere is an error, except for your own context file, which you may rewrite to manage your context.",
       json!({
           "type": "object",
           "properties": {
@@ -265,7 +265,7 @@ fn read(
     let elsewhere = extra_roots
       .iter()
       .find_map(|root| resolve_in(root, path_str).ok());
-    match in_workdir.filter(|p| p.exists()).or_else(|| elsewhere) {
+    match in_workdir.filter(|p| p.exists()).or(elsewhere) {
       Some(p) => p,
       None => return ToolResult::err(format!("read: path escapes workdir: {path_str}")),
     }
@@ -334,12 +334,10 @@ fn write(workdir: &Path, args: &Value, context_file: Option<&Path>) -> ToolResul
   } else {
     path!(workdir, path_str)
   };
-  if is_context {
-    if let Err(why) = crate::context::check_edit(content) {
-      return ToolResult::err(format!(
-        "write: {path_str} is this session's context file and that rewrite was refused: {why}"
-      ));
-    }
+  if is_context && let Err(why) = crate::context::check_edit(content) {
+    return ToolResult::err(format!(
+      "write: {path_str} is this session's context file and that rewrite was refused: {why}"
+    ));
   }
   if let Some(parent) = path.parent()
     && let Err(e) = create_dir_all(parent)
@@ -383,12 +381,10 @@ fn edit(workdir: &Path, args: &Value, context_file: Option<&Path>) -> ToolResult
   };
   let mut updated = content;
   updated.replace_range(idx..idx + old.len(), new);
-  if is_context {
-    if let Err(why) = crate::context::check_edit(&updated) {
-      return ToolResult::err(format!(
-        "edit: that change to {path_str} would break this session's context file, so it was refused: {why}"
-      ));
-    }
+  if is_context && let Err(why) = crate::context::check_edit(&updated) {
+    return ToolResult::err(format!(
+      "edit: that change to {path_str} would break this session's context file, so it was refused: {why}"
+    ));
   }
   if let Err(e) = std::fs::write(&path, updated) {
     return ToolResult::err(format!("edit: cannot write {path_str}: {e}"));

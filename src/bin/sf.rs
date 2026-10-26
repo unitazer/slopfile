@@ -112,10 +112,10 @@ async fn remote_inner(
   if !resp.ok {
     return Err(resp.error.unwrap_or_else(|| "command failed".to_string()));
   }
-  if let Some(status) = &resp.status {
-    if cmd == Cmd::Status {
-      println!("{status}");
-    }
+  if let Some(status) = &resp.status
+    && cmd == Cmd::Status
+  {
+    println!("{status}");
   }
   info!("command `{}` sent to task `{}`", cmd_name(cmd), session);
   Ok(())

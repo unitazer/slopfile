@@ -170,7 +170,7 @@ impl ToolCallAccumulator {
   pub fn accumulate(&mut self, delta: &SseToolCallDelta) {
     // A single frame decides how big this Vec gets, and the endpoint is not trusted to be
     // sane: `index: 10000000` would otherwise allocate gigabytes.
-    let idx = delta.index.unwrap_or(0) as usize;
+    let idx = delta.index.unwrap_or(0);
     let idx = idx.min(MAX_TOOL_CALLS - 1);
     while self.calls.len() <= idx {
       self.calls.push(SseToolCallDelta {
@@ -330,6 +330,7 @@ impl LlamaClient {
     );
   }
 
+  #[allow(clippy::too_many_arguments)]
   pub async fn chat_stream(
     &self,
     model: &str,

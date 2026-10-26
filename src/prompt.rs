@@ -35,22 +35,13 @@ pub fn system_prompt_default(cfg: &AppConfig, tools_excluded: &[String]) -> Stri
   let decision_line = if has("question") {
     "When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing."
   } else {
-    "You have no way to ask the user anything: nobody will answer a question from you, and no decision is coming. Never block on one. Make the call yourself, state the assumption you made, and keep going."
+    "You have no way to ask the user anything: nobody will answer a question from you, and no decision is coming. Never block on one. Make the call yourself, and mention any assumption you made at the end -- incorrect assumptions are one of the worst error sources."
   };
   let mut out = format!(
     "You are an expert software engineering assistant. You help the user by reading files, running commands, editing code, and writing files, and you reply to them in plain text.
 
 You act by calling tools. Your text replies and tool calls are relayed to the user automatically, one step at a time; continue based on each tool result. {decision_line}
-
-Available tools:
-- read: Read files as numbered lines
-- write: Create or overwrite files
-- edit: Replace the first occurrence of a text fragment in a file
-- bash: Execute shell commands (ls, grep, find, etc.) in the workdir
-- grep: Search file contents for a substring
-- find: Find files by name suffix pattern
-- ls: List directory contents"
-  );
+");
   if has("subagent") {
     out.push_str("\n- subagent: Spawn a worker with its own fresh context to handle a self-contained task; its final report is returned here automatically");
   }
@@ -64,15 +55,18 @@ Available tools:
   if has("subagent") {
     out.push_str("\n- Use subagent for large self-contained subtasks (e.g. 'research X and report back', 'fix all lint errors in module Y'); give it every detail it needs, since it cannot see this conversation. Spawn it, then wait for its report instead of duplicating its work.");
   }
+
+  out.push_str("DO NOT read your own context file! what you see, IS the contents of the file, so if you read your own context file, you just double the size of your context window for no reason, which is a giant waste"
+  );
   out.push_str(
-    "\n- NEVER dump large file listings into the conversation. Prefer `fd` over find (it respects .gitignore, so build/generated dirs stay out of your context); scope listings to a specific subdirectory and pattern, and pipe through head -50 when output could be long.",
+    "\n- Avoid dumping large file listings into the conversation. Prefer `fd` over find (it respects .gitignore, so build/generated dirs stay out of your context); scope listings to a specific subdirectory and pattern, and pipe through head -50 when output could be long.",
   );
   out.push_str(
     "\n- The container filesystem is ephemeral: anything installed via a package manager vanishes on rebuild. If a required tool or version is missing, stop and tell the user so the image gets updated; do not paper over it with ad-hoc installs.",
   );
   out.push_str(&format!(
     "\n- Be concise in your replies; don't echo back full file contents unless asked
-- Show file paths clearly when working with files
+- Show file paths clearly when working with files; use relative paths when full paths get long
 
 Current working directory: {}",
     cfg.workdir
@@ -217,10 +211,10 @@ fn body_summary(lines: &[&str]) -> Option<String> {
       break;
     }
     if title.is_none() {
-      if let Some(rest) = trimmed.strip_prefix("# ") {
-        if !rest.is_empty() {
-          title = Some(rest.trim());
-        }
+      if let Some(rest) = trimmed.strip_prefix("# ")
+        && !rest.is_empty()
+      {
+        title = Some(rest.trim());
       }
       continue;
     }

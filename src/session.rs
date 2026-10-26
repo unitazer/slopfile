@@ -659,7 +659,7 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
   (session, report)
 }
 
-fn attach(stack: &mut Vec<Node>, roots: &mut Vec<Node>, node: Node) {
+fn attach(stack: &mut [Node], roots: &mut Vec<Node>, node: Node) {
   match stack.last_mut() {
     Some(parent) => parent.children.push(node),
     None => roots.push(node),

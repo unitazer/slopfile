@@ -290,7 +290,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
     }) || is_sub
       || cfg.confirmations == Confirmations::Yolo;
 
-    match next_action(&session, &cfg, armed) {
+    match next_action(&session, cfg, armed) {
       Action::Idle => {
         control::update(&name, |s| {
           s.phase = Phase::Idle;
@@ -303,7 +303,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
         return Ok(());
       }
       Action::ResolveQuestions => {
-        if flow::resolve_questions(&mut session, &cfg)? {
+        if flow::resolve_questions(&mut session, cfg)? {
           transcript::save(path, &session)?;
           continue;
         }
@@ -317,7 +317,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       Action::Generate => {}
     }
 
-    match run_generation_turn(path, session, &cfg, client, &name).await? {
+    match run_generation_turn(path, session, cfg, client, &name).await? {
       TurnOutcome::Done => {
         control::update(&name, |s| s.settle(token_at_entry));
         return Ok(());
@@ -680,7 +680,7 @@ pub(crate) async fn run_calls(
 pub(crate) fn settle_tool_round(
   mut streamed: Session,
   calls: Vec<crate::session::Call>,
-  outcomes: &mut Vec<ToolOutcome>,
+  outcomes: &mut [ToolOutcome],
   path: &Path,
 ) -> Session {
   match flow::adopt_model_edit(&streamed, path) {
@@ -688,17 +688,17 @@ pub(crate) fn settle_tool_round(
       if edited.turns.last().and_then(|t| t.rounds.last()).is_none() {
         edited.begin_round();
       }
-      edited.finish_round(calls, outcomes.clone());
+      edited.finish_round(calls, outcomes.to_owned());
       edited
     }
     Ok(None) => {
-      streamed.finish_round(calls, outcomes.clone());
+      streamed.finish_round(calls, outcomes.to_owned());
       streamed
     }
     Err(why) => {
       warn!("⚠ {}: context edit rolled back: {why}", path.display());
       flow::note_rollback(outcomes, &why);
-      streamed.finish_round(calls, outcomes.clone());
+      streamed.finish_round(calls, outcomes.to_owned());
       streamed
     }
   }
