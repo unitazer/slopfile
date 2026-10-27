@@ -166,18 +166,15 @@ line.
 
 Stage 2, the cleanup: the compaction's own reasoning (cut-point math, path mapping) lands in the
 surviving file as dead weight. Drop it in one small batch right after stage 1, while the cut turn is
-still next to the live turn. Keep the user messages, text lines, calls, and one-line results as
-provenance.
-
+still next to the live turn. Keep the user messages (unless told by the user that they are not needed anymore) and important text lines
 ## What a cut changes
 
 - `drop 'turn[3]'` deletes the whole turn, children included. No `.*` needed.
 - Deleting turns renumbers survivors: if `turn[6]` becomes the first survivor, it is `turn[0]` the
   moment the batch lands. Re-list before a follow-up add/set. Inside one batch, old paths resolve
   against the pre-batch tree.
-- The summary note goes on the last surviving turn (`turn[0].note` if one survives). If the live
-  turn already exists, the add lands just before it and becomes stable cached prefix on the next
-  request.
 - Distill, do not narrate: put derived cut points, sizes, and path mappings in this skill or the
   summary note, not in the transcript. Re-deriving them next session is the failure this skill
   exists to prevent.
+
+start off by listing what you have, then planning the compaction, then carrying out the main part of the compaction, and then get rid of you planning out the compaction (should be one of the last reasoning turns) to get a basically perfect result

@@ -16,8 +16,9 @@ do by coming up with a moral justification in its reasoning,
 but turns out that letting the llm edit its own context window,
 something i explicitly prevented before, was a pretty good idea
 
-how does this work? i dont fucking know dont ask me, the actual implementation is a result
+i dont really know how it works, the actual implementation is a result
 of yelling at whatever was free on opencode at the time (dsv4 flash, then minimax m3.1)
+most of the code looks reasonable tho aside from the billion tests
 
 also a big note is that this is not intended to run outside of docker because there are no safety features at all, expect the llm to break everything
 
@@ -26,10 +27,15 @@ the claims made in the video might not work for this thing though, but i belive 
 the file format that i have is a little stupid because i didnt build it from ground up to be llm readable, only human readable, but by the time i got to actually having the model edit its own context the format became unreadable shit anyways so ¯\\_(ツ)_/¯ 
 because the file format is rather ass, there is a python tool for parsing it + skill included in /shared/skills by default. its probably possible to get the model to edit it if you ask idk tho its pretty good as is i think
 also if you dont tell the model to cut down its own context its pretty unlikely for it to just remember randomly to do that on its own
+the context editing is indended to be done via the included skill/python tool, which may be out of sync from the rust code, 
+that was an intentional decision so that people could implement their own parsers (by that i mean tell the model to figure it out on its own) 
+so that there is a bit more freedom to that i guess
+the default implementation is aint the best honestly but i dont have enough tokens to make it good lol
 # running
 
 look at how start.sh does it
-
+there is also ./start.sh --no-llama to only start the daemon
+it expects you to be in the docker group
 the daemon expects env variables something like this:
 
 ```bash
@@ -38,7 +44,7 @@ export SLOPFILE_API_BASE=http://127.0.0.1:8080
 export SLOPFILE_WORKDIR=/path/to/a/codebase
 export SLOPFILE_TRANSCRIPTS=./transcripts
 ```
-but like you really should be using the docker script
+but like you really should be using the docker script, this thing got no security at all so yea
 
 the daemon is innert until you send a request to it with the second binary `sf`
 `sf send` arms a session.
@@ -76,6 +82,7 @@ base_url = "https://openrouter.ai/api/v1"
 reasoning_style = "object"
 headers = { Authorization = "Bearer ${OPENROUTER_API_KEY}" }
 ```
+`reasoning_style = "object"` is needed because the name of the reasoning effort key is different with openai/llama ¯\\_(ツ)_/¯ 
 the ${} thing is for env variables, but because its in docker, you have to mirror them
 in the docker compose thingy too
 
@@ -112,6 +119,9 @@ endpoints skip.
 
 # misc
 - there is a known issue of the clanker running out of max token output sometimes, not sure if thats something i can fix
-- if a model edits its own context window so that its some custom tag like "notes" at the end, execution stalls
+- if a model edits its own context window so that its some custom tag like "notes" at the end, harness exits out of the loop (might be fixed now?)
 - this does not implement any image/video reading capabilities yet, maybe one day ill get deepseek to do it with something like @/path/to/image, but that messes with the entire context window as a fole thing, but i also dont want to have it as a base64 string or anything like that. the only real way of doing this entirely in file that i see would be to store the relatively low res latent state of the vision encoder, but i dont think there is an api for that
 - the file format should have been json instead of the markdown comment bullshit i went with, maybe one day ill get deepseek to rewrite that too. a moddified version of json would go hard. rn its some weird pseudo json but instead of {} "" [] i have the dumb comment marker
+- ./shared/skills/thermo-nuclear-code-quality-review.md is taken from https://github.com/cursor/plugins/blob/main/cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md with slight moddifications
+tools are not a part of the system prompt, see `pub fn definitions()` in tools.rs, it would get ugly if they were in the prompt too, and they are all defined in rust anyways so like why would you have custom ones at all
+- also, need to get MCP working one day too
