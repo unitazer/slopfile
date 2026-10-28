@@ -9,103 +9,172 @@ description: >
   transcript, edit my context file.
 ---
 
+Never `tail`, `head`, `sed`, `grep` or `cat` the transcript: re-reading it puts the same bytes back
+in your context. `list`, `read` and `check` are the only exceptions.
+
 ## List first
 
 ```bash
 python3 /shared/skills/session-edit.py list /shared/transcripts/<session>.md
 ```
 
-The output is a tree of addressable regions. Every segment has a 0-based index, including the
-first: `turn[0]`, `turn[0].assistant[0]`, `turn[0].assistant[0].call[0]`.
-
 ```
-643 lines, balanced
-system[0]
-turn[0]
-  user[0]
-  assistant[0]
-    reasoning[0]
-    text[0]
-    call[0]  bash("cargo test --all")
-  result[0]  bash ok 149ms
-  note[0]
-turn[1]
-...
+3590 lines, 74,210 content chars; live: turn[2]
+system[0]  1,204c
+turn[1]  4,112c
+  user[0]  196c
+  assistant[0]  2,930c
+    reasoning[0]  2,714c
+    call[0]  158c  bash("cargo test --all")
+  note[0]  745c
+  result[0]  241c  bash ok 149ms
+turn[2]  512c
+  user[0]  88c
+  assistant[0]  301c  ← live (self)
+    reasoning[0]  250c
+    call[0]  51c  bash("cargo test --all")
 ```
 
-Indices count same-named siblings at that level. A bare name is shorthand for `[0]`
-(`turn.note` means `turn[0].note`), but prefer the indexed form. A call shows the command or path;
-the result shows only its status, plus the first words of the error on failure, so the arguments
-are not repeated.
+The counts are exact content characters, not tokens. Every segment has a 0-based index, including
+the first: `turn[0].assistant[0].call[0]`. A bare name means `[0]`; a wildcard applies only to its
+own segment, so `turn[*].assistant[*].call[*]` is every call in every turn.
 
-A wildcard applies only to its own segment: `turn[*].assistant[*].call[*]` means every call in
-every turn. Put `[*]` on every level you mean to sweep.
+Sizes shrink after an edit, so one `drop` can renumber later siblings. Inside one `batch`, every
+path means what it meant in the listing before it.
 
-A single `drop` can renumber later siblings, so run `list` again before targeting a re-indexed
-path. A `batch` resolves every path against the listing from before it, so order inside a batch
-does not matter.
+## self, last, ranges
 
-## Batch: one call for the whole edit
+- `self` is the round this command runs in: the last assistant of the last turn. It is not "the
+  block you last saw". If a user message arrived after your listing, `self` is a newer, smaller
+  round.
+- Old blocks do not move. A user message appends a turn; it does not renumber the old ones, so
+  `turn[2]` from your listing is still `turn[2]`. Target old blocks by turn:
+  `set 'turn[2].assistant[*].reasoning' | ...`.
+- `turn[-1]` and `turn[last]` mean "now", and so does an open range like `turn[8..]`. For a cut
+  from a listing use an explicit end (`turn[8..11]`); an open range would include the live turn
+  and be refused.
+- `[a..b]` is inclusive; `[last]` and `[-1]` pick the last sibling (`result[-1]`).
 
-Run `list` once, send one batch, get back to work. Do not narrate the plan in your reasoning; that
-narration becomes context you have to prune again.
+If the session runs without thinking there is no reasoning block; summarize `self.text` instead.
 
-A compaction is one heredoc, one parse, one write, and one line of output:
+If a receipt shows `self` is smaller than you expected, an interruption moved it. The old block is
+still at the turn you listed; target it by turn.
+
+## While your tool runs
+
+`live: turn[N]` is normal, not a half-written turn. Generation has ended; the reasoning is closed
+and editable, and only the current *assistant* is left open so the harness can attach this call's
+result to it.
+
+`streaming:` means the file is being written right now. `list`, `read` and `check` still work;
+every write is refused until generation ends.
+
+Never drop the live round or the live turn: this call's result is attached to it, and dropping it
+makes the harness overwrite the previous round instead. Summarize `self` in place.
+
+## Notes are checkpoints
+
+A note records what you know at one point: what you tried, what failed, what is still open. It sits
+where you wrote it — after the call that wrote it, before that call's result — and later rounds are
+appended after it, so it stays at the cut instead of drifting to the end of the turn. Work after a
+note in the same turn is provisional: you can drop it and continue from the note.
+
+- Compact: drop the dead output and add one note at the cut. The note is memory, not your reply;
+  do not paste its body into `text` or `reasoning` as well.
+- Dead end: find the note that marks the last good point, drop the failed rounds/results/notes
+  after it, and write one note saying what failed and where to go next. Notes are small, so
+  prefer dropping the old checkpoint and writing a fresh one over carefully amending it.
+- Editing a note in place has one use: extending a checkpoint you just rolled back to. Never edit
+  an old note to "update memory"; add a new note and drop the old one in the same batch.
+- Keep every `user` message.
+
+To roll back to `turn[2].note[0]` when the live round is `assistant[4]`, take the indices from
+`list` and stop before the live round:
 
 ```bash
-python3 /shared/skills/session-edit.py batch /shared/transcripts/<session>.md <<'EOF'
-drop 'turn[*].assistant[*].call[*]'
-drop 'turn[*].result[*]'
-set 'turn[*].assistant[*].reasoning' | reran tokenize: 25k -> 6k
-add turn[0].note | compaction: dropped dead tool output
+python3 /shared/skills/session-edit.py batch FILE <<'EOF'
+drop 'turn[2].assistant[2..3]'
+drop 'turn[2].result[1..]'
+drop 'turn[2].note[1..]'
+drop 'turn[2].note[0]'
+add 'turn[-1].note' <<'END'
+## Checkpoint
+- tried X: no results
+- tried Y: no results
+- continue in the direction of Z
+END
 EOF
 ```
 
-Each line is `drop PATH`, `set PATH | BODY`, `append PATH | BODY`, or `add PATH | BODY`. Bodies are
-one line; use `set FILE PATH --body -` for a multi-line body. Quotes around a path are stripped.
-If any line fails, the whole batch is abandoned and the file is untouched. Do not chain single
-commands with `&&`: each one re-parses and rewrites the file.
+The note you add goes after the live assistant, so the live call's result still follows it and the
+loop does not mistake the note for your reply.
+
+## Batch: one call for the whole edit
+
+Run `list` once, then one batch. Do not narrate the plan in your reasoning: that narration becomes
+context you have to prune again.
+
+```bash
+python3 /shared/skills/session-edit.py batch /shared/transcripts/<session>.md <<'EOF'
+drop 'turn[1].assistant[*].call[*]'
+drop 'turn[1].result[*]'
+set 'turn[1].assistant[*].reasoning' | searched/fetched benchmarks
+set 'self.reasoning' | pruned turn[1]; findings in the note
+add 'turn[-1].note' <<'END'
+## Findings
+- ...
+END
+EOF
+```
+
+Drop the calls with the results; a call left without a result becomes a "not executed" stub in the
+next request. The note's own call would create another reasoning block to clean up, which is why
+the summary and the cleanup are one batch. The note body is multi-line; the outer shell heredoc
+must use a different tag (`EOF`).
+
+The note is memory, not your reply. Do not paste its body into `text` or `reasoning` as well, and
+do not treat the batch result as the end of the turn: keep working with the next tool call. The
+note is written before this call's result, so later rounds are appended after it; you do not need
+to add it again. A note duplicated into prose is how the model talks itself into stopping.
+
+Each line is `drop PATH`, `set PATH | BODY`, `append PATH | BODY`, `add PATH | BODY`, or
+`add PATH <<'TAG'`. Quotes around a path are stripped. If any line fails, the whole batch is
+abandoned and the file is untouched. Do not chain single commands with `&&`.
+
+To cut a tail, drop the old turns with an explicit end and summarize the live turn in the same
+batch. If the live turn is `turn[12]`:
+
+```bash
+python3 /shared/skills/session-edit.py batch FILE <<'EOF'
+drop 'turn[8..11]'
+set 'self.reasoning' | compacted turns 8-11; summary in the note
+add 'turn[-1].note' <<'END'
+## Summary
+- latest request: ...
+- open threads / paths / pids / decisions: ...
+END
+EOF
+```
+
+Keep every user message unless the user says to drop it.
 
 ## Single edits
 
 ```bash
 python3 /shared/skills/session-edit.py read FILE 'turn[0].note[0]'
-python3 /shared/skills/session-edit.py set  FILE 'turn[0].note[0]' --body '...'
-python3 /shared/skills/session-edit.py add  FILE 'turn[0].assistant[0].scratchpad' --body 'trying two approaches'
+python3 /shared/skills/session-edit.py set  FILE 'self.reasoning' --body '...'
+python3 /shared/skills/session-edit.py add  FILE 'turn[0].assistant[0].scratchpad' --body '...'
 python3 /shared/skills/session-edit.py drop FILE 'turn[0].*'
 ```
 
-`--body -` reads the body from stdin, which is how you pass something long or generated:
-
-```bash
-python3 /shared/skills/session-edit.py set FILE 'turn[0].note[0]' --body - <<'EOF'
-## STATE
-- 7 repos verified; search still running (pid in ghsearch.log)
-- next: curate candidates, then shallow-clone
-EOF
-```
+`--body -` reads the body from stdin for something long or generated.
 
 ## Adding your own roles
 
 Any name you invent inside a turn or an assistant is kept and handed back under that name, so you
-can keep a scratchpad or a ledger without cramming it into prose. `add` creates the region, and
-creates the turn/assistant it needs if they are missing:
-
-```bash
-python3 /shared/skills/session-edit.py add FILE 'turn[0].assistant[0].scratchpad' --body 'trying two approaches'
-python3 /shared/skills/session-edit.py add FILE 'turn[0].ledger' --body -   # kept verbatim
-```
-
-The new leaf has no index: `add` appends it and the listing shows the index it landed on. A batch
-`add` needs its parent path to exist already. Use a single `add` for a session that has no turn or
-assistant yet.
-
-## Why not rewrite the file
-
-`head -48 f.md > f.new && cat >> f.new <<'EOF' ... EOF && mv` works, and it is how you lose an
-afternoon: it hardcodes line numbers, and those numbers move every time the harness regenerates the
-fence or the file gains a line. It also makes you retype every region above the cut, which is the
-part you were trying to keep.
+can keep a scratchpad or ledger without cramming it into prose. `add` creates the region and the
+turn/assistant it needs, and its receipt shows the indexed path it landed on. A batch `add` needs
+its parent path to exist already.
 
 ## What the tool refuses
 
@@ -113,68 +182,21 @@ part you were trying to keep.
   the file alone.
 - Removing the ```toml fence at the top.
 - Part of a batch: one bad line means none of it is written.
+- Dropping the live round or the live turn, because this call's result will land there.
+- Writes while the file is `streaming:`.
+- Writes when the file changed after the tool read it (a user message or a subagent report landed).
+  Nothing is written; run `list` again and re-apply.
 
 Escaping is handled for you: `<` in a body is wrapped automatically, so a note containing
-`<!-- slopfile:note -->` stays text instead of becoming structure. Do not write that wrapper
-yourself.
-
-## Compaction
-
-Compaction is a tail operation. Pick a cut at a turn boundary, drop everything after it in one
-batch, and write a summary note at the tail of the surviving prefix. The summary must restate the
-user's latest request and every open thread, path, PID, and decision, because the cut is about to
-delete those bytes. Finished subtasks become a one-line result; verbose reasoning becomes a
-one-line summary; dead results and the calls that produced them are removed.
-
-Do this before the window fills. A failed search, a huge directory listing, or a wall of repeated
-logs belongs in the bin immediately.
-
-## Why the tail
-
-The harness sends this file as the prompt, and the provider caches the KV of the prefilled prefix.
-A byte changed at position P invalidates the cache from P to the end. Deletion is nearly free; only
-new bytes cost.
-
-- Cut at the tail. Everything before the cut stays cached for the rest of the session.
-- Do not scatter drops across turns. Each mid-file drop makes every later request re-prefill from
-  that drop to the end. Collect mid-file removals into one compaction.
-- Treat the top as read-only. The toml fence, the system region, and summarized old turns are the
-  deepest cached prefix. Never reword them in place; cut before an old turn and summarize it.
-- Notes get buried. A note at the tail of turn N is mid-file once turn N+1 lands, and setting it
-  re-prefills from there to the end. Write running notes in the current turn; do not update a
-  buried one. The permanent layer is the compaction summary at the tail of the surviving prefix.
-- Cut where it hurts least. The summary must restate the bytes the next turn needs most.
+`<!-- slopfile:note -->` stays text. Do not write that wrapper yourself.
 
 ## Trust the output
 
-If a batch printed `applied N edits`, it wrote the file. Do not read or grep the session file to
-verify: that re-injects it as fresh context and defeats the point of dropping it. Record what you
-dropped and why in the summary note of the same batch.
+`set`, `append`, `add`, `drop` and `batch` print the resolved paths (including
+`self → turn[2].assistant[3].reasoning (92c)`) and exact line/character deltas. If it printed, it
+wrote. Do not read or grep the session file to verify: that re-injects it as fresh context and
+defeats the point of dropping it.
 
-Hygiene:
-- Keep session-edit's stderr visible. A validation error means it refused to write; hiding it with
-  `2>/dev/null` turns a refused edit into a silent no-op.
-- `ctx:N` lags one call and only moves on the next result. Judge by trend across calls.
-- `note` lives at the turn level. Inside an assistant, use your own role name (`scratchpad`,
-  `ledger`). The tool refuses anything it cannot keep parseable and says why.
-
-## Compaction is two stages
-
-Stage 1, the cut: one batch drops the cut turns and adds the summary at the tail of the surviving
-prefix. If the summary is multi-line, add it with a separate `--body -` call; batch bodies are one
-line.
-
-Stage 2, the cleanup: the compaction's own reasoning (cut-point math, path mapping) lands in the
-surviving file as dead weight. Drop it in one small batch right after stage 1, while the cut turn is
-still next to the live turn. Keep the user messages (unless told by the user that they are not needed anymore) and important text lines
-## What a cut changes
-
-- `drop 'turn[3]'` deletes the whole turn, children included. No `.*` needed.
-- Deleting turns renumbers survivors: if `turn[6]` becomes the first survivor, it is `turn[0]` the
-  moment the batch lands. Re-list before a follow-up add/set. Inside one batch, old paths resolve
-  against the pre-batch tree.
-- Distill, do not narrate: put derived cut points, sizes, and path mappings in this skill or the
-  summary note, not in the transcript. Re-deriving them next session is the failure this skill
-  exists to prevent.
-
-start off by listing what you have, then planning the compaction, then carrying out the main part of the compaction, and then get rid of you planning out the compaction (should be one of the last reasoning turns) to get a basically perfect result
+Keep stderr visible: a validation error means it refused to write, and `2>/dev/null` turns that
+into a silent no-op. `ctx:N` lags one call; judge by trend. `note` lives at the turn level; inside
+an assistant use your own role name.

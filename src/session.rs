@@ -171,6 +171,11 @@ pub struct PendingQuestion {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Round {
   pub assistant: Assistant,
+  /// Notes the model wrote during this round. They sit between this round's assistant message
+  /// and its results, which is where they were written: the batch runs inside the tool call, so
+  /// its note exists before the call's result does. Keeping them here rather than on the turn
+  /// pins a note to the moment it was written instead of letting every later round move it.
+  pub notes: Vec<Note>,
   pub results: Vec<ToolOutcome>,
 }
 
@@ -690,17 +695,26 @@ fn turn_of(node: &Node, path: &[String], problems: &mut Vec<String>) -> Turn {
         misplaced(problems, &child.name, path, "a second `user` region")
       }
       USER => turn.user = Some(unescape(&child.body())),
-      NOTE => turn.notes.push(Note {
-        by: note_by(&child.payload),
-        text: unescape(&child.body()),
-      }),
+      NOTE => {
+        let note = Note {
+          by: note_by(&child.payload),
+          text: unescape(&child.body()),
+        };
+        // A model note is memory written at a point in the work, so it belongs to the round that
+        // was open when it was written: rendering has to put it back between that round's
+        // assistant and its results. Harness notes are instructions and stay at the turn's tail.
+        match (&note.by, current.as_mut()) {
+          (NoteBy::Model, Some(round)) => round.notes.push(note),
+          _ => turn.notes.push(note),
+        }
+      }
       ASSISTANT => {
         if let Some(round) = current.take() {
           rounds.push(round);
         }
         current = Some(Round {
           assistant: assistant_of(child, path, problems),
-          results: Vec::new(),
+          ..Round::default()
         });
       }
       RESULT => {
@@ -845,10 +859,13 @@ impl Session {
       }
       for (ri, round) in turn.rounds.iter().enumerate() {
         // A note belongs directly in the turn, never inside an open assistant, so the assistant has
-        // to be closed whenever this turn has notes. The turn itself stays open either way, so an
+        // to be closed whenever this round has notes. The turn itself stays open either way, so an
         // interrupted turn is still resumable -- it just stops pretending to be mid-sentence.
-        let open_asst =
-          open_here && open_assistant && ri + 1 == turn.rounds.len() && turn.notes.is_empty();
+        let open_asst = open_here
+          && open_assistant
+          && ri + 1 == turn.rounds.len()
+          && round.notes.is_empty()
+          && turn.notes.is_empty();
         out.push_str(&open_line(ASSISTANT, None));
         if let Some(r) = &round.assistant.reasoning {
           out.push_str(&leaf_inner(
@@ -876,6 +893,14 @@ impl Session {
         if !open_asst {
           out.push_str(&close_line());
         }
+        // A note written by this round's tool call sits between the call and its result. That is
+        // where it was written: the batch runs while the call is still pending, so the note exists
+        // before the result does. Keeping it here is what stops later rounds from moving it to the
+        // end of the turn, and it keeps the result last in the request, which is what tells the
+        // model its turn is not over.
+        for note in &round.notes {
+          out.push_str(&leaf(&note.text, NOTE, None));
+        }
         for result in &round.results {
           let head = ResultHeader {
             id: result.id.clone(),
@@ -886,12 +911,10 @@ impl Session {
           out.push_str(&leaf(&result.output, RESULT, Some(&json(&head))));
         }
       }
-      // Notes render after the rounds, not before. A note is written at a moment of consequence --
-      // the context filled, a ceiling was hit -- and its whole job is to change what the model does
-      // next. Rendered first it was message #2 in the conversation with the entire rest of the
-      // history after it, which is the weakest possible place to put an instruction, and it made
-      // "the old turns above" point at the system prompt. Last is also where a human reading the
-      // file expects to find the explanation for everything above it.
+      // Harness notes render after the rounds. These notes exist to change what the model does
+      // *next* -- "your context filled, prune the file" -- so they have to arrive as the most
+      // recent thing it read. A model note with no round to belong to (a hand-written note at the
+      // very start of a turn) is carried here too rather than being dropped.
       for note in &turn.notes {
         let payload = match note.by {
           NoteBy::Harness => Some(r#"{"by":"harness"}"#),
@@ -994,6 +1017,9 @@ impl Session {
       {
         out.push(ChatMessage::user(user.trim()));
       }
+      // A model note that predates every round in its turn (a hand-written note at the top) has
+      // nowhere else to go. Notes written during a round live on that round and are emitted below.
+      push_model_notes(&mut out, &turn.notes);
       // A role the model gave itself comes back to it under its own name, so the thing it asked
       // for is still the thing it can see.
       for (_name, body) in &turn.custom {
@@ -1002,15 +1028,7 @@ impl Session {
           out.push(assistant_message(Some(text), None, Vec::new()));
         }
       }
-      // A model note must not be the last message after tool results. It *is* an assistant turn,
-      // so ending the request with it tells the model it already replied; the next call comes back
-      // empty and the tool loop stops. Keep the note near the end, but before the last round's
-      // output (and therefore before its results).
-      let last_round = turn.rounds.len().checked_sub(1);
-      for (ri, round) in turn.rounds.iter().enumerate() {
-        if Some(ri) == last_round {
-          push_model_notes(&mut out, &turn.notes);
-        }
+      for round in turn.rounds.iter() {
         let mut calls = round.assistant.calls.clone();
         for result in &round.results {
           if !calls.iter().any(|c| c.id == result.id) {
@@ -1033,14 +1051,18 @@ impl Session {
           .as_deref()
           .map(str::trim)
           .filter(|t| !t.is_empty());
-        if text.is_none() && reasoning.is_none() && calls.is_empty() && round.results.is_empty() {
-          continue;
+        if text.is_some() || reasoning.is_some() || !calls.is_empty() {
+          out.push(assistant_message(
+            text,
+            reasoning,
+            if calls.is_empty() { Vec::new() } else { calls },
+          ));
         }
-        out.push(assistant_message(
-          text,
-          reasoning,
-          if calls.is_empty() { Vec::new() } else { calls },
-        ));
+        // The note was written by this round's call, before the call returned. Emitting it here
+        // reproduces that order: assistant message, note, tool result. The result stays last, so
+        // the model sees something it still has to react to, and the note never gets moved to the
+        // end of the turn as later rounds are added.
+        push_model_notes(&mut out, &round.notes);
         for result in &round.results {
           out.push(ChatMessage::tool(
             result.id.clone(),
@@ -1048,9 +1070,6 @@ impl Session {
             result.output.clone(),
           ));
         }
-      }
-      if last_round.is_none() {
-        push_model_notes(&mut out, &turn.notes);
       }
       // Harness notes come after the rounds. These notes exist to change what the model does
       // *next* -- "your context filled, prune the file" -- so they have to arrive as the most
@@ -1226,10 +1245,20 @@ impl Session {
     if self.turns.is_empty() {
       self.turns.push(Turn::default());
     }
-    self.turns.last_mut().expect("turn").notes.push(Note {
+    let turn = self.turns.last_mut().expect("turn");
+    let note = Note {
       by,
       text: text.into(),
-    });
+    };
+    // A model note is written during a round, so it belongs to that round; keeping it on the turn
+    // would let every later round move it. Harness notes are instructions and stay at the tail.
+    if note.by == NoteBy::Model
+      && let Some(round) = turn.rounds.last_mut()
+    {
+      round.notes.push(note);
+      return;
+    }
+    turn.notes.push(note);
   }
 
   /// Asking a question is a tool call with a result that says it is waiting, so the call/result

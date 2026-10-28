@@ -125,3 +125,4 @@ endpoints skip.
 - ./shared/skills/thermo-nuclear-code-quality-review.md is taken from https://github.com/cursor/plugins/blob/main/cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md with slight moddifications
 tools are not a part of the system prompt, see `pub fn definitions()` in tools.rs, it would get ugly if they were in the prompt too, and they are all defined in rust anyways so like why would you have custom ones at all
 - also, need to get MCP working one day too
+- if you need to check up on how the clanker is doing, use tail -F transcripts/x.md

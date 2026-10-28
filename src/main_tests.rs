@@ -58,6 +58,7 @@ fn with_question(input_tail: &str) -> Session {
     user: Some("pick one".to_string()),
     notes: vec![],
     rounds: vec![session::Round {
+      notes: Vec::new(),
       assistant: session::Assistant {
         custom: Vec::new(),
         reasoning: None,

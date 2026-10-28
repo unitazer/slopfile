@@ -93,11 +93,12 @@ fn sample_session() -> Session {
   session.turns.push(Turn {
     custom: Vec::new(),
     user: Some("hi".to_string()),
-    notes: vec![Note {
-      by: NoteBy::Model,
-      text: "still digging".to_string(),
-    }],
+    notes: vec![],
     rounds: vec![Round {
+      notes: vec![Note {
+        by: NoteBy::Model,
+        text: "still digging".to_string(),
+      }],
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: Some("look around first".to_string()),
@@ -123,6 +124,7 @@ fn sample_session() -> Session {
     user: Some("now compress that".to_string()),
     notes: vec![],
     rounds: vec![Round {
+      notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -144,7 +146,14 @@ fn same_shape(a: &Session, b: &Session) -> bool {
     && a.input == b.input
     && a.open == b.open
     && a.turns.iter().zip(b.turns.iter()).all(|(x, y)| {
-      x.user == y.user && x.notes.len() == y.notes.len() && x.rounds.len() == y.rounds.len()
+      x.user == y.user
+        && x.notes.len() == y.notes.len()
+        && x.rounds.len() == y.rounds.len()
+        && x
+          .rounds
+          .iter()
+          .zip(y.rounds.iter())
+          .all(|(p, q)| p.notes.len() == q.notes.len())
     })
 }
 
@@ -268,7 +277,7 @@ fn render_parse_round_trip() {
   assert_eq!(parsed.config.tools_excluded, vec!["question".to_string()]);
   assert_eq!(parsed.system, "you are helpful\nsecond line");
   assert_eq!(parsed.turns[0].rounds[0].results[0].output, "1: src");
-  assert_eq!(parsed.turns[0].notes[0].text, "still digging");
+  assert_eq!(parsed.turns[0].rounds[0].notes[0].text, "still digging");
   assert_eq!(parsed.render(), rendered, "rendering is idempotent");
 }
 
@@ -525,6 +534,7 @@ fn request_messages_synthesizes_a_call_for_an_orphan_result() {
     user: Some("go".to_string()),
     notes: vec![],
     rounds: vec![Round {
+      notes: Vec::new(),
       assistant: Assistant::default(),
       results: vec![ToolOutcome {
         id: "orphan".to_string(),
@@ -546,6 +556,7 @@ fn request_messages_synthesizes_a_call_for_an_orphan_result() {
 #[test]
 fn multi_round_turn_keeps_each_assistant_with_its_own_results() {
   let round = |id: &str, text: &str, out: &str| Round {
+    notes: Vec::new(),
     assistant: Assistant {
       custom: Vec::new(),
       reasoning: None,
@@ -632,6 +643,7 @@ fn question_round_trip_and_answer() {
     user: Some("pick".to_string()),
     notes: vec![],
     rounds: vec![Round {
+      notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1402,16 +1414,17 @@ fn regions_out_of_place_are_reported_not_dropped() {
 }
 
 #[test]
-fn a_model_note_never_produces_two_adjacent_assistant_messages() {
+fn a_model_note_is_part_of_the_assistant_message_that_wrote_it() {
   let mut session = Session::default();
   session.turns.push(Turn {
     custom: Vec::new(),
-    user: None,
-    notes: vec![Note {
-      by: NoteBy::Model,
-      text: "remember: the user wants tests".to_string(),
-    }],
+    user: Some("go".to_string()),
+    notes: vec![],
     rounds: vec![Round {
+      notes: vec![Note {
+        by: NoteBy::Model,
+        text: "remember: the user wants tests".to_string(),
+      }],
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1423,23 +1436,26 @@ fn a_model_note_never_produces_two_adjacent_assistant_messages() {
     question: None,
   });
   let messages = session.request_messages();
-  assert_eq!(messages.len(), 1, "one message, not two: {messages:?}");
-  let content = messages[0].content.as_deref().unwrap();
+  assert_eq!(messages.len(), 2, "user + one assistant: {messages:?}");
+  assert_eq!(messages[0].role, Role::User);
+  assert_eq!(messages[1].role, Role::Assistant);
+  let content = messages[1].content.as_deref().unwrap();
   assert!(content.contains("remember"), "{content}");
   assert!(content.contains("Understood"), "{content}");
 }
 
 #[test]
-fn a_model_note_does_not_trail_the_tool_results_it_was_written_after() {
+fn a_model_note_is_sent_before_the_result_of_the_round_that_wrote_it() {
   let mut session = Session::default();
   session.turns.push(Turn {
     custom: Vec::new(),
     user: Some("go".to_string()),
-    notes: vec![Note {
-      by: NoteBy::Model,
-      text: "remember: the next step is to re-run the tests".to_string(),
-    }],
+    notes: vec![],
     rounds: vec![Round {
+      notes: vec![Note {
+        by: NoteBy::Model,
+        text: "remember: the next step is to re-run the tests".to_string(),
+      }],
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1461,12 +1477,310 @@ fn a_model_note_does_not_trail_the_tool_results_it_was_written_after() {
     question: None,
   });
   let messages = session.request_messages();
+  let note_at = messages
+    .iter()
+    .position(|m| m.content.as_deref() == Some("remember: the next step is to re-run the tests"))
+    .expect("the note is still in the request");
+  let tool_at = messages
+    .iter()
+    .position(|m| m.role == Role::Tool)
+    .expect("the result is in the request");
+  assert!(note_at < tool_at, "{messages:?}");
   assert_eq!(
     messages.last().unwrap().role,
     Role::Tool,
     "the tool result must be the prompt, not the model's own note: {messages:?}"
   );
   assert!(session.needs_generation());
+}
+
+#[test]
+fn a_model_note_does_not_trail_the_empty_round_a_generation_starts_with() {
+  let mut session = Session::default();
+  session.turns.push(Turn {
+    custom: Vec::new(),
+    user: Some("go".to_string()),
+    notes: vec![],
+    rounds: vec![Round {
+      notes: vec![Note {
+        by: NoteBy::Model,
+        text: "remember: the findings are in the note".to_string(),
+      }],
+      assistant: Assistant {
+        custom: Vec::new(),
+        reasoning: None,
+        text: None,
+        calls: vec![Call {
+          id: "c1".to_string(),
+          name: "bash".to_string(),
+          arguments: r#"{"command":"ls"}"#.to_string(),
+        }],
+      },
+      results: vec![ToolOutcome {
+        id: "c1".to_string(),
+        name: "bash".to_string(),
+        ok: true,
+        ms: 0,
+        output: "src".to_string(),
+      }],
+    }],
+    question: None,
+  });
+  // What the daemon does before asking again: a live turn gets a fresh, still empty round.
+  session.begin_round();
+
+  let messages = session.request_messages();
+  assert_eq!(
+    messages.last().unwrap().role,
+    Role::Tool,
+    "the empty tail round must not push the model's note to the end: {messages:?}"
+  );
+  assert!(
+    messages.iter().any(|m| m.role == Role::Assistant
+      && m.content.as_deref() == Some("remember: the findings are in the note")),
+    "the note is still there, just not last: {messages:?}"
+  );
+}
+
+#[test]
+fn a_model_note_with_no_round_goes_after_the_user() {
+  let mut session = Session::default();
+  session.turns.push(Turn {
+    custom: Vec::new(),
+    user: Some("carry on".to_string()),
+    notes: vec![Note {
+      by: NoteBy::Model,
+      text: "remember: the findings are in the note".to_string(),
+    }],
+    rounds: Vec::new(),
+    question: None,
+  });
+
+  let messages = session.request_messages();
+  assert_eq!(messages.len(), 2, "{messages:?}");
+  assert_eq!(messages[0].role, Role::User);
+  assert_eq!(messages[0].content.as_deref(), Some("carry on"));
+  assert_eq!(messages[1].role, Role::Assistant);
+}
+
+#[test]
+fn a_model_note_does_not_move_when_later_rounds_are_added() {
+  fn key(
+    m: &ChatMessage,
+  ) -> (
+    Role,
+    Option<String>,
+    Option<String>,
+    Option<Vec<ToolCall>>,
+    Option<String>,
+  ) {
+    (
+      m.role,
+      m.content.clone(),
+      m.reasoning_content.clone(),
+      m.tool_calls.clone(),
+      m.tool_call_id.clone(),
+    )
+  }
+
+  let round = |id: &str, text: &str, out: &str| Round {
+    notes: Vec::new(),
+    assistant: Assistant {
+      custom: Vec::new(),
+      reasoning: None,
+      text: Some(text.to_string()),
+      calls: vec![Call {
+        id: id.to_string(),
+        name: "bash".to_string(),
+        arguments: "{}".to_string(),
+      }],
+    },
+    results: vec![ToolOutcome {
+      id: id.to_string(),
+      name: "bash".to_string(),
+      ok: true,
+      ms: 0,
+      output: out.to_string(),
+    }],
+  };
+
+  let mut first_round = round("c0", "first", "one");
+  first_round.notes.push(Note {
+    by: NoteBy::Model,
+    text: "remember: the plan is in the note".to_string(),
+  });
+
+  let mut session = Session::default();
+  session.turns.push(Turn {
+    custom: Vec::new(),
+    user: Some("go".to_string()),
+    notes: vec![],
+    rounds: vec![first_round],
+    question: None,
+  });
+  session.begin_round();
+  let first = session.request_messages();
+
+  session.turns[0].rounds[1] = round("c1", "second", "two");
+  session.begin_round();
+  let second = session.request_messages();
+
+  assert!(second.len() > first.len(), "{first:?} {second:?}");
+  for (before, after) in first.iter().zip(&second) {
+    assert_eq!(
+      key(before),
+      key(after),
+      "the note must stay where it was written: {first:?} vs {second:?}"
+    );
+  }
+}
+
+#[test]
+fn a_model_note_renders_between_its_round_and_that_rounds_results() {
+  let mut session = Session::default();
+  session.turns.push(Turn {
+    custom: Vec::new(),
+    user: Some("go".to_string()),
+    notes: vec![],
+    rounds: vec![Round {
+      notes: vec![Note {
+        by: NoteBy::Model,
+        text: "tried X: no results".to_string(),
+      }],
+      assistant: Assistant {
+        custom: Vec::new(),
+        reasoning: None,
+        text: Some("searching".to_string()),
+        calls: vec![Call {
+          id: "c1".to_string(),
+          name: "bash".to_string(),
+          arguments: r#"{"command":"search X"}"#.to_string(),
+        }],
+      },
+      results: vec![ToolOutcome {
+        id: "c1".to_string(),
+        name: "bash".to_string(),
+        ok: true,
+        ms: 0,
+        output: "nothing useful".to_string(),
+      }],
+    }],
+    question: None,
+  });
+
+  let rendered = session.render();
+  let call = rendered.find("slopfile:call").expect("call");
+  let note = rendered.find("tried X").expect("note");
+  let result = rendered.find("slopfile:result").expect("result");
+  assert!(call < note && note < result, "{rendered}");
+
+  let (parsed, report) = parse(&rendered);
+  assert!(report.is_clean(), "{report:?}");
+  assert_eq!(
+    parsed.turns[0].rounds[0].notes[0].text,
+    "tried X: no results"
+  );
+  assert_eq!(parsed.render(), rendered, "rendering is idempotent");
+}
+
+#[test]
+fn a_note_added_while_a_call_is_pending_lands_before_that_calls_result() {
+  // Exactly what the batch writes: the assistant region is closed, the note follows it, and the
+  // result does not exist yet because the call is still running.
+  let file = session_file(&container(
+    TURN,
+    &format!(
+      "{}{}{}",
+      region(USER, "go"),
+      container(
+        ASSISTANT,
+        &format!(
+          "{}{}",
+          region(TEXT, "searching"),
+          call_region("c1", "bash", r#"{"command":"search X"}"#)
+        )
+      ),
+      note_region("model", "tried X: no results")
+    ),
+  ));
+  let (mut session, report) = parse(&file);
+  assert!(report.is_clean(), "{report:?}");
+  assert_eq!(session.turns[0].rounds[0].notes.len(), 1);
+
+  // The daemon attaches the result after adopting the edit.
+  session.finish_round(
+    vec![Call {
+      id: "c1".into(),
+      name: "bash".into(),
+      arguments: r#"{"command":"search X"}"#.into(),
+    }],
+    vec![ToolOutcome {
+      id: "c1".into(),
+      name: "bash".into(),
+      ok: true,
+      ms: 0,
+      output: "nothing useful".into(),
+    }],
+  );
+
+  let rendered = session.render();
+  let note = rendered.find("tried X").unwrap();
+  let result = rendered.find("slopfile:result").unwrap();
+  assert!(note < result, "{rendered}");
+
+  let messages = session.request_messages();
+  assert_eq!(messages.last().unwrap().role, Role::Tool, "{messages:?}");
+}
+
+#[test]
+fn a_legacy_tail_note_attaches_to_the_last_round_on_reparse() {
+  // What the old renderer wrote: a model note at the end of the turn, after the results.
+  let mut session = Session::default();
+  session.turns.push(Turn {
+    custom: Vec::new(),
+    user: Some("go".to_string()),
+    notes: vec![Note {
+      by: NoteBy::Model,
+      text: "tried X: no results".to_string(),
+    }],
+    rounds: vec![Round {
+      notes: Vec::new(),
+      assistant: Assistant {
+        custom: Vec::new(),
+        reasoning: None,
+        text: None,
+        calls: vec![Call {
+          id: "c1".to_string(),
+          name: "bash".to_string(),
+          arguments: r#"{"command":"ls"}"#.to_string(),
+        }],
+      },
+      results: vec![ToolOutcome {
+        id: "c1".to_string(),
+        name: "bash".to_string(),
+        ok: true,
+        ms: 0,
+        output: "src".to_string(),
+      }],
+    }],
+    question: None,
+  });
+
+  let legacy = session.render();
+  let (parsed, report) = parse(&legacy);
+  assert!(report.is_clean(), "{report:?}");
+  assert_eq!(
+    parsed.turns[0].rounds[0].notes[0].text,
+    "tried X: no results"
+  );
+  assert!(parsed.turns[0].notes.is_empty());
+
+  let stabilised = parsed.render();
+  assert!(
+    stabilised.find("tried X").unwrap() < stabilised.find("slopfile:result").unwrap(),
+    "the note moves back before the result on the first render: {stabilised}"
+  );
+  assert_eq!(parse(&stabilised).0.render(), stabilised);
 }
 
 #[test]
