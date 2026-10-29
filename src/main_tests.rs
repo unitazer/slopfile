@@ -420,7 +420,7 @@ fn context_full_note_is_a_harness_note_and_not_work() {
   session.begin_round();
   session.push_text("partial reply here");
   session.close_turn();
-  flow::add_context_full_note(&mut session);
+  session.add_note(session::NoteBy::Harness, flow::CONTEXT_FULL_NOTE);
   write_session(&path, &session);
 
   let parsed = load(&path);
@@ -1570,9 +1570,9 @@ sys
 
   // And the file the model is shown must still be editable by the model.
   assert!(
-    crate::context::check_edit(&out).is_ok(),
+    crate::session::adopt(&out).map(drop).is_ok(),
     "the file we just wrote is one we now refuse to edit: {:?}",
-    crate::context::check_edit(&out)
+    crate::session::adopt(&out).map(drop)
   );
 }
 
@@ -1852,10 +1852,8 @@ fn a_freshly_created_transcript_explains_itself_and_survives_a_round_trip() {
   crate::control::create_session(&p, &cfg, &[]).expect("create");
 
   let text = std::fs::read_to_string(&p).unwrap();
-  assert!(
-    text.contains(crate::context::CONTEXT_BEGIN) && text.contains("This conversation is that file"),
-    "the file the user opens says nothing about editing itself:\n{text}"
-  );
+  // The managed block is rendered without a sentinel fence; it opens with the path line.
+  assert!(text.contains("This conversation is that file"));
   assert!(text.contains(&format!("Context file: {}", p.display())));
 
   // The managed block contains literal `<`, so it is escaped on render. It must come back
@@ -1948,57 +1946,6 @@ fn shortening_is_stable_across_repeated_passes() {
     once,
     "shortening twice must not renumber c1 -> c2"
   );
-}
-
-// ---- context fill pressure
-
-#[test]
-fn the_window_line_appears_only_past_the_threshold() {
-  use crate::context::{PRUNE_THRESHOLD_PCT, Window, refresh_paragraph};
-  let path = std::path::Path::new("/t/1.md");
-  let at = |pct: u32| {
-    let budget = 100_000u32;
-    refresh_paragraph(
-      "base",
-      path,
-      Some(Window {
-        used: (budget as usize * pct as usize) / 100,
-        usable: budget,
-        total: budget,
-      }),
-    )
-  };
-  assert!(
-    !at(0).contains("Window:"),
-    "a fresh session must not be nagged"
-  );
-  assert!(
-    !at(PRUNE_THRESHOLD_PCT - 1).contains("Window:"),
-    "one below the threshold must be quiet"
-  );
-  let hot = at(PRUNE_THRESHOLD_PCT);
-  assert!(
-    hot.contains("Window:"),
-    "the threshold itself must trigger: {hot}"
-  );
-  assert!(hot.contains("70%"), "the number must be stated: {hot}");
-  assert!(hot.contains("Prune"), "it must say what to do: {hot}");
-  assert_eq!(hot.matches("Window:").count(), 1);
-}
-
-#[test]
-fn a_zero_budget_does_not_divide_by_zero() {
-  use crate::context::{Window, refresh_paragraph};
-  let out = refresh_paragraph(
-    "base",
-    std::path::Path::new("/t/1.md"),
-    Some(Window {
-      used: 999,
-      usable: 0,
-      total: 0,
-    }),
-  );
-  assert!(!out.contains("Window:"), "{out}");
 }
 
 #[test]
@@ -2592,18 +2539,6 @@ fn the_context_size_note_is_on_by_default_and_absent_when_off() {
   assert!(context_size_note(&off, &session_on).contains("ctx:N"));
 }
 
-/// It must not be the last thing in the system prompt: `refresh_paragraph` trims that region's tail,
-/// so a note ending in a newline comes back different depending on which path wrote the file.
-#[test]
-fn the_context_size_note_survives_the_managed_block_rewrite() {
-  let cfg = yolo_cfg();
-  let session = session_template(&cfg, &[]);
-  let once =
-    crate::context::refresh_paragraph(&session.system, std::path::Path::new("/t/1.md"), None);
-  let twice = crate::context::refresh_paragraph(&once, std::path::Path::new("/t/1.md"), None);
-  assert_eq!(once, twice, "the system block must be idempotent");
-}
-
 /// Written once into the transcript. Injected per request it would be re-appended to every earlier
 /// result on every turn, so the file would grow without bound.
 #[test]
@@ -2685,49 +2620,6 @@ fn the_tag_survives_into_the_next_request_without_growing() {
   };
   assert_eq!(count(&a), 1, "the tag is written once into the file");
   assert_eq!(count(&a), count(&b), "and rebuilding must not add another");
-}
-
-/// The percentage is deliberately measured against `usable`/// The percentage is deliberately measured against `usable`/// The percentage is deliberately measured against `usable` (the window minus what the reply
-/// needs), not the full window -- truncation happens at `usable`, so that is the number that
-/// decides when pruning pays. Measured against `total` it could never cross the threshold and the
-/// reminder would never fire at all. These pin the production pairing, where the two differ.
-#[test]
-fn the_pressure_line_is_measured_against_the_conversation_budget() {
-  use crate::context::{Window, refresh_paragraph};
-  let p = "/t/1.md";
-  // At the shipped 65k window, 40k is reserved for the answer, leaving 25536 for conversation.
-  let line = refresh_paragraph(
-    "base",
-    std::path::Path::new(p),
-    Some(Window {
-      used: 17_880,
-      usable: 25_536,
-      total: 65_536,
-    }),
-  );
-  assert!(
-    line.contains("Window:"),
-    "70% of the conversation budget must fire the reminder: {line}"
-  );
-  assert!(
-    line.contains("65536") && line.contains("25536"),
-    "both figures, so the fraction is checkable: {line}"
-  );
-  // Same point measured against the full window would read 27% and stay silent -- which is the
-  // bug this pairing exists to avoid.
-  assert!(
-    !refresh_paragraph(
-      "base",
-      std::path::Path::new(p),
-      Some(Window {
-        used: 17_880,
-        usable: 65_536,
-        total: 65_536,
-      }),
-    )
-    .contains("Window:"),
-    "against the full window it must not nag yet"
-  );
 }
 
 /// A truncated reply is exactly the shape with more than one think block. If the second one is

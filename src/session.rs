@@ -664,6 +664,22 @@ pub fn parse(text: &str) -> (Session, ParseReport) {
   (session, report)
 }
 
+/// Validate a model-authored edit and hand back the session it describes. Returns the reason the
+/// edit was refused so the caller can put it in the tool result.
+pub fn adopt(edited: &str) -> Result<Session, String> {
+  let (parsed, report) = parse(edited);
+  if !report.is_clean() {
+    return Err(report.problems().join("; "));
+  }
+  if fence_bounds(&parsed.preamble).is_none() {
+    return Err("the ```toml header must stay at the top of the file".to_string());
+  }
+  if parsed.system.trim().is_empty() {
+    return Err("the `system` region must remain".to_string());
+  }
+  Ok(parsed)
+}
+
 fn attach(stack: &mut [Node], roots: &mut Vec<Node>, node: Node) {
   match stack.last_mut() {
     Some(parent) => parent.children.push(node),

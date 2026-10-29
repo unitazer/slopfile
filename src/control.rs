@@ -475,6 +475,6 @@ pub fn create_session(path: &Path, cfg: &AppConfig, excluded: &[String]) -> Resu
   // Write the context instructions into the file itself, not just into each request, so the
   // transcript explains what it is to anyone reading it and to a model resuming from it.
   let mut session = flow::session_template(cfg, excluded);
-  session.system = crate::context::refresh_paragraph(&session.system, path, None);
+  session.system = crate::prompt::with_context_paragraph(&session.system, path);
   transcript::save(path, &session)
 }

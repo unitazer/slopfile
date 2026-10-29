@@ -334,7 +334,7 @@ fn write(workdir: &Path, args: &Value, context_file: Option<&Path>) -> ToolResul
   } else {
     path!(workdir, path_str)
   };
-  if is_context && let Err(why) = crate::context::check_edit(content) {
+  if is_context && let Err(why) = crate::session::adopt(content).map(drop) {
     return ToolResult::err(format!(
       "write: {path_str} is this session's context file and that rewrite was refused: {why}"
     ));
@@ -381,7 +381,7 @@ fn edit(workdir: &Path, args: &Value, context_file: Option<&Path>) -> ToolResult
   };
   let mut updated = content;
   updated.replace_range(idx..idx + old.len(), new);
-  if is_context && let Err(why) = crate::context::check_edit(&updated) {
+  if is_context && let Err(why) = crate::session::adopt(&updated).map(drop) {
     return ToolResult::err(format!(
       "edit: that change to {path_str} would break this session's context file, so it was refused: {why}"
     ));

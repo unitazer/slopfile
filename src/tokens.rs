@@ -1,6 +1,6 @@
 use crate::api::LlamaClient;
 use crate::session::Session;
-use crate::types::{AppConfig, ChatMessage, Endpoint, PromptSample, Role};
+use crate::types::{AppConfig, ChatMessage, Endpoint, PromptSample, Role, SessionConfig};
 
 pub(crate) async fn request_token_count(
   endpoint: &Endpoint,
@@ -295,7 +295,7 @@ pub async fn build_request_messages(
       payload_chars: payload,
     });
   };
-  let cap = prompt_budget(context_budget(session, cfg));
+  let cap = prompt_budget(context_budget(&session.config, cfg));
   let (truncated, kept_sum) = truncate_messages(messages, &counts, cap);
   if kept_sum > cap as usize {
     return Err(format!(
@@ -328,9 +328,8 @@ pub fn context_bands(budget: u32) -> (u32, u32) {
   (lo, hi)
 }
 
-pub fn context_budget(session: &Session, cfg: &AppConfig) -> u32 {
-  session
-    .config
+pub fn context_budget(session_config: &SessionConfig, cfg: &AppConfig) -> u32 {
+  session_config
     .max_context_tokens
     .unwrap_or(cfg.max_context_tokens)
 }

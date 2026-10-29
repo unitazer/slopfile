@@ -418,11 +418,9 @@ async fn run_generation_turn(
   let client = &client;
   let endpoint = client.endpoint().base.clone();
 
-  // Build the request first, then measure it: the context paragraph is part of what gets sent, so
-  // counting before adding it would under-count by a thousand characters.
-  let mut messages = work.request_messages();
-  // First pass with no fill level: the paragraph must be counted, but the count does not exist yet.
-  crate::context::attach_context_file(&mut messages, path, None);
+  // Build the request first, then measure it. The context paragraph is part of the file, so it is
+  // already in `messages` and does not need to be attached here.
+  let messages = work.request_messages();
   let tool_defs = crate::tools::advertised(&work.config);
   let tools_chars = serde_json::to_string(&tool_defs).map_or(0, |s| s.len() as u64);
   let anchor = control::update(name, |s| s.last_prompt.clone());
@@ -444,25 +442,9 @@ async fn run_generation_turn(
   // measured to report, and then the results carry no tag at all.
   let tell_ctx = cfg.tell_context_size(&work.config);
   let ctx_tokens = plan.token_count;
-  let mut messages = plan.messages;
-  // Second pass with the real number, so the model knows how much room it has before it decides
-  // whether to spend a turn compacting. The line itself costs ~40 tokens, which is noise here.
-  // With no measured sample there is no honest number to give, so the line stays off entirely
-  // rather than the model being told a figure we made up.
-  let budget = tokens::context_budget(&work, cfg);
-  crate::context::attach_context_file(
-    &mut messages,
-    path,
-    plan.token_count.map(|used| crate::context::Window {
-      used,
-      // The prompt competes for the window minus the reply's allowance, so that -- not the
-      // whole window -- is what "how full am I" is measured against.
-      usable: tokens::prompt_budget(budget),
-      total: budget,
-    }),
-  );
+  let messages = plan.messages;
 
-  let max_tokens = tokens::output_allowance(tokens::context_budget(&work, cfg));
+  let max_tokens = tokens::output_allowance(tokens::context_budget(&work.config, cfg));
 
   client.ensure_model_loaded(&model).await;
 
@@ -572,7 +554,7 @@ async fn run_generation_turn(
       // the problem.
       && result.tool_calls.is_empty();
     if by_reasoning {
-      flow::add_reasoning_exhausted_note(&mut streamed);
+      streamed.add_note(session::NoteBy::Harness, flow::REASONING_EXHAUSTED_NOTE);
       streamed.close_turn();
       transcript::save(path, &streamed)?;
       control::update(name, |s| s.phase = Phase::Idle);
@@ -582,7 +564,7 @@ async fn run_generation_turn(
       );
       return Ok(TurnOutcome::Done);
     }
-    flow::add_context_full_note(&mut streamed);
+    streamed.add_note(session::NoteBy::Harness, flow::CONTEXT_FULL_NOTE);
     streamed.close_turn();
     transcript::save(path, &streamed)?;
     control::update(name, |s| {

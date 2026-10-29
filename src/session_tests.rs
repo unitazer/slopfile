@@ -1890,3 +1890,68 @@ fn a_session_with_no_thinking_key_is_auto_and_sends_nothing() {
   assert_eq!(session.thinking(), Thinking::Auto);
   assert_eq!(Thinking::Auto.wire_value(), None);
 }
+
+fn good_edit() -> String {
+  session_file(&format!(
+    "{}{}",
+    region(SYSTEM, "sys"),
+    container(TURN, &region(USER, "hi"))
+  ))
+}
+
+#[test]
+fn a_sound_edit_passes() {
+  assert!(adopt(&good_edit()).is_ok());
+}
+
+#[test]
+fn edits_must_keep_the_toml_fence() {
+  let err = adopt("<!-- slopfile:begin -->\n<!-- slopfile:system -->\ns\n<!-- /slopfile -->\n")
+    .expect_err("no fence");
+  assert!(err.contains("toml header"), "{err}");
+}
+
+#[test]
+fn edits_must_keep_the_system_region() {
+  let err = adopt(&session_file(&container(TURN, ""))).expect_err("no system region");
+  assert!(err.contains("system"), "{err}");
+}
+
+#[test]
+fn edits_must_keep_the_structure_sound() {
+  let err = adopt(&session_file("<!-- /slopfile -->\n")).expect_err("stray close");
+  assert!(err.contains("never opened"), "{err}");
+
+  let unclosed = session_file(&format!(
+    "<!-- slopfile:{SYSTEM} -->\ns\n<!-- /slopfile -->\n<!-- slopfile:{TURN} -->\n<!-- slopfile:{ASSISTANT} -->\n<!-- slopfile:{TEXT} -->\nleak\n<!-- slopfile:{USER} -->\nnope\n<!-- /slopfile -->\n"
+  ));
+  let err = adopt(&unclosed).expect_err("unclosed leaf");
+  assert!(err.contains("left unclosed"), "{err}");
+
+  let err = adopt(&session_file(&format!(
+    "{}<!-- slopfile:mystery -->\nx\n<!-- /slopfile -->\n",
+    region(SYSTEM, "s")
+  )))
+  .expect_err("unknown region");
+  assert!(err.contains("unknown region"), "{err}");
+}
+
+#[test]
+fn adopt_takes_a_pruned_edit() {
+  let pruned = good_edit().replace("hi\n", "");
+  let edited = adopt(&pruned).expect("adopt");
+  assert_eq!(
+    edited.turns[0].user.as_deref(),
+    Some(""),
+    "the user text is gone"
+  );
+  assert_eq!(edited.system, "sys");
+}
+
+#[test]
+fn adopt_refuses_an_unusable_edit() {
+  assert!(adopt("").is_err());
+  assert!(adopt("everything is gone\n").is_err());
+  let no_system = session_file(&escape("no system region here\n"));
+  assert!(adopt(&no_system).is_err());
+}

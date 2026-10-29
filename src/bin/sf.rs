@@ -180,7 +180,7 @@ async fn tokens(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(),
   )
   .await
   .map_err(|e| format!("tokens: {e}"))?;
-  let budget = slopfile::tokens::context_budget(&parsed, cfg);
+  let budget = slopfile::tokens::context_budget(&parsed.config, cfg);
   println!("tokens: {}", path.display());
   println!(
     "  messages:     {} sent ({} oldest dropped to fit budget)",

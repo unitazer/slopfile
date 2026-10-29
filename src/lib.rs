@@ -1,5 +1,4 @@
 pub mod api;
-pub mod context;
 pub mod control;
 pub mod daemon;
 pub mod docker;

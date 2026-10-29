@@ -1,7 +1,6 @@
-use crate::context;
 use crate::prompt;
 use crate::questions::{self, Question};
-use crate::session::{self, NoteBy, PendingQuestion, Session, ToolOutcome, Turn};
+use crate::session::{self, PendingQuestion, Session, ToolOutcome, Turn};
 use crate::tools;
 use crate::transcript;
 use crate::types::{AppConfig, Confirmations, ToolCall, ToolResult};
@@ -32,7 +31,7 @@ pub fn session_template(cfg: &AppConfig, excluded: &[String]) -> Session {
     tools_excluded: excluded.to_vec(),
     ..Default::default()
   };
-  let system = prompt::system_prompt_with_context_note(cfg, &config);
+  let system = prompt::system_prompt(cfg, &config);
   Session::new(config, system)
 }
 
@@ -253,20 +252,21 @@ fn default_answers(questions: &[Question]) -> Vec<(u32, String)> {
     .collect()
 }
 
-pub fn add_context_full_note(session: &mut Session) {
-  session.add_note(NoteBy::Harness, context::CONTEXT_FULL_NOTE);
-}
+/// The output allowance ran out because the model spent it thinking, not because the transcript
+/// grew. The advice is therefore the opposite of `CONTEXT_FULL_NOTE`: leave the file alone.
+pub const REASONING_EXHAUSTED_NOTE: &str = "the model used its entire output allowance on \
+   thinking and wrote nothing back; nothing is wrong with this transcript, so do not prune it. \
+   Lower `thinking` in the fence above, or raise `max_context_tokens` so the allowance is bigger";
 
-pub fn add_reasoning_exhausted_note(session: &mut Session) {
-  session.add_note(NoteBy::Harness, context::REASONING_EXHAUSTED_NOTE);
-}
+pub const CONTEXT_FULL_NOTE: &str = "the model hit the token cap mid-response; this session file is your context, so edit it now to \
+   drop or compress the useless old turns above, then write your next message below this note";
 
 pub fn adopt_model_edit(current: &Session, path: &Path) -> Result<Option<Session>, String> {
   let text = transcript::read_file(path)?;
   if text == current.render() {
     return Ok(None);
   }
-  let edited = context::adopt(&text)?;
+  let edited = session::adopt(&text)?;
   info!(
     "context file edited by the model, synced: {}",
     path.display()

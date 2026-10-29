@@ -1,16 +1,11 @@
-use crate::types::AppConfig;
-use std::path::PathBuf;
+use crate::types::{AppConfig, SessionConfig};
+use std::path::{Path, PathBuf};
 
-/// The paragraph explaining `ctx:N`. Built only when the feature is on, so a session with it off
-/// carries zero bytes of it -- there is nothing to strip back out later.
-pub fn context_size_note(cfg: &AppConfig, session_config: &crate::types::SessionConfig) -> String {
+pub fn context_size_note(cfg: &AppConfig, session_config: &SessionConfig) -> String {
   if !cfg.tell_context_size(session_config) {
     return String::new();
   }
-  let budget = crate::tokens::context_budget(
-    &crate::session::Session::new(session_config.clone(), String::new()),
-    cfg,
-  );
+  let budget = crate::tokens::context_budget(session_config, cfg);
   let (lo, hi) = crate::tokens::context_bands(budget);
   format!(
     "\n\nContext size. Every tool result you get back is tagged `ctx:N`, the length of this \
@@ -19,19 +14,15 @@ pub fn context_size_note(cfg: &AppConfig, session_config: &crate::types::Session
      mid-sentence.\n\n \
      If you have only just started, stay under {lo} tokens. If you have a long and detailed \
      context where everything still matters and nothing can be thrown away, try to stay under \
-     {hi}. Either way, prune the file itself -- delete or compress finished turns, drop dead tool \
-     output. Whatever you leave in the file is exactly what comes back on the next call.\n\n \
+     {hi}.\n\n \
      The number may be stale: it is a snapshot from before the call, and it does not move until \
      the next one. It is a hint about which ballpark you are in, not a live meter -- judge by \
      trend across calls rather than by any single reading."
   )
 }
 
-pub fn system_prompt_default(cfg: &AppConfig, tools_excluded: &[String]) -> String {
-  let has = |t: &str| !tools_excluded.iter().any(|x| x == t);
-  // Without this tool the model can still reach the point where it wants a decision. Saying
-  // nothing leaves it to either guess or stall on a question nobody can answer, so name the
-  // constraint instead of just dropping the sentence.
+pub fn system_prompt(cfg: &AppConfig, session_config: &SessionConfig) -> String {
+  let has = |t: &str| !session_config.tools_excluded.iter().any(|x| x == t);
   let decision_line = if has("question") {
     "When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing."
   } else {
@@ -56,8 +47,6 @@ You act by calling tools. Your text replies and tool calls are relayed to the us
     out.push_str("\n- Use subagent for large self-contained subtasks (e.g. 'research X and report back', 'fix all lint errors in module Y'); give it every detail it needs, since it cannot see this conversation. Spawn it, then wait for its report instead of duplicating its work.");
   }
 
-  out.push_str("DO NOT read your own context file! what you see, IS the contents of the file, so if you read your own context file, you just double the size of your context window for no reason, which is a giant waste"
-  );
   out.push_str(
     "\n- Avoid dumping large file listings into the conversation. Prefer `fd` over find (it respects .gitignore, so build/generated dirs stay out of your context); scope listings to a specific subdirectory and pattern, and pipe through head -50 when output could be long.",
   );
@@ -77,23 +66,8 @@ Current working directory: {}",
   out.push_str(
     "\n\nIf you learn something that took trial and error to discover, write it down as a new skill. Creating skills is how you manage persistent memory, so the next session does not have to rediscover it."
   );
+  out.push_str(&context_size_note(cfg, session_config));
   out
-}
-
-/// `system_prompt_default` plus the context-size paragraph, which needs the session's own fence
-/// (it can override the window the bands are derived from). Kept separate so the note can be built
-/// from a session that already exists.
-pub fn system_prompt_with_context_note(
-  cfg: &AppConfig,
-  session_config: &crate::types::SessionConfig,
-) -> String {
-  let base = system_prompt_default(cfg, &session_config.tools_excluded);
-  let note = context_size_note(cfg, session_config);
-  if note.is_empty() {
-    base
-  } else {
-    format!("{base}{note}")
-  }
 }
 
 fn skills_index(dir: &str) -> String {
@@ -235,5 +209,79 @@ fn truncate_chars(s: &str, max: usize) -> String {
   match cut.rfind(' ') {
     Some(i) => format!("{}...", &cut[..i]),
     None => format!("{cut}..."),
+  }
+}
+
+/// Append the paragraph that explains the context file. Called once when the session is created;
+/// after that the harness never touches the `system` region again, so the model owns it outright.
+pub fn with_context_paragraph(system: &str, path: &Path) -> String {
+  let base = system.trim_end();
+  let paragraph = context_paragraph(path);
+  if base.is_empty() {
+    paragraph
+  } else {
+    format!("{base}\n\n{paragraph}")
+  }
+}
+
+fn context_paragraph(path: &Path) -> String {
+  format!(
+    "Context file: {path}
+This conversation is that file, and every byte of it is already in your context, so reading it back \
+(`read`, `cat`, `grep`, `head`, `tail`) only re-injects what you can already see: a gigantic waste of \
+tokens. Never read your own context file.
+
+Editing it directly is just as useless. `edit` needs an old string and a new string, and the call \
+that carries them is itself recorded in this very file, so it writes back everything it removes. \
+Every such edit is a net gain of tokens, never a loss, and the window can never shrink through one: \
+editing your context window is impossible. All compaction must go through a tool whose pattern is \
+smaller than the chunk it removes: a short path or selector that drops or rewrites a big region in \
+a few dozen bytes of call. If there is a tool to edit your context window already available (eg the \
+`session-edit` skill), use that; if not, invent your own tooling.
+
+Whatever you leave in the file is exactly what you get as context on the next call, so prune before \
+the context fills up: drop dead tool output, compress turns you have finished with, or delete whole \
+turns.
+
+The file is a stack of regions. `<!-- slopfile:NAME -->` opens one, `<!-- /slopfile -->` closes it, \
+and everything between is the body, copied out verbatim. Keep the ```toml fence and the `system` \
+region; drop or rewrite anything else. A turn counts as finished when its `turn` region is closed, \
+so close the ones you are done with.
+
+The grammar is: top level takes `system`, `turn` and `input`; a `turn` takes `user`, `note`, \
+`assistant`; an `assistant` takes `reasoning`, `text` and `call`. Anything else you name inside a \
+`turn` or an `assistant` is kept as your own role and handed back to you under that name, so you \
+can invent a `scratchpad` or a `ledger` and write in it as long as you like. `text` goes inside an \
+`assistant`, never straight into a `turn`.
+
+If your own text needs to contain one of those markers, wrap it so it stays text: \
+`<!--slopfile:ESC[<<!-- /slopfile -->]-->` keeps a literal close marker inside a body. An edit that \
+would leave the file unparseable is rolled back and the tool result tells you why.",
+    path = path.display(),
+  )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn paragraph_names_the_path_and_the_region_rules() {
+    let p = context_paragraph(Path::new("/t/shared/transcripts/1.md"));
+    assert!(
+      p.contains("Context file: /t/shared/transcripts/1.md"),
+      "{p}"
+    );
+    assert!(p.contains("prune before the context fills up"), "{p}");
+    assert!(p.contains("<!-- /slopfile -->"), "{p}");
+    assert!(p.contains("<!--slopfile:ESC["), "{p}");
+    assert!(p.contains("rolled back"), "{p}");
+  }
+
+  #[test]
+  fn with_context_paragraph_appends_it_to_the_default_prompt() {
+    let system = with_context_paragraph("be helpful", Path::new("/t/1.md"));
+    assert!(system.starts_with("be helpful"), "{system}");
+    assert_eq!(system.matches("Context file: ").count(), 1, "{system}");
   }
 }
