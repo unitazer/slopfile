@@ -36,6 +36,12 @@ fn yolo_cfg() -> AppConfig {
   }
 }
 
+/// Tests that do not care where the transcript lives still use the real constructor, including the
+/// context paragraph, by naming a fixed fake path.
+fn template(cfg: &AppConfig, excluded: &[String]) -> Session {
+  session_template(Path::new("/t/1.md"), cfg, excluded)
+}
+
 fn scratch(tag: &str) -> std::path::PathBuf {
   let dir = temp_dir().join(format!("slopfile-test-{tag}"));
   std::fs::remove_dir_all(&dir).ok();
@@ -52,7 +58,7 @@ fn load(path: &Path) -> Session {
 }
 
 fn with_question(input_tail: &str) -> Session {
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.turns.push(session::Turn {
     custom: Vec::new(),
     user: Some("pick one".to_string()),
@@ -322,7 +328,7 @@ fn skip_resolves_with_defaults() {
 fn stream_writer_closes_sections_and_keeps_the_file_valid() {
   let dir = scratch("streamwriter");
   let path = dir.join("streamwriter.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "hi".into();
   session.promote_input();
   session.begin_round();
@@ -348,7 +354,7 @@ fn stream_writer_closes_sections_and_keeps_the_file_valid() {
 fn stream_translates_raw_think_tags_and_drops_orphans() {
   let dir = scratch("thinktags");
   let path = dir.join("thinktags.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.begin_round();
   write_session(&path, &session);
 
@@ -379,7 +385,7 @@ fn stream_translates_raw_think_tags_and_drops_orphans() {
 fn a_resumed_turn_restarts_the_assistant_region() {
   let dir = scratch("resume");
   let path = dir.join("resume.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "go".into();
   session.promote_input();
   session.begin_round();
@@ -414,7 +420,7 @@ fn a_resumed_turn_restarts_the_assistant_region() {
 fn context_full_note_is_a_harness_note_and_not_work() {
   let dir = scratch("ctxfull");
   let path = dir.join("ctxfull.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "hi".into();
   session.promote_input();
   session.begin_round();
@@ -442,7 +448,7 @@ fn context_full_note_is_a_harness_note_and_not_work() {
 fn typed_input_becomes_a_user_turn_only_when_armed() {
   let dir = scratch("draft");
   let path = dir.join("draft.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "keep the daemons running".into();
   write_session(&path, &session);
 
@@ -472,7 +478,7 @@ fn typed_input_becomes_a_user_turn_only_when_armed() {
 #[test]
 fn session_template_has_default_header_and_prompt() {
   let cfg = yolo_cfg();
-  let tpl = session_template(&cfg, &[]);
+  let tpl = template(&cfg, &[]);
   let text = tpl.render();
   assert!(text.starts_with("```toml\n"), "{text}");
   assert!(text.contains("model = \"qwen3.8-27b\""), "{text}");
@@ -490,9 +496,23 @@ fn session_template_has_default_header_and_prompt() {
   assert_eq!(messages[0].role, Role::System);
   let prompt = messages[0].content.as_deref().unwrap();
   assert!(prompt.contains("expert software engineering assistant"));
+  assert!(prompt.contains("Context file: /t/1.md"), "{prompt}");
   assert!(
     !prompt.contains("# Session"),
     "heading stripped from prompt"
+  );
+}
+
+#[test]
+fn a_session_template_names_the_file_it_belongs_to() {
+  let path = Path::new("/t/real/7.md");
+  let tpl = session_template(path, &yolo_cfg(), &[]);
+  assert!(
+    tpl
+      .system
+      .contains(&format!("Context file: {}", path.display())),
+    "{}",
+    tpl.system
   );
 }
 
@@ -509,7 +529,7 @@ fn session_template_lists_skills() {
 
   let mut cfg = yolo_cfg();
   cfg.skills_dir = dir.to_string_lossy().into_owned();
-  let text = session_template(&cfg, &[]).render();
+  let text = template(&cfg, &[]).render();
   assert!(
     text.contains("Skills available in"),
     "index missing: {text}"
@@ -526,7 +546,7 @@ fn session_template_lists_skills() {
     "---\nname: front-skill\ndescription: >\n  Handles frontmatter\n  skills properly.\nmetadata:\n  x: 1\n---\n\n# Body ignored\n",
   )
   .unwrap();
-  let text2 = session_template(&cfg, &[]).render();
+  let text2 = template(&cfg, &[]).render();
   assert!(
     text2.contains("- c-front.md: Handles frontmatter skills properly."),
     "frontmatter desc missing: {text2}"
@@ -537,7 +557,7 @@ fn session_template_lists_skills() {
     "---\nname: manual-only\ndescription: Only for explicit requests.\ndisable-model-invocation: true\n---\n\n# Manual\n",
   )
   .unwrap();
-  let text3 = session_template(&cfg, &[]).render();
+  let text3 = template(&cfg, &[]).render();
   assert!(
     !text3.contains("d-manual.md"),
     "disabled skill skipped: {text3}"
@@ -555,13 +575,18 @@ fn subagent_depth_and_spawn_filtering() {
   let mut cfg = yolo_cfg();
   cfg.subagent_max_depth = 2;
   let parent = dir.join("session.md");
-  write_session(&parent, &session_template(&cfg, &[]));
+  write_session(&parent, &template(&cfg, &[]));
 
   let c1 = spawn_subagent(&parent, "do task one", &cfg).unwrap();
   assert_eq!(c1.file_name().unwrap(), "session.sub-01.md");
   let t1 = load(&c1);
   assert_eq!(t1.config.tools_excluded, vec!["question".to_string()]);
   assert_eq!(t1.input, "do task one\n", "the task is the pending input");
+  assert!(
+    t1.system
+      .contains(&format!("Context file: {}", c1.display())),
+    "a subagent must get the context paragraph for its own file"
+  );
 
   let c2 = spawn_subagent(&c1, "nested task", &cfg).unwrap();
   assert_eq!(c2.file_name().unwrap(), "session.sub-01.sub-01.md");
@@ -574,10 +599,6 @@ fn subagent_depth_and_spawn_filtering() {
   assert!(
     t2.system.contains("nobody will answer") && !t2.system.contains("call the `question` tool"),
     "prompt adapts to a missing question tool"
-  );
-  assert!(
-    !t2.system.contains("- subagent:") && t1.system.contains("- subagent:"),
-    "prompt advertises only available tools"
   );
 
   let err = spawn_subagent(&c2, "too deep", &cfg).unwrap_err();
@@ -592,7 +613,7 @@ async fn tool_calls_enforce_exclusions_and_spawn_subagents() {
   let dir = scratch("blocks");
   let cfg = yolo_cfg();
   let parent = dir.join("blocks.md");
-  let mut session = session_template(&cfg, &[]);
+  let mut session = template(&cfg, &[]);
   session.config.tools_excluded = vec!["bash".to_string()];
   session.input = "hi".into();
   session.promote_input();
@@ -630,7 +651,7 @@ async fn model_edits_of_its_own_context_file_are_synced() {
   let mut cfg = yolo_cfg();
   cfg.workdir = dir.to_string_lossy().into_owned();
   let session = dir.join("ctxedit.md");
-  let mut start = session_template(&cfg, &[]);
+  let mut start = template(&cfg, &[]);
   start.input = "hi".into();
   start.promote_input();
   write_session(&session, &start);
@@ -675,8 +696,8 @@ async fn model_edits_of_its_own_context_file_are_synced() {
 fn unfinished_subagents_block_the_parent() {
   let dir = scratch("wait-sub");
   let parent = dir.join("wait-sub.md");
-  write_session(&parent, &session_template(&yolo_cfg(), &[]));
-  let mut child = session_template(&yolo_cfg(), &[]);
+  write_session(&parent, &template(&yolo_cfg(), &[]));
+  let mut child = template(&yolo_cfg(), &[]);
   child.config.tools_excluded = vec!["question".to_string()];
   child.input = "task\n".into();
   write_session(&dir.join("wait-sub.sub-01.md"), &child);
@@ -712,9 +733,9 @@ fn unfinished_subagents_block_the_parent() {
 async fn deliver_subagent_result_injects_once() {
   let dir = scratch("deliver");
   let parent = dir.join("deliver.md");
-  write_session(&parent, &session_template(&yolo_cfg(), &[]));
+  write_session(&parent, &template(&yolo_cfg(), &[]));
   let child = dir.join("deliver.sub-01.md");
-  let mut sub = session_template(&yolo_cfg(), &[]);
+  let mut sub = template(&yolo_cfg(), &[]);
   sub.config.tools_excluded = vec!["question".to_string()];
   sub.input = "task".into();
   sub.promote_input();
@@ -814,7 +835,7 @@ async fn control_round_trips_over_tcp() {
     let _ = control::serve_listener(listener, served).await;
   });
 
-  write_session(&dir.join("ghost.md"), &session_template(&yolo_cfg(), &[]));
+  write_session(&dir.join("ghost.md"), &template(&yolo_cfg(), &[]));
 
   let ask = |cmd: Cmd, session: &str| {
     let addr = addr.clone();
@@ -1007,7 +1028,7 @@ async fn tool_calls_next_to_a_question_are_still_executed_and_recorded() {
   let dir = scratch("qmix");
   let cfg = yolo_cfg();
   let path = dir.join("qmix.md");
-  let mut start = session_template(&cfg, &[]);
+  let mut start = template(&cfg, &[]);
   start.config.tools_excluded = vec!["subagent".to_string()];
   start.input = "check then ask".into();
   start.promote_input();
@@ -1084,7 +1105,7 @@ async fn tool_calls_next_to_a_question_are_still_executed_and_recorded() {
 
 #[test]
 fn only_the_tools_the_session_allows_are_advertised() {
-  let mut cfg = session_template(&yolo_cfg(), &[]);
+  let mut cfg = template(&yolo_cfg(), &[]);
   assert!(crate::tools::advertised(&cfg.config).len() > 1);
   cfg.config.tools = Some(vec!["read".to_string(), "bash".to_string()]);
   let names: Vec<String> = crate::tools::advertised(&cfg.config)
@@ -1176,9 +1197,9 @@ fn content_after_the_fence_survives_every_render() {
 fn a_delivery_failure_leaves_the_child_reportable_again() {
   let dir = scratch("deliver-fail");
   let parent = dir.join("deliver-fail.md");
-  write_session(&parent, &session_template(&yolo_cfg(), &[]));
+  write_session(&parent, &template(&yolo_cfg(), &[]));
   let child = dir.join("deliver-fail.sub-01.md");
-  let mut sub = session_template(&yolo_cfg(), &[]);
+  let mut sub = template(&yolo_cfg(), &[]);
   sub.input = "task".into();
   sub.promote_input();
   sub.begin_round();
@@ -1205,7 +1226,7 @@ fn a_delivery_failure_leaves_the_child_reportable_again() {
     "a failed delivery must stay retryable"
   );
 
-  std::fs::write(&parent, session_template(&yolo_cfg(), &[]).render()).unwrap();
+  std::fs::write(&parent, template(&yolo_cfg(), &[]).render()).unwrap();
   tokio::runtime::Builder::new_current_thread()
     .build()
     .unwrap()
@@ -1244,7 +1265,7 @@ fn every_session_name_normalizes_once() {
 
 #[test]
 fn an_empty_response_does_not_keep_the_session_armed() {
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "hello".into();
   session.promote_input();
   session.begin_round();
@@ -1259,7 +1280,7 @@ fn an_empty_response_does_not_keep_the_session_armed() {
 
 #[test]
 fn an_interrupted_round_still_gets_resumed() {
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "hello".into();
   session.promote_input();
   session.begin_round();
@@ -1275,7 +1296,7 @@ fn an_interrupted_round_still_gets_resumed() {
 
 #[test]
 fn tool_results_alone_still_demand_a_reply() {
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "go".into();
   session.promote_input();
   session.begin_round();
@@ -1303,8 +1324,8 @@ fn tool_results_alone_still_demand_a_reply() {
 async fn a_pruned_report_turn_does_not_wedge_the_parent() {
   let dir = scratch("wedge");
   let parent = dir.join("wedge.md");
-  write_session(&parent, &session_template(&yolo_cfg(), &[]));
-  let mut child = session_template(&yolo_cfg(), &[]);
+  write_session(&parent, &template(&yolo_cfg(), &[]));
+  let mut child = template(&yolo_cfg(), &[]);
   child.input = "task\n".into();
   child.promote_input();
   child.begin_round();
@@ -1322,7 +1343,7 @@ async fn a_pruned_report_turn_does_not_wedge_the_parent() {
   assert!(read_to_string(&parent).unwrap().contains("the report"));
 
   // The model prunes the turn that holds the report, which its prompt explicitly invites.
-  write_session(&parent, &session_template(&yolo_cfg(), &[]));
+  write_session(&parent, &template(&yolo_cfg(), &[]));
   assert!(
     crate::daemon::unfinished_subagents(&parent, &load(&parent))
       .unwrap()
@@ -1335,11 +1356,11 @@ async fn a_pruned_report_turn_does_not_wedge_the_parent() {
 async fn concurrent_report_deliveries_do_not_overwrite_each_other() {
   let dir = scratch("deliver-race");
   let parent = dir.join("race.md");
-  write_session(&parent, &session_template(&yolo_cfg(), &[]));
+  write_session(&parent, &template(&yolo_cfg(), &[]));
   let mut children = Vec::new();
   for n in ["01", "02", "03", "04"] {
     let path = dir.join(format!("race.sub-{n}.md"));
-    let mut child = session_template(&yolo_cfg(), &[]);
+    let mut child = template(&yolo_cfg(), &[]);
     child.input = "task\n".into();
     child.promote_input();
     child.begin_round();
@@ -1372,7 +1393,7 @@ async fn concurrent_report_deliveries_do_not_overwrite_each_other() {
 async fn concurrent_writes_leave_the_file_intact() {
   let dir = scratch("atomic");
   let path = dir.join("atomic.md");
-  write_session(&path, &session_template(&yolo_cfg(), &[]));
+  write_session(&path, &template(&yolo_cfg(), &[]));
   let filler = "x".repeat(200_000);
   let probe = filler[..1000].to_string();
   let mut readers = Vec::new();
@@ -1954,14 +1975,14 @@ fn a_subagent_is_never_offered_the_question_tool() {
   let cfg = AppConfig::default();
   // `question` is excluded when a subagent transcript is created, so the model can only reach the
   // name by inventing it; the daemon refuses that rather than answering on the user's behalf.
-  let child = flow::subagent_task_template(&cfg, &["question".to_string()], "do the thing");
+  let path = scratch("subagent-question").join("parent.sub-01.md");
+  let child = flow::subagent_task_template(&path, &cfg, &["question".to_string()], "do the thing");
   assert!(
     !crate::tools::advertised(&child.config)
       .iter()
       .any(|t| t.function.name == "question"),
     "question must not be offered to a subagent"
   );
-  let path = scratch("subagent-question").join("parent.sub-01.md");
   std::fs::write(&path, child.render()).unwrap();
   assert!(
     flow::is_subagent_path(&path),
@@ -1969,7 +1990,7 @@ fn a_subagent_is_never_offered_the_question_tool() {
     path.display()
   );
   // And a parent session keeps it.
-  let parent = flow::session_template(&cfg, &[]);
+  let parent = template(&cfg, &[]);
   assert!(
     crate::tools::advertised(&parent.config)
       .iter()
@@ -2100,7 +2121,7 @@ fn a_provider_refusal_is_recorded_in_the_transcript_itself() {
   use crate::api::ApiError;
   let dir = scratch("provider-failure");
   let path = dir.join("1.md");
-  write_session(&path, &session_template(&yolo_cfg(), &[]));
+  write_session(&path, &template(&yolo_cfg(), &[]));
 
   let e = ApiError::NonOkStatus(
     429,
@@ -2136,7 +2157,7 @@ fn a_refusal_does_not_delete_input_typed_while_the_request_was_in_flight() {
   use crate::api::ApiError;
   let dir = scratch("failure-input");
   let path = dir.join("1.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "original request".into();
   session.promote_input();
   session.begin_round();
@@ -2173,7 +2194,7 @@ fn a_failure_note_does_not_revert_edits_made_while_the_request_was_running() {
   let path = dir.join("1.md");
 
   // Two turns on disk; the request is made against both.
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "first".into();
   session.promote_input();
   session.begin_round();
@@ -2230,7 +2251,7 @@ fn an_aborted_fragment_is_not_grafted_onto_a_finished_round() {
   let dir = scratch("failure-graft");
   let path = dir.join("1.md");
 
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "do two things".into();
   session.promote_input();
   // Round 1 completes properly, with a tool call and its result.
@@ -2303,7 +2324,7 @@ fn an_aborted_fragment_is_not_grafted_onto_a_finished_prose_round() {
   let dir = scratch("failure-graft-prose");
   let path = dir.join("1.md");
 
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "say something".into();
   session.promote_input();
   session.begin_round();
@@ -2355,7 +2376,7 @@ fn a_failure_note_on_a_half_written_turn_does_not_corrupt_the_file() {
   use crate::api::ApiError;
   let dir = scratch("failure-midstream");
   let path = dir.join("1.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "do the thing".into();
   session.promote_input();
   session.begin_round();
@@ -2409,7 +2430,7 @@ fn a_failure_note_on_a_half_written_turn_does_not_corrupt_the_file() {
 /// terminal 400 -- so it would park the session permanently over note placement.
 #[test]
 fn a_harness_note_and_the_input_do_not_come_out_as_two_user_messages() {
-  let mut s = session_template(&yolo_cfg(), &[]);
+  let mut s = template(&yolo_cfg(), &[]);
   s.input = "do the next thing".into();
   s.promote_input();
   s.begin_round();
@@ -2591,7 +2612,7 @@ fn the_tag_survives_into_the_next_request_without_growing() {
   use crate::session::ToolOutcome;
   let dir = scratch("ctx-tag");
   let path = dir.join("1.md");
-  let mut session = session_template(&yolo_cfg(), &[]);
+  let mut session = template(&yolo_cfg(), &[]);
   session.input = "go".into();
   session.promote_input();
   session.begin_round();
@@ -2686,7 +2707,7 @@ fn a_misspelled_provider_is_reported_in_the_transcript() {
       reasoning_style: Default::default(),
     },
   );
-  let mut session = session_template(&cfg, &[]);
+  let mut session = template(&cfg, &[]);
   session.input = "hi".into();
   session.promote_input();
   session.config.provider = Some("openroter".into());
@@ -2720,7 +2741,7 @@ fn a_transport_failure_does_not_get_refusal_wording() {
   use crate::api::ApiError;
   let dir = scratch("timeout-note");
   let path = dir.join("1.md");
-  write_session(&path, &session_template(&yolo_cfg(), &[]));
+  write_session(&path, &template(&yolo_cfg(), &[]));
 
   daemon::record_provider_failure(
     &path,

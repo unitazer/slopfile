@@ -227,12 +227,8 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
     turns += 1;
 
     let mut session = transcript::load(path)?;
-    if session.system.trim().is_empty()
-      && session.turns.is_empty()
-      && !session.has_input()
-      && transcript::read_file(path)?.trim().is_empty()
-    {
-      transcript::save(path, &flow::session_template(cfg, &[]))?;
+    if transcript::read_file(path)?.trim().is_empty() {
+      transcript::save(path, &flow::session_template(path, cfg, &[]))?;
       info!("{path:?}: initialized empty session");
       return Ok(());
     }

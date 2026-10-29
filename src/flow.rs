@@ -23,7 +23,7 @@ pub fn is_subagent_path(path: &Path) -> bool {
     .is_some_and(|s| subagent_depth(&s.to_string_lossy()) > 0)
 }
 
-pub fn session_template(cfg: &AppConfig, excluded: &[String]) -> Session {
+pub fn session_template(path: &Path, cfg: &AppConfig, excluded: &[String]) -> Session {
   let config = session::SessionConfig {
     provider: cfg.provider.clone(),
     model: Some(cfg.default_session_model.clone()),
@@ -31,12 +31,17 @@ pub fn session_template(cfg: &AppConfig, excluded: &[String]) -> Session {
     tools_excluded: excluded.to_vec(),
     ..Default::default()
   };
-  let system = prompt::system_prompt(cfg, &config);
+  let system = prompt::system_prompt(cfg, &config, path);
   Session::new(config, system)
 }
 
-pub fn subagent_task_template(cfg: &AppConfig, excluded: &[String], task: &str) -> Session {
-  let mut session = session_template(cfg, excluded);
+pub fn subagent_task_template(
+  path: &Path,
+  cfg: &AppConfig,
+  excluded: &[String],
+  task: &str,
+) -> Session {
+  let mut session = session_template(path, cfg, excluded);
   session.input = format!("{}\n", task.trim_end());
   session
 }
@@ -71,7 +76,7 @@ pub fn spawn_subagent(parent: &Path, task: &str, cfg: &AppConfig) -> Result<Path
   if child_depth >= cfg.subagent_max_depth {
     excluded.push("subagent".to_string());
   }
-  let session = subagent_task_template(cfg, &excluded, task);
+  let session = subagent_task_template(&child, cfg, &excluded, task);
   transcript::save(&child, &session)?;
   Ok(child)
 }

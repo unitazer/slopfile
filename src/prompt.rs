@@ -21,21 +21,21 @@ pub fn context_size_note(cfg: &AppConfig, session_config: &SessionConfig) -> Str
   )
 }
 
-pub fn system_prompt(cfg: &AppConfig, session_config: &SessionConfig) -> String {
-  let has = |t: &str| !session_config.tools_excluded.iter().any(|x| x == t);
-  let decision_line = if has("question") {
-    "When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing."
-  } else {
+pub fn system_prompt(cfg: &AppConfig, session_config: &SessionConfig, path: &Path) -> String {
+  let decision_line = if session_config
+    .tools_excluded
+    .iter()
+    .any(|x| x == "question")
+  {
     "You have no way to ask the user anything: nobody will answer a question from you, and no decision is coming. Never block on one. Make the call yourself, and mention any assumption you made at the end -- incorrect assumptions are one of the worst error sources."
+  } else {
+    "When you need the user to make a decision, call the `question` tool and offer concrete, distinct options instead of guessing."
   };
   let mut out = format!(
     "You are an expert software engineering assistant. You help the user by reading files, running commands, editing code, and writing files, and you reply to them in plain text.
 
 You act by calling tools. Your text replies and tool calls are relayed to the user automatically, one step at a time; continue based on each tool result. {decision_line}
 ");
-  if has("subagent") {
-    out.push_str("\n- subagent: Spawn a worker with its own fresh context to handle a self-contained task; its final report is returned here automatically");
-  }
   out.push_str(
     "\n\nGuidelines:
 - Prefer grep/find/ls tools over bash for file exploration
@@ -43,9 +43,6 @@ You act by calling tools. Your text replies and tool calls are relayed to the us
 - Use edit for precise changes (old text must match exactly)
 - Use write only for new files or complete rewrites",
   );
-  if has("subagent") {
-    out.push_str("\n- Use subagent for large self-contained subtasks (e.g. 'research X and report back', 'fix all lint errors in module Y'); give it every detail it needs, since it cannot see this conversation. Spawn it, then wait for its report instead of duplicating its work.");
-  }
 
   out.push_str(
     "\n- Avoid dumping large file listings into the conversation. Prefer `fd` over find (it respects .gitignore, so build/generated dirs stay out of your context); scope listings to a specific subdirectory and pattern, and pipe through head -50 when output could be long.",
@@ -67,6 +64,8 @@ Current working directory: {}",
     "\n\nIf you learn something that took trial and error to discover, write it down as a new skill. Creating skills is how you manage persistent memory, so the next session does not have to rediscover it."
   );
   out.push_str(&context_size_note(cfg, session_config));
+  out.push_str("\n");
+  out.push_str(&context_paragraph(path));
   out
 }
 
@@ -212,51 +211,35 @@ fn truncate_chars(s: &str, max: usize) -> String {
   }
 }
 
-/// Append the paragraph that explains the context file. Called once when the session is created;
-/// after that the harness never touches the `system` region again, so the model owns it outright.
-pub fn with_context_paragraph(system: &str, path: &Path) -> String {
-  let base = system.trim_end();
-  let paragraph = context_paragraph(path);
-  if base.is_empty() {
-    paragraph
-  } else {
-    format!("{base}\n\n{paragraph}")
-  }
-}
-
+/// The paragraph that explains the context file. Written once when the session is created; after
+/// that the harness never touches the `system` region again, so the model owns it outright.
 fn context_paragraph(path: &Path) -> String {
   format!(
     "Context file: {path}
-This conversation is that file, and every byte of it is already in your context, so reading it back \
-(`read`, `cat`, `grep`, `head`, `tail`) only re-injects what you can already see: a gigantic waste of \
-tokens. Never read your own context file.
 
-Editing it directly is just as useless. `edit` needs an old string and a new string, and the call \
-that carries them is itself recorded in this very file, so it writes back everything it removes. \
-Every such edit is a net gain of tokens, never a loss, and the window can never shrink through one: \
-editing your context window is impossible. All compaction must go through a tool whose pattern is \
-smaller than the chunk it removes: a short path or selector that drops or rewrites a big region in \
-a few dozen bytes of call. If there is a tool to edit your context window already available (eg the \
-`session-edit` skill), use that; if not, invent your own tooling.
+This conversation is that file. Everything in it is already in your context, so reading it back with \
+`read`, `cat`, `grep`, `head`, or `tail` only duplicates it. Do not read your own context file.
 
-Whatever you leave in the file is exactly what you get as context on the next call, so prune before \
-the context fills up: drop dead tool output, compress turns you have finished with, or delete whole \
-turns.
+Editing it with `edit` does not shrink the window. The edit call is recorded in the same file, so it \
+writes back everything it removes. Every such edit grows the file. To compact, use a tool whose \
+pattern is smaller than the text it removes: a short path or selector that drops or rewrites a large \
+region in one call. Use the `session-edit` skill if available, or write your own tool.
 
-The file is a stack of regions. `<!-- slopfile:NAME -->` opens one, `<!-- /slopfile -->` closes it, \
-and everything between is the body, copied out verbatim. Keep the ```toml fence and the `system` \
-region; drop or rewrite anything else. A turn counts as finished when its `turn` region is closed, \
-so close the ones you are done with.
+Whatever is left in the file is what you get on the next call, so prune before the context fills up: \
+delete dead tool output, compress finished turns, or remove whole turns.
 
-The grammar is: top level takes `system`, `turn` and `input`; a `turn` takes `user`, `note`, \
-`assistant`; an `assistant` takes `reasoning`, `text` and `call`. Anything else you name inside a \
-`turn` or an `assistant` is kept as your own role and handed back to you under that name, so you \
-can invent a `scratchpad` or a `ledger` and write in it as long as you like. `text` goes inside an \
-`assistant`, never straight into a `turn`.
+Regions: `<!-- slopfile:NAME -->` opens one, `<!-- /slopfile -->` closes it. The body between them is \
+copied verbatim. Keep the ```toml fence and the `system` region; drop or rewrite anything else. A \
+turn is finished when its `turn` region is closed.
 
-If your own text needs to contain one of those markers, wrap it so it stays text: \
-`<!--slopfile:ESC[<<!-- /slopfile -->]-->` keeps a literal close marker inside a body. An edit that \
-would leave the file unparseable is rolled back and the tool result tells you why.",
+Grammar: top level takes `system`, `turn`, `input`. A `turn` takes `user`, `note`, `assistant`. An \
+`assistant` takes `reasoning`, `text`, `call`. Any other name inside a `turn` or `assistant` is kept \
+as a custom role and returned under that name, so you can add a `scratchpad` or `ledger`. `text` \
+belongs inside an `assistant`, not directly in a `turn`.
+
+If your text must contain a marker, escape it: `<!--slopfile:ESC[<<!-- /slopfile -->]-->` keeps a \
+literal close marker inside a body. An edit that would make the file unparseable is refused, and the \
+tool result says why.",
     path = path.display(),
   )
 }
@@ -275,13 +258,22 @@ mod tests {
     assert!(p.contains("prune before the context fills up"), "{p}");
     assert!(p.contains("<!-- /slopfile -->"), "{p}");
     assert!(p.contains("<!--slopfile:ESC["), "{p}");
-    assert!(p.contains("rolled back"), "{p}");
+    assert!(p.contains("is refused"), "{p}");
   }
 
   #[test]
-  fn with_context_paragraph_appends_it_to_the_default_prompt() {
-    let system = with_context_paragraph("be helpful", Path::new("/t/1.md"));
-    assert!(system.starts_with("be helpful"), "{system}");
-    assert_eq!(system.matches("Context file: ").count(), 1, "{system}");
+  fn system_prompt_names_the_context_file_last() {
+    let cfg = AppConfig {
+      skills_dir: "/nonexistent".to_string(),
+      ..Default::default()
+    };
+    let path = Path::new("/t/1.md");
+    let prompt = system_prompt(&cfg, &SessionConfig::default(), path);
+    assert!(
+      prompt.contains(&format!("Context file: {}", path.display())),
+      "{prompt}"
+    );
+    assert!(prompt.ends_with("says why."), "{prompt}");
+    assert_eq!(prompt.matches("Context file: ").count(), 1, "{prompt}");
   }
 }
