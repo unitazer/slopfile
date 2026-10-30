@@ -609,8 +609,6 @@ class Editor:
             self.initial_text = fh.read()
         self.lines = self.initial_text.splitlines(keepends=True)
         self.reindex()
-        self.initial_lines = len(self.lines)
-        self.initial_chars = total_chars(self)
 
     def reindex(self):
         self.roots, self.stack, self.open_nodes = build_tree(self.lines)
@@ -671,12 +669,12 @@ class Editor:
     def stats(self):
         return len(self.lines), total_chars(self)
 
-    def delta_suffix(self):
+    def size_suffix(self):
+        # Only the size now. A "before" figure is the file at the start of this process, which is
+        # already after the harness streamed this round's reasoning, text and call into it; printing
+        # it next to an older `list` invites a comparison that can never be right.
         lines, chars = self.stats()
-        return (
-            f"{self.initial_lines} → {lines} lines, "
-            f"{self.initial_chars:,} → {chars:,} content chars; {describe_state(self)}"
-        )
+        return f"{lines} lines, {chars:,} content chars; {describe_state(self)}"
 
     def drop(self, spec):
         self.ensure_writable()
@@ -696,7 +694,7 @@ class Editor:
         for node in targets:
             doomed.update(range(node.open_line, node.close_line + 1))
         self.commit([line for i, line in enumerate(self.lines) if i not in doomed])
-        return len(targets), f"dropped {len(targets)} region(s): {self.delta_suffix()}"
+        return len(targets), f"dropped {len(targets)} region(s): {self.size_suffix()}"
 
     def write(self, spec, raw, append=False):
         self.ensure_writable()
@@ -723,7 +721,7 @@ class Editor:
             label = f"{spec} ({len(targets)} region(s))"
         self.commit(keep)
         verb = "appended to" if append else "set"
-        return len(targets), f"{verb} {label}: {self.delta_suffix()}"
+        return len(targets), f"{verb} {label}: {self.size_suffix()}"
 
     def begin(self):
         tops = [n for n in self.roots if n.name == BEGIN]
@@ -801,7 +799,7 @@ class Editor:
             f"{holder_path}.{new_base}" if holder_path else new_base
         )
         size = content_size(self.lines, self.by_path[new_path])
-        return 1, f"added {new_path} ({size:,}c): {self.delta_suffix()}"
+        return 1, f"added {new_path} ({size:,}c): {self.size_suffix()}"
 
     def save(self):
         with open(self.path) as fh:
@@ -1062,7 +1060,7 @@ def main():
         editor.save()
         print(
             f"applied {len(ops)} {'edit' if len(ops) == 1 else 'edits'} ({regions} regions): "
-            f"{editor.delta_suffix()}"
+            f"{editor.size_suffix()}"
         )
         return
 

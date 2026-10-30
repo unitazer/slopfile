@@ -193,9 +193,14 @@ Escaping is handled for you: `<` in a body is wrapped automatically, so a note c
 ## Trust the output
 
 `set`, `append`, `add`, `drop` and `batch` print the resolved paths (including
-`self → turn[2].assistant[3].reasoning (92c)`) and exact line/character deltas. If it printed, it
-wrote. Do not read or grep the session file to verify: that re-injects it as fresh context and
+`self → turn[2].assistant[3].reasoning (92c)`) and the file's size after the edit. If it printed,
+it wrote. Do not read or grep the session file to verify: that re-injects it as fresh context and
 defeats the point of dropping it.
+
+Sizes are snapshots, not deltas. The harness writes your reasoning, text and call into the
+transcript as you generate them, so the file grows between a `list` and the next command. Do not
+compare a count from an earlier `list` to a later receipt: the difference is your own output plus
+whatever tool results landed since, not what the edit did. The receipt's count is the size now.
 
 when doing a batch edit to compact your own session, remove all previous outputs of the listed tree
 stale information is a frequent source of confusion and sends you on long reasoning chains about
