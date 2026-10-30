@@ -197,6 +197,11 @@ Escaping is handled for you: `<` in a body is wrapped automatically, so a note c
 wrote. Do not read or grep the session file to verify: that re-injects it as fresh context and
 defeats the point of dropping it.
 
+when doing a batch edit to compact your own session, remove all previous outputs of the listed tree
+stale information is a frequent source of confusion and sends you on long reasoning chains about
+things that no longer matter since the edit has already happened. ignore all previous list command 
+outputs and only reason about an up to date representation of the context file structure
+
 Keep stderr visible: a validation error means it refused to write, and `2>/dev/null` turns that
 into a silent no-op. `ctx:N` lags one call; judge by trend. `note` lives at the turn level; inside
 an assistant use your own role name.
