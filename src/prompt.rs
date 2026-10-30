@@ -64,7 +64,7 @@ Current working directory: {}",
     "\n\nIf you learn something that took trial and error to discover, write it down as a new skill. Creating skills is how you manage persistent memory, so the next session does not have to rediscover it."
   );
   out.push_str(&context_size_note(cfg, session_config));
-  out.push_str("\n");
+  out.push('\n');
   out.push_str(&context_paragraph(path));
   out
 }

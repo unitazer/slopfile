@@ -254,7 +254,7 @@ pub async fn drive_file(path: &Path, cfg: &AppConfig, client: &LlamaClient) -> R
       return Ok(());
     }
     // While a question is pending the input region belongs to the answer UI, not to a new turn.
-    if session.has_input() && !session.turn_in_progress() && session.pending_question().is_none() {
+    if session.has_input() && session.pending_question().is_none() {
       session.promote_input();
       transcript::save(path, &session)?;
     }

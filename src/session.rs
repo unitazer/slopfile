@@ -1143,6 +1143,9 @@ impl Session {
     if text.is_empty() {
       return false;
     }
+    // A new message is a new turn. An open turn is an interrupted response, and resuming it would
+    // append the new answer to the old reasoning. Close it instead; resume only runs with no input.
+    self.close_turn();
     self.input.clear();
     // Only a completely empty trailing turn can absorb the text; anything else already holds a
     // message the user typed, and overwriting it would delete their words.

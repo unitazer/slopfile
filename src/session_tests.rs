@@ -779,6 +779,33 @@ fn promote_input_turns_typed_text_into_a_user_turn() {
 }
 
 #[test]
+fn promote_input_closes_an_open_turn_instead_of_resuming_it() {
+  let (mut session, report) = parse(&input_file("first"));
+  assert!(report.is_clean(), "{report:?}");
+  session.promote_input();
+  session.begin_round();
+  session.push_reasoning("old thought");
+  session.push_text("old answer");
+  assert!(session.turn_in_progress());
+
+  session.input = "second".into();
+  assert!(session.promote_input());
+  assert!(!session.turn_in_progress());
+  assert_eq!(session.turns.len(), 2, "{:?}", session.turns);
+  assert_eq!(session.turns[0].user.as_deref(), Some("first"));
+  assert_eq!(
+    session.turns[0].rounds[0].assistant.reasoning.as_deref(),
+    Some("old thought")
+  );
+  assert_eq!(session.turns[1].user.as_deref(), Some("second"));
+  assert!(session.turns[1].rounds.is_empty());
+
+  let (reparsed, report) = parse(&session.render());
+  assert!(report.is_clean(), "{report:?}");
+  assert_eq!(reparsed.turns, session.turns);
+}
+
+#[test]
 fn promote_input_escapes_typed_markers() {
   let (mut session, report) = parse(&input_file("<!-- /slopfile --> please"));
   assert!(report.is_clean(), "{report:?}");
