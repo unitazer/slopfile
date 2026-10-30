@@ -60,6 +60,8 @@ If the session runs without thinking there is no reasoning block; summarize `sel
 If a receipt shows `self` is smaller than you expected, an interruption moved it. The old block is
 still at the turn you listed; target it by turn.
 
+removing your own reasoning about the session edit plan is generally a good idea
+
 ## While your tool runs
 
 `live: turn[N]` is normal, not a half-written turn. Generation has ended; the reasoning is closed
@@ -155,6 +157,7 @@ add 'turn[-1].note' <<'END'
 END
 EOF
 ```
+please use ranges like 2..7 (this is from 2 to 7 inclusive) instead of writing the same operation many times
 
 Keep every user message unless the user says to drop it.
 

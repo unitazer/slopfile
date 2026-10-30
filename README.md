@@ -1,6 +1,6 @@
-(almost) COMEPLETELY vibecoded, this is a throwaway project, if i feel like its worthy and anyone else
-expresses some interest in it, i might rewrite it on my own.
-the code's definitely questionable at places but if it doesnt work just throw a different clanker at it idc
+(almost) completely ai slop, didnt look at the code too much, if this gets more than like 10 stars i might
+rewrite it more cleanly, the code is not the best and still has some common ai slop issues left but at least
+i tried to clean up a bit
 
 you can also sort of tell which parts the llms wrote because i almost never capitalize things
 anyways please read the entire part bellow:
