@@ -33,16 +33,15 @@ so that there is a bit more freedom to that i guess
 the default implementation is aint the best honestly but i dont have enough tokens to make it good lol
 # running
 
-look at how start.sh does it
-there is also ./start.sh --no-llama to only start the daemon
+look at how `start.sh` does it
+there is also `./start.sh --no-llama` to only start the daemon
 it expects you to be in the docker group
 the daemon expects env variables something like this:
-
-```bash
-export SLOPFILE_CONFIG=shared/slopfile.toml
-export SLOPFILE_API_BASE=http://127.0.0.1:8080
-export SLOPFILE_WORKDIR=/path/to/a/codebase
-export SLOPFILE_TRANSCRIPTS=./transcripts
+```
+SLOPFILE_CONFIG=shared/slopfile.toml
+SLOPFILE_API_BASE=http://127.0.0.1:8080
+SLOPFILE_WORKDIR=/path/to/a/codebase
+SLOPFILE_TRANSCRIPTS=./transcripts
 ```
 but like you really should be using the docker script, this thing got no security at all so yea
 
