@@ -5,7 +5,7 @@ workdir = "/workspace"
 transcripts_dir = "/shared/transcripts"
 sweep_interval_ms = 250
 default_session_model = "qwen3.8-gsq"
-max_context_tokens = 131072
+max_context_tokens = 90000
 
 # Tell the model how large its context window is. Every tool result is tagged `ctx:N` and the
 # system prompt explains how to read it, so it can prune before it runs out instead of finding out
