@@ -44,15 +44,22 @@ pub fn repo_relative(value: &str, root: &std::path::Path) -> String {
 
 pub fn load_app_config() -> types::AppConfig {
   use std::env::var;
-  use tracing::warn;
 
   let fallback = discover_repo_root()
     .map(|root| root.join("shared").join("slopfile.toml"))
     .unwrap_or_else(|| PathBuf::from("shared/slopfile.toml"));
-  let path = var("SLOPFILE_CONFIG").unwrap_or_else(|_| fallback.to_string_lossy().into());
+  // An empty value is how an unset shell variable often arrives; treat it as unset rather than
+  // trying to open the empty path.
+  let path = var("SLOPFILE_CONFIG")
+    .ok()
+    .filter(|p| !p.trim().is_empty())
+    .unwrap_or_else(|| fallback.to_string_lossy().into());
+  // A bad config is fatal. Falling back to built-in defaults here would start a daemon that
+  // looks healthy while every value the user wrote is missing -- the failure they most need to
+  // see, hidden behind a warning.
   let mut cfg = types::AppConfig::load_from_file(&path).unwrap_or_else(|e| {
-    warn!("could not load app config ({path}): {e}; using defaults");
-    types::AppConfig::default()
+    eprintln!("slopfile: cannot load config {path}: {e}");
+    std::process::exit(1);
   });
   if let Some(root) = discover_repo_root() {
     if cfg.workdir == "workspace" && root.join("workspace").is_dir() {
@@ -129,7 +136,24 @@ mod duplicate_key_tests {
     let path = dir.join("slopfile.toml");
     std::fs::write(
       &path,
-      "workdir = \"/custom/workdir\"\nmax_context_tokens = 131072\nmodel = \"old-name\"\ndefault_session_model = \"new-name\"\n",
+      r#"confirmations = "ask"
+api_base = "http://127.0.0.1:8080"
+workdir = "/custom/workdir"
+transcripts_dir = "/tmp/transcripts"
+skills_dir = "/tmp/skills"
+sweep_interval_ms = 250
+model = "old-name"
+default_session_model = "new-name"
+tool_timeout_ms = 30000
+max_context_tokens = 131072
+abort_restart_server = true
+llama_container = "test-llama"
+burst_max_turns = 0
+tell_model_context_size = true
+what_to_tell_when_above_reminder_threshold = ", please compact!"
+subagent_max_depth = 2
+[providers]
+"#,
     )
     .unwrap();
     let cfg = types::AppConfig::load_from_file(path.to_str().unwrap());

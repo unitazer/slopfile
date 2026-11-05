@@ -3,6 +3,7 @@ api_base = "http://127.0.0.1:8080"
 # provider = "openrouter"   # app-wide default for sessions whose fence names none
 workdir = "/workspace"
 transcripts_dir = "/shared/transcripts"
+skills_dir = "/shared/skills"
 sweep_interval_ms = 250
 default_session_model = "qwen3.8-gsq"
 max_context_tokens = 90000
@@ -11,11 +12,17 @@ max_context_tokens = 90000
 # system prompt explains how to read it, so it can prune before it runs out instead of finding out
 # by being cut off mid-sentence. Set false to keep the file smaller and the prompt shorter.
 tell_model_context_size = true
+# Text appended inside the `ctx:N` tag once the context exceeds the reminder threshold below, so
+# the nudge arrives with the number that triggered it: `[ctx:100000, please compact!]`. Written
+# verbatim, punctuation included.
+what_to_tell_when_above_reminder_threshold = ", please compact!"
+# Token count above which the reminder is added. Omit this key (`None`) to never add it.
+# compaction_reminder_threshold = 100000
 tool_timeout_ms = 60000
 abort_restart_server = true
 llama_container = "clanker-llama"
 subagent_max_depth = 2
-# burst_max_turns = 0   # ceiling on turns per `sf send`; 0 (default) means none
+burst_max_turns = 0  
 # tell_model_context_size = true   # per-session override of the setting above
 
 # Any OpenAI-compatible endpoint. A session selects one with `provider = "<name>"` in its fence.

@@ -57,9 +57,11 @@ You act by calling tools. Your text replies and tool calls are relayed to the us
 Current working directory: {}",
     cfg.workdir
   ));
-  out.push_str(&skills_index(&cfg.skills_dir));
-  // `skills_index` is empty when there are no skills, and the block above ends without a newline,
-  // so this needs its own leading break or it welds itself onto the working directory.
+  if let Some(sk) = skills_index(&cfg.skills_dir) {
+    out.push_str(&sk);
+  }
+
+  // this little bit of the prompt has not worked once yet
   out.push_str(
     "\n\nIf you learn something that took trial and error to discover, write it down as a new skill. Creating skills is how you manage persistent memory, so the next session does not have to rediscover it."
   );
@@ -69,10 +71,10 @@ Current working directory: {}",
   out
 }
 
-fn skills_index(dir: &str) -> String {
+fn skills_index(dir: &str) -> Option<String> {
   let entries = match std::fs::read_dir(dir) {
     Ok(entries) => entries,
-    Err(_) => return String::new(),
+    Err(_) => return None,
   };
   let mut files: Vec<PathBuf> = entries
     .flatten()
@@ -81,7 +83,7 @@ fn skills_index(dir: &str) -> String {
     .collect();
   files.sort();
   if files.is_empty() {
-    return String::new();
+    return None;
   }
   let mut listed = Vec::new();
   for f in files {
@@ -100,13 +102,13 @@ fn skills_index(dir: &str) -> String {
     }
   }
   if listed.is_empty() {
-    return String::new();
+    return None;
   }
   let mut out = format!(
     "\nSkills available in {dir}. When a task matches a skill, read that file fully and follow it:\n"
   );
   out.push_str(&listed.concat());
-  out
+  Some(out)
 }
 
 fn frontmatter_disabled(content: &str) -> bool {
@@ -194,21 +196,22 @@ fn body_summary(lines: &[&str]) -> Option<String> {
     if trimmed.is_empty() || trimmed.starts_with('#') {
       continue;
     }
-    desc = Some(truncate_chars(trimmed, 120));
+    desc = Some(truncate_chars(trimmed, 48));
     break;
   }
   desc.or(title.map(|s| s.to_string()))
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
-  if s.chars().count() <= max {
+  if s.split_ascii_whitespace().count() <= max {
     return s.to_string();
   }
-  let cut: String = s.chars().take(max).collect();
-  match cut.rfind(' ') {
-    Some(i) => format!("{}...", &cut[..i]),
-    None => format!("{cut}..."),
-  }
+  let cut: String = s.split_ascii_whitespace().take(max).collect();
+  format!("{cut}..")
+  // match cut.rfind(' ') {
+  //   Some(i) => format!("{}...", &cut[..i]),
+  //   None => format!("{cut}..."),
+  // }
 }
 
 /// The paragraph that explains the context file. Written once when the session is created; after

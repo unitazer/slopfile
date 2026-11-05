@@ -509,55 +509,55 @@ fn expand_env(value: &str, provider: &str, header: &str) -> Result<String, Strin
   Ok(out)
 }
 
+/// Deserialization is deliberately strict: every non-`Option` field must be present, and unknown
+/// keys are rejected. That way a config file cannot silently inherit a value it never mentioned --
+/// if the schema changes, an old file fails at startup with a missing-field error instead of
+/// quietly running with a default the user did not choose.
+///
+/// The two `Option` fields are the exception, because TOML has no `null` to spell `None` with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
-  #[serde(default)]
   pub confirmations: Confirmations,
   /// The implicit, always-available endpoint. Used whenever a session names no provider, and is
   /// assumed to be llama-server, since that is what it has always pointed at.
-  #[serde(default = "default_api_base")]
   pub api_base: String,
   /// Named endpoints a session can select by putting `provider = "<name>"` in its fence.
-  #[serde(default)]
   pub providers: BTreeMap<String, Provider>,
   /// Which named endpoint a session that names none gets. `None` keeps `api_base`.
-  #[serde(default)]
   pub provider: Option<String>,
-  #[serde(default = "default_workdir")]
   pub workdir: String,
-  #[serde(default = "default_transcripts_dir")]
   pub transcripts_dir: String,
-  #[serde(default = "default_skills_dir")]
   pub skills_dir: String,
-  #[serde(default = "default_sweep_interval_ms")]
   pub sweep_interval_ms: u64,
   /// Stamped into the fence of every new session. Renamed from a bare `model`, which read
   /// like a global switch but never was: a session pins its own model at creation, so this
   /// only ever affects sessions created *after* you change it.
-  #[serde(default = "default_session_model", alias = "model")]
+  #[serde(alias = "model")]
   pub default_session_model: String,
-  #[serde(default = "default_tool_timeout_ms")]
   pub tool_timeout_ms: u64,
-  #[serde(default = "default_max_context")]
   pub max_context_tokens: u32,
-  #[serde(default = "default_abort_restart_server")]
   pub abort_restart_server: bool,
-  #[serde(default = "default_llama_container")]
   pub llama_container: String,
-  /// Turns one `sf send` may spend before the harness stops the burst. 0, the default, means no
-  /// limit: the turn cap that used to sit here at a fixed 20 was a band-aid for a `bash` bug that
-  /// forced the model to poll backgrounded jobs, and it outlived the bug.
-  #[serde(default)]
+  /// Turns one `sf send` may spend before the harness stops the burst. 0 means no limit: the turn
+  /// cap that used to sit here at a fixed 20 was a band-aid for a `bash` bug that forced the model
+  /// to poll backgrounded jobs, and it outlived the bug.
   pub burst_max_turns: u32,
   /// Tell the model how large its context window currently is.
   ///
-  /// On by default. A model that is asked to prune its own transcript has no way to know how full
-  /// it is, and the only other signal arrives mid-response once the answer is already truncated --
-  /// so compaction timing becomes guesswork. Each tool result carries `ctx:N`, the count as of the
-  /// request that made the call, and the system prompt explains how to read it.
-  #[serde(default = "default_true")]
+  /// A model that is asked to prune its own transcript has no way to know how full it is, and the
+  /// only other signal arrives mid-response once the answer is already truncated -- so compaction
+  /// timing becomes guesswork. Each tool result carries `ctx:N`, the count as of the request that
+  /// made the call, and the system prompt explains how to read it.
   pub tell_model_context_size: bool,
-  #[serde(default = "default_subagent_max_depth")]
+  /// Appended to the `ctx:N` tag once the measured context exceeds
+  /// `compaction_reminder_threshold`, so the model is told to compact right where it reads its own
+  /// size. Written verbatim, punctuation included: the default yields `[ctx:100000, please
+  /// compact!]`.
+  pub what_to_tell_when_above_reminder_threshold: String,
+  /// When the context size in tokens passes this, `what_to_tell_when_above_reminder_threshold` is
+  /// appended to the `ctx:N` tag. `None` never adds the reminder.
+  pub compaction_reminder_threshold: Option<u32>,
   pub subagent_max_depth: u32,
 }
 
@@ -597,6 +597,9 @@ fn default_subagent_max_depth() -> u32 {
 fn default_true() -> bool {
   true
 }
+fn default_compaction_reminder() -> String {
+  ", please compact!".to_string()
+}
 
 impl Default for AppConfig {
   fn default() -> Self {
@@ -615,18 +618,22 @@ impl Default for AppConfig {
       abort_restart_server: default_abort_restart_server(),
       llama_container: default_llama_container(),
       burst_max_turns: 0,
-      tell_model_context_size: true,
+      tell_model_context_size: default_true(),
+      what_to_tell_when_above_reminder_threshold: default_compaction_reminder(),
+      compaction_reminder_threshold: None,
       subagent_max_depth: default_subagent_max_depth(),
     }
   }
 }
 
 impl AppConfig {
+  /// There is deliberately no fallback to `AppConfig::default()`: a missing file or a missing
+  /// field is a configuration mistake, and silently substituting defaults is exactly how a
+  /// session ends up running with values nobody chose. Callers that need a default should point
+  /// at the tracked default config instead.
   pub fn load_from_file(path: &str) -> Result<Self, String> {
-    match std::fs::read_to_string(path) {
-      Ok(text) => Self::from_toml(&text).map_err(|e| format!("bad toml: {e}")),
-      Err(_) => Ok(Self::default()),
-    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    Self::from_toml(&text).map_err(|e| format!("bad toml: {e}"))
   }
 
   /// `model` is an accepted alias for `default_session_model`, but serde treats both as the same
@@ -785,6 +792,38 @@ impl ToolResult {
       output: output.into(),
     }
   }
+}
+
+/// A complete config for tests that only care about one field. Every non-`Option` key is present
+/// because `AppConfig` deliberately has no serde defaults to fall back on.
+#[cfg(test)]
+pub(crate) fn complete_config_with(model: &str, top: &str, providers: &str) -> String {
+  format!(
+    r#"confirmations = "ask"
+api_base = "http://127.0.0.1:8080"
+workdir = "/tmp"
+transcripts_dir = "/tmp/transcripts"
+skills_dir = "/tmp/skills"
+sweep_interval_ms = 250
+{model}
+tool_timeout_ms = 30000
+max_context_tokens = 90000
+abort_restart_server = true
+llama_container = "test-llama"
+burst_max_turns = 0
+tell_model_context_size = true
+what_to_tell_when_above_reminder_threshold = ", please compact!"
+subagent_max_depth = 2
+{top}
+[providers]
+{providers}
+"#
+  )
+}
+
+#[cfg(test)]
+pub(crate) fn complete_config(top: &str, providers: &str) -> String {
+  complete_config_with("default_session_model = \"qwen3.8-27b\"", top, providers)
 }
 
 #[cfg(test)]
@@ -977,23 +1016,19 @@ mod tests {
 
   #[test]
   fn a_provider_block_parses_out_of_the_config_file() {
-    let cfg: AppConfig = toml::from_str(
-      r#"
-      api_base = "http://127.0.0.1:8080"
-      provider = "openrouter"
+    let cfg: AppConfig = toml::from_str(&complete_config(
+      r#"provider = "openrouter""#,
+      r#"[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
 
-      [providers.openrouter]
-      base_url = "https://openrouter.ai/api/v1"
+[providers.openrouter.headers]
+Authorization = "Bearer sk-or-v1-literal"
+"HTTP-Referer" = "http://localhost"
 
-      [providers.openrouter.headers]
-      Authorization = "Bearer sk-or-v1-literal"
-      "HTTP-Referer" = "http://localhost"
-
-      [providers.a_second_llama]
-      base_url = "http://gpu-box:8080"
-      llama = true
-      "#,
-    )
+[providers.a_second_llama]
+base_url = "http://gpu-box:8080"
+llama = true"#,
+    ))
     .unwrap();
     assert_eq!(cfg.providers.len(), 2);
     assert!(cfg.providers["a_second_llama"].llama);
@@ -1012,20 +1047,47 @@ mod alias_tests {
   use super::*;
 
   /// Renaming `model` -> `default_session_model` would otherwise silently reset every deployed
-  /// config to the built-in default, because `AppConfig` ignores unknown keys. The alias keeps an
+  /// config to the built-in default, because `AppConfig` rejects unknown keys. The alias keeps an
   /// old config file working unchanged.
   #[test]
   fn the_old_model_key_still_stamps_new_sessions() {
-    let cfg: AppConfig = toml::from_str(r#"model = "qwen3.8-27b""#).unwrap();
+    let cfg: AppConfig =
+      toml::from_str(&complete_config_with(r#"model = "qwen3.8-27b""#, "", "")).unwrap();
     assert_eq!(cfg.default_session_model, "qwen3.8-27b");
   }
 
   #[test]
   fn the_new_key_wins_and_an_unset_one_falls_back_to_the_built_in_default() {
-    let cfg: AppConfig =
-      toml::from_str(r#"default_session_model = "qwen/qwen3-235b-a22b""#).unwrap();
+    let cfg: AppConfig = toml::from_str(&complete_config_with(
+      r#"default_session_model = "qwen/qwen3-235b-a22b""#,
+      "",
+      "",
+    ))
+    .unwrap();
     assert_eq!(cfg.default_session_model, "qwen/qwen3-235b-a22b");
     assert_eq!(AppConfig::default().default_session_model, "qwen3.8-27b");
+  }
+
+  /// A field added to the schema must not silently take its built-in default for an existing
+  /// config. The load has to fail where the user can see it.
+  #[test]
+  fn a_missing_field_is_an_error_instead_of_a_default() {
+    let text = complete_config("", "").replace("max_context_tokens = 90000\n", "");
+    let err = toml::from_str::<AppConfig>(&text).unwrap_err().to_string();
+    assert!(err.contains("missing field `max_context_tokens`"), "{err}");
+  }
+
+  #[test]
+  fn an_unknown_field_is_rejected() {
+    let text = complete_config("max_context_token = 1", "");
+    let err = toml::from_str::<AppConfig>(&text).unwrap_err().to_string();
+    assert!(err.contains("unknown field `max_context_token`"), "{err}");
+  }
+
+  #[test]
+  fn a_missing_config_file_is_an_error_instead_of_defaults() {
+    let err = AppConfig::load_from_file("/definitely/not/a/slopfile.toml").unwrap_err();
+    assert!(err.contains("read"), "{err}");
   }
 }
 

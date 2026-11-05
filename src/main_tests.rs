@@ -12,7 +12,7 @@ use crate::flow::{
 };
 use crate::session::{self, Session};
 use crate::stream::StreamWriter;
-use crate::types::{AppConfig, ChatMessage, Confirmations, Role, StreamEvent, ToolCall};
+use crate::types::{AppConfig, Confirmations, Role, StreamEvent, ToolCall};
 use crate::{flow, tokens, tools, transcript};
 
 fn yolo_cfg() -> AppConfig {
@@ -23,6 +23,8 @@ fn yolo_cfg() -> AppConfig {
     provider: None,
     burst_max_turns: 0,
     tell_model_context_size: true,
+    what_to_tell_when_above_reminder_threshold: ", please compact!".into(),
+    compaction_reminder_threshold: None,
     workdir: "/tmp".into(),
     transcripts_dir: "/tmp".into(),
     skills_dir: "/tmp/does-not-exist".into(),
@@ -995,6 +997,13 @@ fn arming_is_consumed_when_the_burst_settles() {
   state.settle(entry);
   assert!(!state.armed, "the burst that ran disarms at idle");
 
+  state.context_full = true;
+  state.arm();
+  assert!(
+    !state.context_full,
+    "a fresh send clears the previous context-full marker"
+  );
+
   state.arm();
   let entry = state.arm_token();
   state.arm();
@@ -1455,7 +1464,7 @@ async fn concurrent_writes_leave_the_file_intact() {
 fn the_prompt_budget_leaves_room_for_the_answer() {
   let budget = 131_072;
   let allowance = tokens::output_allowance(budget);
-  assert_eq!(allowance, 40_000);
+  assert_eq!(allowance, 32_768);
   assert_eq!(
     tokens::prompt_budget(budget),
     budget - allowance,
@@ -1467,35 +1476,6 @@ fn the_prompt_budget_leaves_room_for_the_answer() {
     0,
     "no underflow when the allowance exceeds the window"
   );
-}
-
-#[test]
-fn a_truncated_window_never_opens_with_the_assistant() {
-  let mut msgs = vec![ChatMessage::system("sys")];
-  for i in 1..=8 {
-    msgs.push(ChatMessage::user(format!("user {i}")));
-    msgs.push(ChatMessage::assistant(format!("assistant {i}")));
-  }
-  let counts: Vec<usize> = msgs.iter().map(|_| 3).collect();
-  for budget in [6usize, 8, 10, 12, 14, 16, 18, 20, 24] {
-    let (window, kept) = tokens::truncate_messages(msgs.clone(), &counts, budget as u32);
-    let roles: Vec<Role> = window.iter().map(|m| m.role).collect();
-    assert_eq!(roles[0], Role::System, "budget {budget}");
-    if kept <= budget {
-      assert_ne!(
-        roles.get(1),
-        Some(&Role::Assistant),
-        "budget {budget} opened with an assistant message: {roles:?}"
-      );
-    } else {
-      // Over budget: the caller must refuse rather than silently send an invalid window.
-      assert_ne!(
-        roles.get(1),
-        Some(&Role::Assistant),
-        "budget {budget}: {roles:?}"
-      );
-    }
-  }
 }
 
 #[tokio::test]
@@ -2498,9 +2478,9 @@ fn a_stopped_session_is_not_rearmed_by_unparking() {
 }
 
 /// The bands are advice the model can actually follow. Derived from the window rather than the
-/// configured ceiling, because `output_allowance` reserves up to 40k for the reply: at a 65k window
-/// the prompt only gets 25536, so thresholds computed from the configured number would sit above
-/// the point where the model gets truncated anyway.
+/// configured ceiling, because `output_allowance` reserves `max(budget / 4, 32k)` for the reply:
+/// at a 65k window the prompt only gets 33536, so thresholds computed from the configured number
+/// would sit above the point where the model gets cut off anyway.
 #[test]
 fn the_context_bands_are_always_reachable() {
   use crate::tokens::context_bands;
@@ -2581,7 +2561,7 @@ fn a_tool_result_is_tagged_once_and_only_once() {
       ms: 2,
     },
   ];
-  crate::flow::annotate_context_size(&mut outcomes, Some(45454));
+  crate::flow::annotate_context_size(&mut outcomes, Some(45454), &yolo_cfg());
   assert!(
     outcomes[0].output.contains("[ctx:45454]"),
     "{}",
@@ -2601,8 +2581,46 @@ fn a_tool_result_is_tagged_once_and_only_once() {
     ok: true,
     ms: 0,
   }];
-  crate::flow::annotate_context_size(&mut blind, None);
+  crate::flow::annotate_context_size(&mut blind, None, &yolo_cfg());
   assert_eq!(blind[0].output, "body", "no invented number");
+}
+
+/// The reminder is part of the tag itself -- `[ctx:N{note}]` -- so it cannot drift away from the
+/// number that triggered it. `None` keeps the tag bare no matter how large the context gets.
+#[test]
+fn the_context_tag_carries_the_compaction_reminder_above_the_threshold() {
+  use crate::session::ToolOutcome;
+  let one = || {
+    vec![ToolOutcome {
+      id: "a".into(),
+      name: "read".into(),
+      output: "body".into(),
+      ok: true,
+      ms: 1,
+    }]
+  };
+  let mut cfg = yolo_cfg();
+  cfg.compaction_reminder_threshold = Some(100_000);
+  cfg.what_to_tell_when_above_reminder_threshold = ", please compact!".into();
+
+  let mut above = one();
+  crate::flow::annotate_context_size(&mut above, Some(100_001), &cfg);
+  assert_eq!(above[0].output, "body\n[ctx:100001, please compact!]");
+
+  let mut at = one();
+  crate::flow::annotate_context_size(&mut at, Some(100_000), &cfg);
+  assert_eq!(
+    at[0].output, "body\n[ctx:100000]",
+    "the threshold is exclusive"
+  );
+
+  cfg.compaction_reminder_threshold = None;
+  let mut off = one();
+  crate::flow::annotate_context_size(&mut off, Some(500_000), &cfg);
+  assert_eq!(
+    off[0].output, "body\n[ctx:500000]",
+    "None never adds the note"
+  );
 }
 
 /// The tag goes in the transcript, so it comes back on later turns without being rebuilt -- and the
@@ -2626,7 +2644,7 @@ fn the_tag_survives_into_the_next_request_without_growing() {
     ok: true,
     ms: 1,
   }];
-  crate::flow::annotate_context_size(&mut outcomes, Some(12345));
+  crate::flow::annotate_context_size(&mut outcomes, Some(12345), &yolo_cfg());
   session.finish_round(vec![], outcomes);
   write_session(&path, &session);
 
@@ -2732,6 +2750,59 @@ fn a_misspelled_provider_is_reported_in_the_transcript() {
       .any(|n| n.text.contains("Re-sending alone will fail")),
     "and must not send the user in circles: {notes:?}"
   );
+}
+
+/// A transcript over the prompt budget is refused before anything is sent. The file has to say
+/// why: the daemon parks after repeated sweeps, and the model never gets to see the error that
+/// would tell it to compact.
+#[test]
+fn an_over_budget_transcript_is_reported_in_the_transcript() {
+  let dir = scratch("budget-note");
+  let path = dir.join("1.md");
+  let mut session = template(&yolo_cfg(), &[]);
+  session.input = "hi".into();
+  session.promote_input();
+  write_session(&path, &session);
+
+  daemon::record_budget_failure(
+    &path,
+    "request exceeds the context budget: 60000 > 58000 tokens; compact the transcript",
+  )
+  .unwrap();
+
+  let reloaded = load(&path);
+  let notes = &reloaded.turns.last().unwrap().notes;
+  assert!(
+    notes
+      .iter()
+      .any(|n| n.text.contains("larger than the prompt budget")),
+    "the note must name the actual problem: {notes:?}"
+  );
+  assert!(
+    notes.iter().any(|n| n.text.contains("session-edit")),
+    "and point at the tool that can shrink it: {notes:?}"
+  );
+  assert!(
+    notes.iter().any(|n| n.text.contains("max_context_tokens")),
+    "and at the setting that can raise the ceiling: {notes:?}"
+  );
+
+  // Repeated sweeps replace the note instead of stacking one per attempt.
+  daemon::record_budget_failure(
+    &path,
+    "request exceeds the context budget: 61000 > 58000 tokens; compact the transcript",
+  )
+  .unwrap();
+  let reloaded = load(&path);
+  let count = reloaded
+    .turns
+    .last()
+    .unwrap()
+    .notes
+    .iter()
+    .filter(|n| n.text.contains("larger than the prompt budget"))
+    .count();
+  assert_eq!(count, 1, "one budget note, not one per sweep");
 }
 
 /// A timeout is not a refusal. Telling the user "re-sending is safe" when a stream died

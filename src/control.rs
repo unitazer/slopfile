@@ -74,6 +74,8 @@ impl SessionState {
     self.stopped = false;
     // A send is the user saying "try again", which is also how a provider refusal gets cleared.
     self.blocked = false;
+    // The previous burst may have hit the ceiling; a fresh send is a fresh measurement.
+    self.context_full = false;
     self.arm_token += 1;
   }
 

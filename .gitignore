@@ -1,4 +1,8 @@
 /target
+/docker/.env
+/docker/Dockerfile.slopfile.local
+/shared/slopfile.local.toml
+/shared/models/presets.local.ini
 /shared/models
 /shared/transcripts
 /workspace

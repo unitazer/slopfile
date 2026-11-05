@@ -134,6 +134,24 @@ next request. The note's own call would create another reasoning block to clean 
 the summary and the cleanup are one batch. The note body is multi-line; the outer shell heredoc
 must use a different tag (`EOF`).
 
+The listing that planned the batch is dead too: the round that ran `list`, the output it printed,
+and the reasoning that read it. `list` prints the exact paths for that round (or for its call, if
+the round had other calls) and for the result it will produce; use the ones from the listing you
+are acting on, and put them in the same batch as the compaction:
+
+```bash
+set 'self.reasoning' | <one-line summary>
+drop '<the assistant or call path printed by list>'
+drop '<the result path printed by list>'
+```
+
+When `list` ran alone in the immediately previous round, those paths are
+`turn[-1].assistant[-2]` and `turn[-1].result[-1]`. Do not assume that shorthand in any other case.
+If the list round contained other calls, `list` prints the `call` path instead of the round path:
+drop that call and its result, not the whole assistant, or the other call is lost while its result
+stays behind. If another round landed after `list`, or a new turn started, use the absolute paths
+`list` printed -- `[-2]`/`[-1]` then point at the wrong regions.
+
 The note is memory, not your reply. Do not paste its body into `text` or `reasoning` as well, and
 do not treat the batch result as the end of the turn: keep working with the next tool call. The
 note is written before this call's result, so later rounds are appended after it; you do not need
@@ -213,3 +231,7 @@ outputs and only reason about an up to date representation of the context file s
 Keep stderr visible: a validation error means it refused to write, and `2>/dev/null` turns that
 into a silent no-op. `ctx:N` lags one call; judge by trend. `note` lives at the turn level; inside
 an assistant use your own role name.
+
+dropping this skill itself out of context is a bad idea. it is often the case that the agent 
+gets confused after the drops by things that are explicitly stated to be not worth reasoning 
+about in this file.

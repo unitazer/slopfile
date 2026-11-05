@@ -207,6 +207,32 @@ pub(crate) fn record_config_failure(path: &Path, e: &str) -> Result<(), String> 
   transcript::save(path, &s)
 }
 
+/// The transcript is over the prompt budget, so the request never left the building. Unlike a
+/// provider failure this happens before `StreamWriter` exists, which means the daemon would
+/// otherwise park the session with the reason only in its log. The file has to carry the reason
+/// and the way out: the model cannot edit a context it never gets to see, and the user cannot
+/// guess why every sweep is failing.
+pub(crate) fn record_budget_failure(path: &Path, e: &str) -> Result<(), String> {
+  let mut s = transcript::load(path)?;
+  s.close_section();
+  let note = format!(
+    "[harness] {e}\n   Nothing was sent: the transcript is larger than the prompt budget, so \
+     re-sending will fail the same way until it shrinks. Compact it with the `session-edit` skill \
+     (drop or compress old turns), or raise `max_context_tokens` if the model really has a bigger \
+     window. The daemon does not trim it for you."
+  );
+  if let Some(last) = s.turns.last_mut()
+    && let Some(note_slot) = last.notes.last_mut()
+    && note_slot.by == session::NoteBy::Harness
+    && note_slot.text.contains("larger than the prompt budget")
+  {
+    note_slot.text = note;
+  } else {
+    s.add_note(session::NoteBy::Harness, &note);
+  }
+  transcript::save(path, &s)
+}
+
 /// One `sf send` opens a burst that runs until the model stops calling tools.
 ///
 /// There is deliberately no turn limit. There used to be one at 20, and it was a band-aid: a bug
@@ -420,9 +446,9 @@ async fn run_generation_turn(
   let tool_defs = crate::tools::advertised(&work.config);
   let tools_chars = serde_json::to_string(&tool_defs).map_or(0, |s| s.len() as u64);
   let anchor = control::update(name, |s| s.last_prompt.clone());
-  let plan = tokens::build_request_messages(
+  let plan = match tokens::build_request_messages(
     &work,
-    messages,
+    &messages,
     cfg,
     client.endpoint(),
     client,
@@ -431,14 +457,24 @@ async fn run_generation_turn(
       tools_chars,
     },
   )
-  .await?;
+  .await
+  {
+    Ok(plan) => plan,
+    Err(e) => {
+      // This returns before `StreamWriter` exists, so the provider-failure path cannot record it.
+      // Without a note the session just parks after repeated sweeps, and the model never sees the
+      // one instruction it would need to fix the file itself.
+      record_budget_failure(path, &e)?;
+      control::update(name, |s| s.context_full = true);
+      return Err(e);
+    }
+  };
   // The size of the context this request was built from -- i.e. before the calls it makes. That is
   // the reading the model can act on, and it is the only one that exists: `usage` for this request
   // has not come back yet. `None` on the first turn against a new endpoint, where there is nothing
   // measured to report, and then the results carry no tag at all.
   let tell_ctx = cfg.tell_context_size(&work.config);
   let ctx_tokens = plan.token_count;
-  let messages = plan.messages;
 
   let max_tokens = tokens::output_allowance(tokens::context_budget(&work.config, cfg));
 
@@ -446,11 +482,10 @@ async fn run_generation_turn(
 
   let mut active = StreamWriter::new(path, work);
   info!(
-    "→ {path:?}: generating (provider={}, model={model}, thinking={thinking}, messages={}, tokens={}, dropped={})",
+    "→ {path:?}: generating (provider={}, model={model}, thinking={thinking}, messages={}, tokens={})",
     endpoint,
     messages.len(),
     plan.token_count.map_or("?".to_string(), |n| n.to_string()),
-    plan.dropped
   );
   // The lock serializes the model, not the tools: holding it across a 30s bash would stall every
   // other session behind it.
@@ -502,7 +537,7 @@ async fn run_generation_turn(
   };
 
   // Pair what we sent with what the provider counted, so the next turn has a measured density
-  // instead of an assumed one. Recorded from the list that actually went out, after truncation.
+  // instead of an assumed one. Recorded from the list that actually went out.
   if let Some(usage) = &result.usage
     && usage.prompt_tokens > 0
   {
@@ -608,7 +643,7 @@ async fn run_generation_turn(
             .to_string(),
         });
         if tell_ctx {
-          flow::annotate_context_size(&mut outcomes, ctx_tokens);
+          flow::annotate_context_size(&mut outcomes, ctx_tokens, cfg);
         }
         streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
         transcript::save(path, &streamed)?;
@@ -619,7 +654,7 @@ async fn run_generation_turn(
       let before = &result.tool_calls[..at];
       let mut outcomes = run_calls(&streamed, before, cfg, path).await?;
       if tell_ctx {
-        flow::annotate_context_size(&mut outcomes, ctx_tokens);
+        flow::annotate_context_size(&mut outcomes, ctx_tokens, cfg);
       }
       streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
       flow::render_question(&mut streamed, question)?;
@@ -628,7 +663,7 @@ async fn run_generation_turn(
     }
     let mut outcomes = run_calls(&streamed, &result.tool_calls, cfg, path).await?;
     if tell_ctx {
-      flow::annotate_context_size(&mut outcomes, ctx_tokens);
+      flow::annotate_context_size(&mut outcomes, ctx_tokens, cfg);
     }
     streamed = settle_tool_round(streamed, calls, &mut outcomes, path);
     transcript::save(path, &streamed)?;

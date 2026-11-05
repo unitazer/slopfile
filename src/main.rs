@@ -115,6 +115,11 @@ async fn main() {
     });
   }
 
+  // Constructing a `reqwest::Client` parses the system CA bundle, which costs ~10ms. The sweep
+  // spawns a task per transcript every tick, so building one per task pinned a couple of cores on
+  // cert decoding even when every session was idle and no request was ever sent. The client is
+  // `Arc`-backed; build it once and hand each task a clone.
+  let base_client = LlamaClient::new(&app_cfg);
   let busy: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
   let throttled: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
   let failures: Arc<Mutex<HashMap<PathBuf, u32>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -218,13 +223,13 @@ async fn main() {
       drop(guard);
 
       let cfg = app_cfg.clone();
+      let client = base_client.clone();
       let busy = busy.clone();
       let throttled = throttled.clone();
       let failures = failures.clone();
       let parked = parked.clone();
       let parked_at_token = parked_at_token.clone();
       tokio::spawn(async move {
-        let client = LlamaClient::new(&cfg);
         match daemon::drive_file(&path, &cfg, &client).await {
           Ok(()) => {
             failures.lock().await.remove(&path);

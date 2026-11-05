@@ -322,6 +322,43 @@ def live_assistant(editor):
     return assistants[-1] if assistants else None
 
 
+def live_list_paths(editor):
+    """Exact paths for the live `list` call and the result it will produce.
+
+    The result index is the one this call will get when the round settles: results from earlier
+    rounds are already in the tree, and the calls in this round are settled in order. Absolute
+    paths stay correct even if another round or a new turn lands before the cleanup batch.
+    """
+    turn = live_turn(editor)
+    assistant = live_assistant(editor)
+    if turn is None or assistant is None:
+        return None
+    calls = [n for n in assistant.children if n.name == "call"]
+    if not calls:
+        return None
+    list_index = None
+    for i, call in enumerate(calls):
+        try:
+            outer = json.loads(call.payload or "{}")
+            args = json.loads(outer.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if re.search(r"session-edit\.py\s+list\b", str(args.get("command", ""))):
+            list_index = i
+            break
+    if list_index is None:
+        return None
+    turn_path = path_of(turn, editor.index_of)
+    assistant_path = path_of(assistant, editor.index_of)
+    existing_results = sum(1 for n in turn.children if n.name == "result")
+    return (
+        assistant_path,
+        f"{assistant_path}.call[{list_index}]",
+        f"{turn_path}.result[{existing_results + list_index}]",
+        len(calls),
+    )
+
+
 def open_state(editor):
     """balanced, live (tool time: assistant open, generation over), or streaming."""
     names = [n.name for n in editor.open_nodes]
@@ -393,6 +430,20 @@ def list_output(editor):
         size = sizes.get(inp, 0)
         if size:
             out.append(f"input  {size:,}c")
+    if state == "live":
+        paths = live_list_paths(editor)
+        if paths is not None:
+            assistant_path, call_path, result_path, call_count = paths
+            out.append("# compacting? in the next batch:")
+            out.append("#   set 'self.reasoning' | <summary>")
+            if call_count == 1:
+                out.append(f"#   drop '{assistant_path}'   (the round that ran this list)")
+            else:
+                out.append(
+                    f"#   drop '{call_path}'   (this list call; this round has {call_count} calls, "
+                    "so do not drop the whole assistant)"
+                )
+            out.append(f"#   drop '{result_path}'   (this listing)")
     return "\n".join(out)
 
 

@@ -164,12 +164,15 @@ async fn tokens(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(),
   let messages = parsed.request_messages();
   let tool_defs = slopfile::tools::advertised(&parsed.config);
   let tools_chars = serde_json::to_string(&tool_defs).map_or(0, |s| s.len() as u64);
+  let budget = slopfile::tokens::context_budget(&parsed.config, cfg);
+  let allowance = slopfile::tokens::output_allowance(budget);
+  println!("tokens: {}", path.display());
   // No anchor here: the measured sample lives in the daemon's memory for the session it belongs
   // to. Running this command tells you what the payload weighs, not what it costs in tokens --
   // except against a llama-server, which counts for real and needs no sample.
-  let plan = slopfile::tokens::build_request_messages(
+  let plan = match slopfile::tokens::build_request_messages(
     &parsed,
-    messages,
+    &messages,
     cfg,
     client.endpoint(),
     &client,
@@ -179,19 +182,23 @@ async fn tokens(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(),
     },
   )
   .await
-  .map_err(|e| format!("tokens: {e}"))?;
-  let budget = slopfile::tokens::context_budget(&parsed.config, cfg);
-  println!("tokens: {}", path.display());
-  println!(
-    "  messages:     {} sent ({} oldest dropped to fit budget)",
-    plan.messages.len(),
-    plan.dropped
-  );
+  {
+    Ok(plan) => plan,
+    Err(e) => {
+      // The breakdown is most useful on the transcript that cannot be sent, so print it before
+      // returning the refusal instead of making the caller run a second command.
+      println!(
+        "  context budget: {budget}  output allowance: {allowance}  prompt budget: {}",
+        budget.saturating_sub(allowance)
+      );
+      return Err(format!("tokens: {e}"));
+    }
+  };
+  println!("  messages:     {} sent", messages.len());
   match plan.token_count {
     Some(n) => {
-      // Against `budget`, not the usable prompt: `n` is already capped at `prompt_budget`, so
-      // subtracting from the full window would never drop below the output allowance and would
-      // report headroom on a transcript that has none left.
+      // Against the usable prompt, because `n` is the whole prompt the request would carry;
+      // subtracting from the full window would count the output allowance as headroom.
       let headroom = tokens::prompt_budget(budget).saturating_sub(n as u32);
       println!(
         "  model tokens: {n}  (via {}/tokenize)",
@@ -206,7 +213,6 @@ async fn tokens(session: &str, transcripts: &str, cfg: &AppConfig) -> Result<(),
       plan.payload_chars
     ),
   }
-  let allowance = slopfile::tokens::output_allowance(budget);
   println!(
     "  context budget: {budget}  output allowance: {allowance}  prompt budget: {}",
     budget.saturating_sub(allowance)

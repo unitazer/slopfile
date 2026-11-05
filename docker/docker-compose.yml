@@ -18,7 +18,7 @@ services:
       - ../shared/models:/models:ro
       - ../shared/llama-cache:/cache
     command: [
-      "--models-preset", "/models/presets.ini",
+      "--models-preset", "${LLAMA_PRESETS:-/models/presets.ini}",
       "--models-max", "2",
       #"--mlock",
       #"--no-mmap",
@@ -41,7 +41,7 @@ services:
   slopfile:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.slopfile
+      dockerfile: ${SLOPFILE_DOCKERFILE:-docker/Dockerfile.slopfile}
     container_name: clanker-slopfile
     user: "1000:1000"
     group_add:
@@ -54,7 +54,7 @@ services:
       llama-server:
         condition: service_healthy
     environment:
-      SLOPFILE_CONFIG: /shared/slopfile.toml
+      SLOPFILE_CONFIG: ${SLOPFILE_CONFIG:-/shared/slopfile.toml}
       SLOPFILE_API_BASE: http://llama-server:8080
       SLOPFILE_TRANSCRIPTS: /shared/transcripts
       SLOPFILE_SKILLS_DIR: /shared/skills

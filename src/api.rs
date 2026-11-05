@@ -225,6 +225,9 @@ impl ToolCallAccumulator {
   }
 }
 
+/// Cheap to clone: the socket pool lives behind the `reqwest::Client`'s `Arc`, so a clone shares
+/// connections rather than opening a new pool.
+#[derive(Clone)]
 pub struct LlamaClient {
   endpoint: Endpoint,
   headers: reqwest::header::HeaderMap,
@@ -236,11 +239,15 @@ impl LlamaClient {
   /// `api_base` here rather than refusing to start: the daemon sweeps every transcript, and one
   /// unusable default must not take the local session down with it. Sessions that name a provider
   /// go through `for_provider`, which does report the error.
+  ///
+  /// Building this is expensive: `reqwest::Client::new` loads and parses the system CA bundle
+  /// (tens of milliseconds in a container with a full cert store). Callers that run repeatedly,
+  /// like the daemon's sweep, must build one and clone it, not construct a fresh one each tick.
   pub fn new(cfg: &AppConfig) -> Self {
-    // The sweep builds one of these per file per tick, so this resolves the endpoint *quietly*:
-    // a misconfigured app-level provider would otherwise log several times a second, per session,
-    // and bury the one line that explains it. `main` logs the resolved endpoint once at startup,
-    // and a per-session `sf send` still reports the real error against the named provider.
+    // This resolves the endpoint *quietly*: a misconfigured app-level provider would otherwise log
+    // several times a second, per session, and bury the one line that explains it. `main` logs the
+    // resolved endpoint once at startup, and a per-session `sf send` still reports the real error
+    // against the named provider.
     let endpoint = cfg
       .endpoint(None, &BTreeMap::new())
       .unwrap_or_else(|_| Endpoint::local(&cfg.api_base));
@@ -373,19 +380,23 @@ impl LlamaClient {
 
     let url = self.endpoint.url("chat/completions");
     tracing::debug!("sending request {body:#?} to {url}");
-    let resp = tokio::time::timeout(
-      std::time::Duration::from_secs(60),
-      self.request(&url).json(&body).send(),
-    )
-    .await
-    .map_err(|_| ApiError::Timeout(std::time::Duration::from_secs(60)))?
-    .map_err(ApiError::Reqwest)?;
+    //    let resp = tokio::time::timeout(
+    //   std::time::Duration::from_secs(60),
+    //   self.request(&url).json(&body).send(),
+    // )
+    // .await
+    // .map_err(|_| ApiError::Timeout(std::time::Duration::from_secs(60)))?
+    // .map_err(ApiError::Reqwest)?;
+    //^^clanker felt like adding timeouts for the 50th time
+    let resp = self
+      .request(&url)
+      .json(&body)
+      .send()
+      .await
+      .map_err(ApiError::Reqwest)?;
 
     let status = resp.status();
     if !status.is_success() {
-      // Read before the body: the response is still live here, and `Retry-After` is a header --
-      // the one signal that separates "come back in five seconds" from "never", and the body
-      // almost never carries it.
       let retry_after = resp.headers().contains_key(reqwest::header::RETRY_AFTER);
       let snippet = resp.text().await.unwrap_or_default();
       tracing::warn!("request failed: status:{status:?} snippet:{snippet}");

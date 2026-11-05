@@ -77,7 +77,60 @@ def live():
         + "<!-- slopfile:user -->\ndo it\n" + END
         + "<!-- slopfile:assistant -->\n"
         + "<!-- slopfile:reasoning -->\nsecond thought\n" + END
-        + "<!-- slopfile:call {\"id\":\"c2\",\"name\":\"bash\",\"arguments\":\"{}\"} -->\n" + END
+        + '<!-- slopfile:call {"id":"c2","name":"bash","arguments":'
+        + '"{\\"command\\":\\"python3 /shared/skills/session-edit.py list '
+        + '/shared/transcripts/s.md\\"}"} -->\n'
+        + END
+        + INPUT
+    )
+
+
+def live_multi():
+    """A live round that ran `list` alongside another call; results settle after both."""
+    return (
+        FENCE
+        + BEGIN
+        + SYSTEM
+        + "<!-- slopfile:turn -->\n"
+        + "<!-- slopfile:user -->\ndo it\n" + END
+        + "<!-- slopfile:assistant -->\n"
+        + "<!-- slopfile:reasoning -->\nsecond thought\n" + END
+        + '<!-- slopfile:call {"id":"c2","name":"bash","arguments":'
+        + '"{\\"command\\":\\"python3 /shared/skills/session-edit.py list '
+        + '/shared/transcripts/s.md\\"}"} -->\n'
+        + END
+        + '<!-- slopfile:call {"id":"c3","name":"bash","arguments":'
+        + '"{\\"command\\":\\"echo other\\"}"} -->\n'
+        + END
+        + INPUT
+    )
+
+
+def live_multi_after_list():
+    """The next round after a multi-call round that contained `list`."""
+    return (
+        FENCE
+        + BEGIN
+        + SYSTEM
+        + "<!-- slopfile:turn -->\n"
+        + "<!-- slopfile:user -->\ndo it\n" + END
+        + "<!-- slopfile:assistant -->\n"
+        + "<!-- slopfile:reasoning -->\nsecond thought\n" + END
+        + '<!-- slopfile:call {"id":"c2","name":"bash","arguments":'
+        + '"{\\"command\\":\\"python3 /shared/skills/session-edit.py list '
+        + '/shared/transcripts/s.md\\"}"} -->\n'
+        + END
+        + '<!-- slopfile:call {"id":"c3","name":"bash","arguments":'
+        + '"{\\"command\\":\\"echo other\\"}"} -->\n'
+        + END
+        + END  # assistant
+        + '<!-- slopfile:result {"id":"c2","name":"bash","ok":true} -->\nlisting output\n' + END
+        + '<!-- slopfile:result {"id":"c3","name":"bash","ok":true} -->\nother output\n' + END
+        + "<!-- slopfile:assistant -->\n"
+        + "<!-- slopfile:reasoning -->\nread the listing\n" + END
+        + '<!-- slopfile:call {"id":"c4","name":"bash","arguments":'
+        + '"{\\"command\\":\\"batch\\"}"} -->\n'
+        + END
         + INPUT
     )
 
@@ -190,6 +243,38 @@ class TestList(Base):
         output = se.list_output(editor)
         self.assertIn("← streaming", output)
         self.assertNotIn("← live (self)", output)
+
+    def test_compaction_hint_only_when_live(self):
+        editor, _ = self.editor(live())
+        output = se.list_output(editor)
+        self.assertIn("turn[0].assistant[0]", output)
+        self.assertIn("turn[0].result[0]", output)
+        editor, _ = self.editor(balanced())
+        self.assertNotIn("compacting?", se.list_output(editor))
+
+    def test_compaction_hint_drops_only_the_list_call_when_the_round_has_others(self):
+        editor, _ = self.editor(live_multi())
+        output = se.list_output(editor)
+        self.assertIn("turn[0].assistant[0].call[0]", output)
+        self.assertIn("turn[0].result[0]", output)
+        self.assertIn("2 calls", output)
+        self.assertNotIn("#   drop 'turn[0].assistant[0]'", output)
+
+    def test_multi_call_cleanup_keeps_the_other_call_and_result(self):
+        editor, _ = self.editor(live_multi_after_list())
+        ops = se.parse_batch(
+            "set 'self.reasoning' | summary\n"
+            "drop 'turn[0].assistant[0].call[0]'\n"
+            "drop 'turn[0].result[0]'\n"
+        )
+        new_lines, _, _ = se.plan_batch(editor, ops)
+        editor.commit(new_lines)
+        text = editor.text()
+        self.assertNotIn("session-edit.py list", text)
+        self.assertNotIn("listing output", text)
+        self.assertIn("echo other", text)
+        self.assertIn("other output", text)
+        self.assertIsNone(se.check(editor.lines))
 
     def test_exact_characters(self):
         editor, _ = self.editor(balanced())

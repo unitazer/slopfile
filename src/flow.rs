@@ -279,24 +279,23 @@ pub fn adopt_model_edit(current: &Session, path: &Path) -> Result<Option<Session
   Ok(Some(edited))
 }
 
-/// Tag each tool result with the context size as of the request that made the call.
-///
-/// Written into the transcript rather than injected into the outgoing request. Injected, it would
-/// be rebuilt from the transcript on every turn and re-appended to every earlier result forever, so
-/// the file would grow without bound -- strictly worse than a fixed few bytes per result. Written
-/// once, it stays put, is visible to anyone reading the session, and shows the trend across calls.
-///
-/// The number is stale by construction: it is from before the call, and it does not move until the
-/// next one. The system prompt says so, rather than the number pretending to be live.
-pub fn annotate_context_size(outcomes: &mut [ToolOutcome], tokens: Option<usize>) {
+pub fn annotate_context_size(outcomes: &mut [ToolOutcome], tokens: Option<usize>, cfg: &AppConfig) {
   let Some(n) = tokens else {
     return;
+  };
+  // The reminder rides inside the tag the model already reads for its size, so it arrives exactly
+  // when the number it refers to does. `None` keeps the tag bare, as if the feature were absent.
+  let note = match cfg.compaction_reminder_threshold {
+    Some(threshold) if n > threshold as usize => {
+      cfg.what_to_tell_when_above_reminder_threshold.as_str()
+    }
+    _ => "",
   };
   for outcome in outcomes.iter_mut() {
     if !outcome.output.trim().is_empty() && !outcome.output.ends_with('\n') {
       outcome.output.push('\n');
     }
-    outcome.output.push_str(&format!("[ctx:{n}]"));
+    outcome.output.push_str(&format!("[ctx:{n}{note}]"));
   }
 }
 
