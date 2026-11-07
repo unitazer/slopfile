@@ -61,6 +61,7 @@ def many_turns(count):
             f"<!-- slopfile:user -->\nu{i}\n" + END
             + "<!-- slopfile:assistant -->\n"
             f"<!-- slopfile:reasoning -->\nr{i}\n" + END
+            + f'<!-- slopfile:call {{"id":"c{i}","name":"bash","arguments":"{{}}"}} -->\n' + END
             + END  # assistant
             + f'<!-- slopfile:result {{"id":"c{i}","name":"bash","ok":true}} -->\no{i}\n' + END
             + END  # turn
@@ -105,6 +106,43 @@ def live():
         + '"{\\"command\\":\\"python3 /shared/skills/session-edit.py list '
         + '/shared/transcripts/s.md\\"}"} -->\n'
         + END
+        + INPUT
+    )
+
+
+def live_no_call():
+    """The real tool-time state: assistant open, reasoning closed, no call yet.
+
+    The daemon writes calls when the round settles, after the tool returns, so a listing
+    taken from inside a call cannot see its own call.
+    """
+    return (
+        FENCE
+        + BEGIN
+        + SYSTEM
+        + "<!-- slopfile:turn -->\n"
+        + "<!-- slopfile:user -->\ndo it\n" + END
+        + "<!-- slopfile:assistant -->\n"
+        + "<!-- slopfile:reasoning -->\nsecond thought\n" + END
+        + INPUT
+    )
+
+
+def live_with_previous():
+    """One settled round, then a live round with no call yet (the batch being planned)."""
+    return (
+        FENCE
+        + BEGIN
+        + SYSTEM
+        + "<!-- slopfile:turn -->\n"
+        + "<!-- slopfile:user -->\ndo it\n" + END
+        + "<!-- slopfile:assistant -->\n"
+        + "<!-- slopfile:reasoning -->\nfirst thought\n" + END
+        + CALL
+        + END  # assistant
+        + '<!-- slopfile:result {"id":"c1","name":"bash","ok":true} -->\nfirst out\n' + END
+        + "<!-- slopfile:assistant -->\n"
+        + "<!-- slopfile:reasoning -->\nsecond thought\n" + END
         + INPUT
     )
 
@@ -284,6 +322,21 @@ class TestList(Base):
         self.assertIn("2 calls", output)
         self.assertNotIn("#   drop 'turn[0].assistant[0]'", output)
 
+    def test_hint_for_the_live_round_without_a_call(self):
+        editor, _ = self.editor(live_no_call())
+        output = se.list_output(editor)
+        self.assertIn("this listing is running inside the live round", output)
+        self.assertIn("turn[0].assistant[0]", output)
+        self.assertIn("turn[0].result[0]", output)
+
+    def test_hint_for_a_live_round_after_a_settled_round(self):
+        editor, _ = self.editor(live_with_previous())
+        output = se.list_output(editor)
+        self.assertIn("this listing is running inside the live round", output)
+        self.assertIn("turn[0].assistant[1]", output)
+        self.assertIn("turn[0].result[1]", output)
+        self.assertNotIn("#   drop 'turn[0].assistant[0]'", output)
+
     def test_multi_call_cleanup_keeps_the_other_call_and_result(self):
         editor, _ = self.editor(live_multi_after_list())
         ops = se.parse_batch(
@@ -354,6 +407,61 @@ class TestSelectors(Base):
         with self.assertRaises(SystemExit) as caught:
             editor.resolve("turn[0].self.reasoning")
         self.assertIn("self must be the first segment", str(caught.exception))
+
+    def test_self_call_explains_the_in_flight_call(self):
+        editor, _ = self.editor(live_no_call())
+        with self.assertRaises(SystemExit) as caught:
+            editor.resolve("self.call[0]")
+        message = str(caught.exception)
+        self.assertIn("not written until the tool returns", message)
+        self.assertIn("prev", message)
+
+    def test_self_result_explains_turn_level_results(self):
+        editor, _ = self.editor(live_no_call())
+        with self.assertRaises(SystemExit) as caught:
+            editor.resolve("self.result[0]")
+        message = str(caught.exception)
+        self.assertIn("children of the turn", message)
+        self.assertIn("turn[N].result[M]", message)
+
+    def test_prev_is_the_last_settled_round(self):
+        editor, _ = self.editor(live_with_previous())
+        self.assertEqual(
+            [se.path_of(n, editor.index_of) for n in editor.resolve("prev")],
+            ["turn[0].assistant[0]", "turn[0].result[0]"],
+        )
+        self.assertEqual(
+            se.path_of(editor.resolve("prev.reasoning")[0], editor.index_of),
+            "turn[0].assistant[0].reasoning[0]",
+        )
+
+    def test_round_expands_to_assistant_and_results(self):
+        editor, _ = self.editor(live_with_previous())
+        self.assertEqual(
+            [se.path_of(n, editor.index_of) for n in editor.resolve("turn[0].round[0]")],
+            ["turn[0].assistant[0]", "turn[0].result[0]"],
+        )
+
+    def test_round_must_be_last(self):
+        editor, _ = self.editor(live_with_previous())
+        with self.assertRaises(SystemExit) as caught:
+            editor.resolve("turn[0].round[0].reasoning")
+        self.assertIn("must be the last segment", str(caught.exception))
+
+    def test_drop_prev_removes_the_whole_round(self):
+        editor, _ = self.editor(live_with_previous())
+        editor.drop("prev")
+        text = editor.text()
+        self.assertNotIn("first thought", text)
+        self.assertNotIn("first out", text)
+        self.assertIn("second thought", text)
+        self.assertIsNone(se.check(editor.lines))
+
+    def test_dropping_a_result_alone_warns(self):
+        editor, _ = self.editor(balanced())
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            editor.drop("turn[0].result[0]")
+        self.assertIn("without its call", err.getvalue())
 
 
 class TestLiveGuards(Base):
@@ -501,6 +609,25 @@ class TestBatch(Base):
         editor.commit(new_lines)
         self.assertIsNone(se.check(editor.lines))
         self.assertEqual(len(editor.resolve("turn[*]")), 4)
+
+    def test_prev_drops_the_whole_round_in_a_batch(self):
+        editor, _ = self.editor(live_with_previous())
+        new_lines, _, _ = se.plan_batch(editor, se.parse_batch("drop 'prev'\n"))
+        editor.commit(new_lines)
+        text = editor.text()
+        self.assertNotIn("first thought", text)
+        self.assertNotIn("first out", text)
+        self.assertIn("second thought", text)
+        self.assertIsNone(se.check(editor.lines))
+
+    def test_round_range_drops_assistants_and_results(self):
+        editor, _ = self.editor(many_turns(3))
+        batch = "drop 'turn[1..2].round[*]'\n"
+        new_lines, _, _ = se.plan_batch(editor, se.parse_batch(batch))
+        editor.commit(new_lines)
+        self.assertEqual(len(editor.resolve("turn[*].assistant[*]")), 1)
+        self.assertEqual(len(editor.resolve("turn[*].result[*]")), 1)
+        self.assertIsNone(se.check(editor.lines))
 
 
 class TestFreshness(Base):

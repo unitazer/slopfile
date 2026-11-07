@@ -24,8 +24,7 @@ has not finished.
 
 ```bash
 python3 /shared/skills/session-edit.py batch FILE <<'EOF'
-drop 'turn[3].assistant[1]'
-drop 'turn[3].result[1]'
+drop 'turn[3].round[1]'
 set 'self.reasoning' | pruned turn[3]; state in the note
 droplists
 EOF
@@ -34,12 +33,16 @@ EOF
 `droplists` is the whole cleanup in one line: it finds every round that ran `session-edit.py list`
 and drops the round and its listing. Use it instead of hunting for indices.
 
-Every `list` prints, at the bottom, the exact drop lines for the listings it can see:
+Every `list` prints, at the bottom, the exact drop lines for the listings it can see. For the round
+currently running the list it synthesizes the lines even though that call is not in the file yet:
 
 ```
 # every list round is dead once you edit: drop it in the next batch
+# this listing is running inside the live round: turn[12].assistant[18]
 #   drop 'turn[12].assistant[18]'
-#   drop 'turn[12].result[31]'   (that listing)
+#   drop 'turn[12].result[31]'   (next result in the turn; exact for a one-call round)
+#   drop 'turn[11].assistant[4]'   (an older listing)
+#   drop 'turn[11].result[9]'   (that listing)
 # ...or the whole job in one line: droplists
 ```
 
@@ -52,6 +55,12 @@ the old one. List once, and in the batch it plans drop the old list round *and* 
 - **Run `list` bare.** `list | head -20` is still a listing, and piping is exactly what hides the
   cleanup hint and the `← live (self)` marker. If the tree is too big to read, use
   `list --turns 6` (older turns are folded) rather than a pipe.
+- **Do not hand-drop the listing round with `self`.** The round running `list` is `self` now, but
+  its call is not in the file, and results are turn-level. Use the `drop 'turn[N].assistant[M]'`
+  and `drop 'turn[N].result[K]'` lines the listing printed, or just `droplists`.
+- If you also want to drop the round that ran a write between the listing and the batch, use
+  `drop 'prev'`: that is the last settled round before the live one, and it removes the assistant
+  and its results together.
 - A batch that dropped output but left a listing prints `warning: N list round(s) still in
   context`. That warning is the point: read it, then run `droplists`.
 
@@ -73,10 +82,18 @@ turn[1]  4,112c
   result[0]  241c  bash ok 149ms
 turn[2]  512c
   user[0]  88c
-  assistant[0]  301c  ← live (self)
+  assistant[0]  301c
     reasoning[0]  250c
     call[0]  51c  bash("cargo test --all")
+  result[0]  241c  bash ok 149ms
+  assistant[1]  250c  ← live (self)
+    reasoning[0]  250c
 ```
+
+The round marked `← live (self)` is the one running your command. Its `call` is **not in the
+file yet**: the harness writes calls when the round settles, after the tool returns. So `self` has
+`reasoning`/`text` but no `call` and no `result` while a tool runs. `turn[2].assistant[0]` above is
+a previous round: it has its call and result because it already settled.
 
 The counts are exact content characters, not tokens. Every segment has a 0-based index, including
 the first: `turn[0].assistant[0].call[0]`. A bare name means `[0]`; a wildcard applies only to its
@@ -85,18 +102,31 @@ own segment, so `turn[*].assistant[*].call[*]` is every call in every turn.
 Sizes shrink after an edit, so one `drop` can renumber later siblings. Inside one `batch`, every
 path means what it meant in the listing before it.
 
-## self, last, ranges
+## Rounds, self, prev, ranges
+
+A **round** is one assistant generation: one `assistant` block plus the `result` blocks for its
+calls. Results are siblings of the assistant in the turn, never children. Every tool call you make
+is a new round, so `self` moves forward on every call even when no user message arrives.
 
 - `self` is the round this command runs in: the last assistant of the last turn. It is not "the
   block you last saw". If a user message arrived after your listing, `self` is a newer, smaller
   round.
+- **`self` has only `reasoning` and `text` while your tool runs.** The call running this command is
+  written when the round settles, after the tool returns, so `self.call[*]` never matches. Results
+  are children of the turn, so `self.result[*]` never matches either. Use `prev`, `round[M]`, or
+  `droplists` instead.
+- `prev` is the last settled round before the live one: `prev` = `turn[-1].round[-2]`. Use it for
+  the round that ran your previous tool call (the write you want to drop, for example).
+- `round[M]` expands to one assistant block **and its results**, so `drop 'turn[0].round[2..23]'`
+  drops both halves of every round in the range. `round` must be the last segment. Use it instead
+  of computing `assistant[a..b]` and `result[c..d]` separately.
 - Old blocks do not move. A user message appends a turn; it does not renumber the old ones, so
   `turn[2]` from your listing is still `turn[2]`. Target old blocks by turn:
   `set 'turn[2].assistant[*].reasoning' | ...`.
 - `turn[-1]` and `turn[last]` mean "now", and so does an open range like `turn[8..]`. For a cut
   from a listing use an explicit end (`turn[8..11]`); an open range would include the live turn
   and be refused.
-- `[a..b]` is inclusive; `[last]` and `[-1]` pick the last sibling (`result[-1]`).
+- `[a..b]` is inclusive; `[last]` and `[-1]` pick the last sibling (`result[-1]`, `round[-2]`).
 
 If the session runs without thinking there is no reasoning block; summarize `self.text` instead.
 
@@ -111,6 +141,12 @@ receipt is the record.
 `live: turn[N]` is normal, not a half-written turn. Generation has ended; the reasoning is closed
 and editable, and only the current *assistant* is left open so the harness can attach this call's
 result to it.
+
+**The live round's call and result are not in the file yet.** The harness writes them when the round
+settles, after the tool returns. That is why `self.call[*]` and `self.result[*]` cannot resolve:
+there is nothing there to match. A `list` prints a synthesized cleanup hint for the live round
+anyway, so copy the `turn[N].assistant[M]` / `turn[N].result[K]` lines it gives you, or use
+`droplists`.
 
 `streaming:` means the file is being written right now. `list`, `read` and `check` still work;
 every write is refused until generation ends.
@@ -175,9 +211,13 @@ EOF
 ```
 
 Drop the calls with the results; a call left without a result becomes a "not executed" stub in the
-next request. The note's own call would create another reasoning block to clean up, which is why
-the summary and the cleanup are one batch. The note body is multi-line; the outer shell heredoc
-must use a different tag (`EOF`).
+next request. Use `drop 'turn[N].round[M]'` when you want to remove the whole round (assistant and
+results); use the separate call/result drops when you want to keep the assistant's reasoning and
+only remove its output. If you wrote a file to preserve state during compaction, drop that write
+round too (`drop 'prev'`), because the file body is in the transcript as the call's arguments.
+The note's own call would create another reasoning block to clean up, which is why the summary and
+the cleanup are one batch. The note body is multi-line; the outer shell heredoc must use a
+different tag (`EOF`).
 
 Each line is `drop PATH`, `droplists`, `set PATH | BODY`, `append PATH | BODY`, `add PATH | BODY`,
 or `add PATH <<'TAG'`. Quotes around a path are stripped; `drop` and `droplists` take no body. If
@@ -209,6 +249,17 @@ do not treat the batch result as the end of the turn: keep working with the next
 note is written before this call's result, so later rounds are appended after it; you do not need
 to add it again. A note duplicated into prose is how the model talks itself into stopping.
 
+## Compacting under a `ctx:` warning
+
+When the `ctx:N` tag says compact, the next call must be the compaction batch. Do not write a large
+file first: a `write` call's body is part of the transcript as the call's arguments, so it adds the
+same bytes you are trying to remove. Put the state in the note instead, or if you do write a file,
+drop that round (`drop 'prev'`) in the same batch.
+
+A failed batch is atomic: nothing is written. If you are already at the budget, a failed batch can
+push the next request over the limit, so keep the batch small and use the paths the listing
+printed.
+
 ## Single edits
 
 ```bash
@@ -234,6 +285,9 @@ its parent path to exist already.
 - Removing the ```toml fence at the top.
 - Part of a batch: one bad line means none of it is written.
 - Dropping the live round or the live turn, because this call's result will land there.
+- `self.call[*]` and `self.result[*]`: the live round's call is not written yet, and results are
+  turn-level. The error names the live round and points at `prev`, `round[M]`, or `droplists`.
+- `round` anywhere except as the last segment; `round[M]` already names a whole round.
 - Writes while the file is `streaming:`.
 - Writes when the file changed after the tool read it (a user message or a subagent report landed).
   Nothing is written; run `list` again and re-apply.

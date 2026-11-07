@@ -337,6 +337,55 @@ def is_list_call(node):
     return bool(LIST_CMD.search(str(args.get("command", ""))))
 
 
+def turn_rounds(editor, turn):
+    """Pair each assistant block in `turn` with the results that belong to it.
+
+    A round is one assistant generation: one `assistant` block plus the `result` blocks for
+    its calls. Results are siblings of the assistant in the turn, never children, and ids
+    are only unique inside one round on some harnesses, so pair by id when the ids are
+    distinct across the turn and by call order otherwise.
+    """
+    assistants = [n for n in turn.children if n.name == "assistant"]
+    results = [n for n in turn.children if n.name == "result"]
+    ids = [parse_payload(r).get("id") for r in results]
+    # Some harnesses reuse one id for every call, so ids cannot be trusted to pair a
+    # result with its call. Pair by id only when the ids are actually distinct.
+    unique_ids = len(set(i for i in ids if i)) == len([i for i in ids if i])
+    by_id = {parse_payload(r).get("id"): r for r in results} if unique_ids else {}
+    all_calls = [c for a in assistants for c in a.children if c.name == "call"]
+    call_pos = {id(c): i for i, c in enumerate(all_calls)}
+    rounds = []
+    for index, assistant in enumerate(assistants):
+        calls = [n for n in assistant.children if n.name == "call"]
+        pairs = []
+        for call in calls:
+            cid = parse_payload(call).get("id")
+            result = by_id.get(cid) if unique_ids and cid is not None else None
+            if result is None and (not unique_ids or len(results) == len(all_calls)):
+                # No usable ids, or ids that do not name a result: results follow calls
+                # in order within a turn.
+                position = call_pos[id(call)]
+                result = results[position] if position < len(results) else None
+            pairs.append((call, result))
+        rounds.append(
+            {
+                "index": index,
+                "assistant": assistant,
+                "calls": calls,
+                "pairs": pairs,
+                "results": [result for _, result in pairs if result is not None],
+                "path": path_of(assistant, editor.index_of),
+                "turn": turn,
+            }
+        )
+    return rounds
+
+
+def round_nodes(round_info):
+    """The nodes `round[N]` expands to: the assistant block and its result blocks."""
+    return [round_info["assistant"]] + round_info["results"]
+
+
 def list_rounds(editor):
     """Every round in the transcript that ran `session-edit.py list`, with the paths that remove it.
 
@@ -350,45 +399,29 @@ def list_rounds(editor):
         if turn.name != "turn":
             continue
         turn_path = path_of(turn, editor.index_of)
-        assistants = [n for n in turn.children if n.name == "assistant"]
         results = [n for n in turn.children if n.name == "result"]
-        ids = [parse_payload(r).get("id") for r in results]
-        # Some harnesses reuse one id for every call, so ids cannot be trusted to pair a
-        # result with its call. Pair by id only when the ids are actually distinct.
-        unique_ids = len(set(i for i in ids if i)) == len([i for i in ids if i])
-        by_id = {parse_payload(r).get("id"): r for r in results} if unique_ids else {}
-        all_calls = [c for a in assistants for c in a.children if c.name == "call"]
-        for ai, assistant in enumerate(assistants):
-            calls = [n for n in assistant.children if n.name == "call"]
-            open_assistant = assistant.close_line is None
-            for ci, call in enumerate(calls):
+        for r in turn_rounds(editor, turn):
+            for ci, (call, result) in enumerate(r["pairs"]):
                 if not is_list_call(call):
                     continue
-                cid = parse_payload(call).get("id")
-                result = by_id.get(cid) if cid is not None else None
-                if result is None and len(results) == len(all_calls):
-                    # No usable ids: results follow calls in order within a turn.
-                    position = all_calls.index(call)
-                    if position < len(results):
-                        result = results[position]
                 if result is None:
                     result_path = f"{turn_path}.result[{len(results) + ci}]"
                     settled = False
                 else:
                     result_path = path_of(result, editor.index_of)
                     settled = True
-                if len(calls) == 1:
-                    round_path = f"{turn_path}.assistant[{ai}]"
+                if len(r["calls"]) == 1:
+                    round_path = r["path"]
                 else:
-                    round_path = f"{turn_path}.assistant[{ai}].call[{ci}]"
+                    round_path = f"{r['path']}.call[{ci}]"
                 rounds.append(
                     {
                         "round": round_path,
-                        "call": f"{turn_path}.assistant[{ai}].call[{ci}]",
+                        "call": f"{r['path']}.call[{ci}]",
                         "result": result_path,
                         "settled": settled,
-                        "open": open_assistant,
-                        "calls": len(calls),
+                        "open": r["assistant"].close_line is None,
+                        "calls": len(r["calls"]),
                     }
                 )
     return rounds
@@ -400,14 +433,44 @@ def compacting_hint(editor):
     Printed even when the file is balanced or streaming: a listing is only useful while it
     is fresh, and every one left behind is stale context that has to be dropped by the
     next batch.
+
+    The round running this command is special: the harness writes calls only when the round
+    settles, so the listing's own call is not in the file and `list_rounds` cannot see it.
+    Synthesize the hint from the live assistant and the next result index; otherwise the
+    first listing of a session would carry no cleanup lines at all.
     """
     rounds = list_rounds(editor)
-    if not rounds:
+    synthetic = None
+    if open_state(editor) == "live":
+        assistant = live_assistant(editor)
+        if assistant is not None:
+            assistant_path = path_of(assistant, editor.index_of)
+            covered = any(
+                r["round"] == assistant_path
+                or r["round"].startswith(assistant_path + ".")
+                for r in rounds
+            )
+            has_calls = any(c.name == "call" for c in assistant.children)
+            if not covered and not has_calls:
+                turn = live_turn(editor)
+                results = [c for c in turn.children if c.name == "result"]
+                synthetic = {
+                    "round": assistant_path,
+                    "result": f"{path_of(turn, editor.index_of)}.result[{len(results)}]",
+                }
+    if not rounds and synthetic is None:
         return []
     out = [
         "# every list round is dead once you edit: drop it in the next batch "
         "(a listing from before a drop has the wrong indices)"
     ]
+    if synthetic is not None:
+        out.append(f"# this listing is running inside the live round: {synthetic['round']}")
+        out.append(f"#   drop '{synthetic['round']}'")
+        out.append(
+            f"#   drop '{synthetic['result']}'   "
+            "(next result in the turn; exact when this round ran only the list call)"
+        )
     for r in rounds:
         note = ""
         if r["calls"] > 1:
@@ -428,6 +491,49 @@ def stale_warning(editor):
         f"warning: {len(rounds)} list round(s) still in context ({pairs}); "
         "the next batch must drop them, or run `droplists`"
     )
+
+
+def warn_unpaired(editor, nodes):
+    """Warn when a drop leaves a call without its result, or a result without its call.
+
+    The harness synthesizes a stub for the missing half, which is almost never what the
+    model meant. `round[N]` drops both halves together; this warning points at it.
+    """
+    ranges = [(n.open_line, n.close_line) for n in nodes if n.close_line is not None]
+    if not ranges:
+        return
+    warned = set()
+    for turn in top_nodes(editor):
+        if turn.name != "turn":
+            continue
+        for r in turn_rounds(editor, turn):
+            for call, result in r["pairs"]:
+                if call is None or result is None:
+                    continue
+                call_in = any(start <= call.open_line <= end for start, end in ranges)
+                result_in = any(start <= result.open_line <= end for start, end in ranges)
+                if call_in == result_in:
+                    continue
+                key = (call.open_line, result.open_line)
+                if key in warned:
+                    continue
+                warned.add(key)
+                if call_in:
+                    print(
+                        f"warning: dropping call {path_of(call, editor.index_of)} without "
+                        f"its result {path_of(result, editor.index_of)}; the next request "
+                        f"will synthesize a 'not executed' stub. Drop the result too, or "
+                        f"use `turn[N].round[M]`.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"warning: dropping result {path_of(result, editor.index_of)} "
+                        f"without its call {path_of(call, editor.index_of)}; the next "
+                        f"request will synthesize a call. Drop the call too, or use "
+                        f"`turn[N].round[M]`.",
+                        file=sys.stderr,
+                    )
 
 
 def drop_reminder():
@@ -586,49 +692,106 @@ def indices(selector, count):
     return [index] if 0 <= index < count else []
 
 
+def resolve_miss(editor, spec, name, parent_paths, base_kind):
+    """A path that found nothing, with the two mistakes worth explaining explicitly."""
+    where = ", ".join(parent_paths) if parent_paths else "(top level)"
+    if name == "result" and base_kind in ("self", "prev"):
+        return SystemExit(
+            f"no region matches {spec!r}: results are children of the turn, not the "
+            f"assistant. {base_kind} is {where}. Use `turn[N].result[M]`, "
+            f"`turn[N].round[M]`, or `droplists` for a list round."
+        )
+    if name == "call" and base_kind == "self":
+        node = editor.by_path.get(parent_paths[0]) if parent_paths else None
+        calls = [c for c in (node.children if node is not None else []) if c.name == "call"]
+        if not calls:
+            return SystemExit(
+                f"no region matches {spec!r}: self is {where}, and the call running this "
+                f"command is not written until the tool returns, so self has no `call` "
+                f"children while it runs. Address an earlier round with `prev` or "
+                f"`turn[N].round[M]`, or use `droplists`."
+            )
+        return SystemExit(
+            f"no region matches {spec!r}: self is {where} and has {len(calls)} call(s); "
+            f"the selector is out of range."
+        )
+    return SystemExit(f"no region matches {spec!r}; run `list` to see the paths")
+
+
 def resolve(editor, spec):
     """Turn a spec into nodes against the tree as it is right now.
 
     `self` is resolved here, at execution time, never from a listing the model remembers.
+    `prev` is the last settled round before the live one, and `round[N]` expands to one
+    assistant block plus the result blocks that belong to it.
     """
     spec = spec.strip()
     if not spec:
         raise SystemExit("empty region path")
     segments = split_spec(spec)
-    start = ""
+    base_kind = None
     if segments[0] == "self":
         node = live_assistant(editor)
         if node is None:
             raise SystemExit("there is no live round to address with self")
-        start = path_of(node, editor.index_of)
+        parents = [path_of(node, editor.index_of)]
+        base_kind = "self"
         segments = segments[1:]
+    elif segments[0] == "prev":
+        turn = live_turn(editor)
+        if turn is None:
+            raise SystemExit("there is no live turn to address with prev")
+        rounds = turn_rounds(editor, turn)
+        if len(rounds) < 2:
+            raise SystemExit("there is no previous round to address with prev")
+        parents = [path_of(n, editor.index_of) for n in round_nodes(rounds[-2])]
+        base_kind = "prev"
+        segments = segments[1:]
+    else:
+        parents = [""]
     if any(seg == "self" for seg in segments):
         raise SystemExit("self must be the first segment: use self.reasoning, not turn[0].self")
     if not segments:
-        node = editor.by_path.get(start)
-        if node is None:
-            raise SystemExit(f"no region matches {spec!r}; run `list` to see the paths")
-        return [node]
+        if base_kind is None:
+            raise SystemExit("empty region path")
+        return [editor.by_path[path] for path in parents]
 
-    parents = [start]
-    for seg in segments:
+    for depth, seg in enumerate(segments):
         name, selector = parse_segment(seg)
         found = []
-        for parent in parents:
-            groups = {}
-            for child_name, child_path in editor.by_parent.get(parent, []):
-                groups.setdefault(child_name, []).append(child_path)
-            if name == "*":
-                for paths in groups.values():
-                    for i in indices(selector if selector is not None else "*", len(paths)):
+        if name == "round":
+            if depth != len(segments) - 1:
+                raise SystemExit(
+                    f"`round` must be the last segment in {spec!r}; target a child of "
+                    "the round instead"
+                )
+            for parent in parents:
+                node = editor.by_path.get(parent)
+                if node is None or node.name != "turn":
+                    raise SystemExit(f"`round` only applies to a turn: {spec!r}")
+                rounds = turn_rounds(editor, node)
+                for i in indices(selector, len(rounds)):
+                    found.extend(
+                        path_of(n, editor.index_of) for n in round_nodes(rounds[i])
+                    )
+        else:
+            for parent in parents:
+                groups = {}
+                for child_name, child_path in editor.by_parent.get(parent, []):
+                    groups.setdefault(child_name, []).append(child_path)
+                if name == "*":
+                    for paths in groups.values():
+                        for i in indices(
+                            selector if selector is not None else "*", len(paths)
+                        ):
+                            found.append(paths[i])
+                else:
+                    paths = groups.get(name, [])
+                    for i in indices(selector, len(paths)):
                         found.append(paths[i])
-            else:
-                paths = groups.get(name, [])
-                for i in indices(selector, len(paths)):
-                    found.append(paths[i])
+        if not found:
+            raise resolve_miss(editor, spec, name, parents, base_kind)
         parents = found
-        if not parents:
-            raise SystemExit(f"no region matches {spec!r}; run `list` to see the paths")
     return [editor.by_path[path] for path in parents]
 
 
@@ -823,6 +986,7 @@ class Editor:
                 )
             if turn is not None and turn in targets:
                 raise SystemExit(f"{spec} is the live turn; its tool call is still running.")
+        warn_unpaired(self, targets)
         # Both markers go, or the open is left dangling and the file stops parsing.
         doomed = set()
         for node in targets:
@@ -1050,6 +1214,7 @@ def plan_batch(editor, ops):
     """
     editor.ensure_writable()
     drops = []  # (start, end, lineno) end exclusive
+    drop_nodes = []
     edits = []  # (start, end, seq, lines, lineno)
     inserts = []  # (at, seq, closes, block, lineno, holder)
     labels = []
@@ -1061,6 +1226,7 @@ def plan_batch(editor, ops):
                 editor.dropped = True
                 if split_spec(spec)[0] == "self":
                     labels.append(self_label(editor, spec, nodes))
+                drop_nodes.extend(nodes)
                 drops.extend((n.open_line, n.close_line + 1, lineno) for n in nodes)
                 regions += len(nodes)
             elif op in ("set", "append"):
@@ -1088,6 +1254,7 @@ def plan_batch(editor, ops):
                 for r in rounds:
                     for path in (r["round"], r["result"]):
                         nodes = editor.targets(path)
+                        drop_nodes.extend(nodes)
                         drops.extend((n.open_line, n.close_line + 1, lineno) for n in nodes)
                         regions += len(nodes)
                 labels.append(
@@ -1142,6 +1309,8 @@ def plan_batch(editor, ops):
         for start, end, _, _, elineno in edits:
             if start <= at < end:
                 raise SystemExit(f"batch lines {elineno} and {lineno}: add lands in an edited region")
+
+    warn_unpaired(editor, drop_nodes)
 
     # Nested drops (a turn and a child) are fine, but they must become disjoint line ranges before
     # they are applied: two slice assignments computed on the original numbering would otherwise
