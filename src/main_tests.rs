@@ -44,6 +44,18 @@ fn template(cfg: &AppConfig, excluded: &[String]) -> Session {
   session_template(Path::new("/t/1.md"), cfg, excluded)
 }
 
+fn all_notes(session: &Session) -> Vec<&session::Note> {
+  let mut notes = Vec::new();
+  for turn in &session.turns {
+    notes.extend(turn.notes.iter());
+    for round in &turn.rounds {
+      notes.extend(round.notes.iter());
+      notes.extend(round.trailing_notes.iter());
+    }
+  }
+  notes
+}
+
 fn scratch(tag: &str) -> std::path::PathBuf {
   let dir = temp_dir().join(format!("slopfile-test-{tag}"));
   std::fs::remove_dir_all(&dir).ok();
@@ -67,6 +79,7 @@ fn with_question(input_tail: &str) -> Session {
     notes: vec![],
     rounds: vec![session::Round {
       notes: Vec::new(),
+      trailing_notes: Vec::new(),
       assistant: session::Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -432,7 +445,7 @@ fn context_full_note_is_a_harness_note_and_not_work() {
   write_session(&path, &session);
 
   let parsed = load(&path);
-  let notes = &parsed.turns[0].notes;
+  let notes = all_notes(&parsed);
   assert_eq!(notes.len(), 1);
   assert_eq!(notes[0].by, session::NoteBy::Harness);
   assert!(
@@ -2209,11 +2222,7 @@ fn a_failure_note_does_not_revert_edits_made_while_the_request_was_running() {
     "the user's prune must not be undone by the failure note"
   );
   assert!(
-    after
-      .turns
-      .last()
-      .unwrap()
-      .notes
+    all_notes(&after)
       .iter()
       .any(|n| n.text.contains("too large")),
     "and the note must still be there"
@@ -2380,11 +2389,7 @@ fn a_failure_note_on_a_half_written_turn_does_not_corrupt_the_file() {
 
   let reloaded = load(&path);
   assert!(
-    reloaded
-      .turns
-      .last()
-      .unwrap()
-      .notes
+    all_notes(&reloaded)
       .iter()
       .any(|n| n.text.contains("timed out")),
     "note must be readable as a note, not swallowed as assistant text"

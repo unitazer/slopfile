@@ -14,6 +14,11 @@ const GREP_MATCH_CAP: usize = 500;
 const GREP_LINE_CAP: usize = 2_000;
 const FIND_FILE_CAP: usize = 2_000;
 const WALK_FILE_CAP: usize = 50_000;
+/// Ordinary `read` window.
+const DEFAULT_READ_LIMIT: usize = 200;
+/// Markdown under a configured extra root is a skill: prose, often longer than 200 lines, meant to
+/// be read as a whole.
+const SKILL_READ_LIMIT: usize = 1_000;
 
 pub fn definitions() -> Vec<ToolDefinition> {
   vec![
@@ -25,7 +30,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
           "properties": {
               "path": { "type": "string", "description": "File to read, relative to the workdir" },
               "offset": { "type": "integer", "description": "Skip this many lines", "default": 0 },
-              "limit": { "type": "integer", "description": "Show at most this many lines", "default": 200 }
+              "limit": { "type": "integer", "description": "Show at most this many lines. Defaults to 200, or 1000 for .md files in the skills directory" }
           },
           "required": ["path"]
       }),
@@ -216,6 +221,27 @@ fn resolve_target(
     .map_err(|e| format!("cannot open the context file {asked}: {e}"))
 }
 
+/// Whether `path` lives under `root`. `path` comes from `resolve_in`, so it is canonical; the root
+/// is whatever the config said, so canonicalize it when possible before comparing.
+fn is_under(path: &Path, root: &Path) -> bool {
+  let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+  path.starts_with(root)
+}
+
+/// `.md` files under a configured extra root (in practice the skills dir) default to a taller
+/// window, because a skill is prose and a 200-line cap cuts most of them off mid-recipe. An
+/// explicit `limit` always wins; everything else keeps `DEFAULT_READ_LIMIT`.
+fn default_read_limit(path: &Path, extra_roots: &[PathBuf]) -> usize {
+  let markdown = path
+    .extension()
+    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+  if markdown && extra_roots.iter().any(|root| is_under(path, root)) {
+    SKILL_READ_LIMIT
+  } else {
+    DEFAULT_READ_LIMIT
+  }
+}
+
 fn str_arg<'a>(tool: &str, args: &'a Value, key: &str) -> Result<&'a str, ToolResult> {
   args
     .get(key)
@@ -249,7 +275,10 @@ fn read(
 ) -> ToolResult {
   let path_str = arg!("read", args, "path");
   let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-  let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+  let explicit_limit = args
+    .get("limit")
+    .and_then(Value::as_u64)
+    .map(|n| n as usize);
   let is_context = targets_context_file(workdir, path_str, context_file);
   let path = if is_context {
     match resolve_target(workdir, path_str, context_file) {
@@ -270,6 +299,7 @@ fn read(
       None => return ToolResult::err(format!("read: path escapes workdir: {path_str}")),
     }
   };
+  let limit = explicit_limit.unwrap_or_else(|| default_read_limit(&path, extra_roots));
   // Read only the window the model asked for: a 200 MB file with limit 200 still cost 200 MB
   // resident in the one process that hosts every session.
   let content = match read_window(&path, offset, limit) {
@@ -1004,6 +1034,66 @@ mod tests {
       !skills.join("evil.md").exists(),
       "no file may be written via extra root"
     );
+
+    let _ = fs::remove_dir_all(&wd);
+    let _ = fs::remove_dir_all(&skills);
+  }
+
+  #[tokio::test]
+  async fn markdown_under_a_skills_root_gets_a_taller_default_window() {
+    let wd = test_dir("skill-window-wd");
+    let skills = test_dir("skill-window-skills");
+    let body: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+    fs::write(skills.join("long.md"), &body).unwrap();
+    fs::write(skills.join("long.txt"), &body).unwrap();
+    fs::write(wd.join("plain.md"), &body).unwrap();
+
+    let read = |path: PathBuf, limit: Option<u32>| {
+      let mut args = json!({"path": path.to_string_lossy()});
+      if let Some(limit) = limit {
+        args["limit"] = json!(limit);
+      }
+      let wd = wd.clone();
+      let skills = skills.clone();
+      async move {
+        run(
+          "read",
+          &args.to_string(),
+          wd,
+          30_000,
+          std::slice::from_ref(&skills),
+          None,
+        )
+        .await
+      }
+    };
+
+    let skill = read(skills.join("long.md"), None).await;
+    assert!(skill.ok, "{}", skill.output);
+    assert!(
+      skill.output.contains("300: line 300"),
+      "a skill .md should default to 1000 lines: {}",
+      skill.output
+    );
+
+    // Only the extension+location pair changes the default; a .txt in the skills dir and an .md in
+    // the workdir both keep the ordinary 200-line window.
+    let not_markdown = read(skills.join("long.txt"), None).await;
+    assert!(
+      !not_markdown.output.contains("line 300"),
+      "{}",
+      not_markdown.output
+    );
+    let not_a_skill = read(wd.join("plain.md"), None).await;
+    assert!(
+      !not_a_skill.output.contains("line 300"),
+      "{}",
+      not_a_skill.output
+    );
+
+    // An explicit limit still wins over the skills default.
+    let capped = read(skills.join("long.md"), Some(5)).await;
+    assert!(!capped.output.contains("line 6"), "{}", capped.output);
 
     let _ = fs::remove_dir_all(&wd);
     let _ = fs::remove_dir_all(&skills);

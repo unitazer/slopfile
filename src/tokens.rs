@@ -165,7 +165,7 @@ pub fn prompt_budget(budget: u32) -> u32 {
   budget.saturating_sub(output_allowance(budget))
 }
 pub fn output_allowance(budget: u32) -> u32 {
-  (budget / 4).max(32_000).min(budget - budget / 4)
+  (budget / 6).clamp(8000, 32000)
 }
 #[derive(Debug, Clone, Default)]
 pub struct Counting {

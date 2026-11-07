@@ -91,7 +91,7 @@ local function send_cmd(label)
     vim.notify("sf: " .. why, vim.log.levels.WARN)
     return
   end
-  vim.cmd("write")
+  -- vim.cmd("write")
   checktime()
   M.sf({ "send", name }, vim.log.levels.INFO)
 end

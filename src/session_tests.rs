@@ -99,6 +99,7 @@ fn sample_session() -> Session {
         by: NoteBy::Model,
         text: "still digging".to_string(),
       }],
+      trailing_notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: Some("look around first".to_string()),
@@ -125,6 +126,7 @@ fn sample_session() -> Session {
     notes: vec![],
     rounds: vec![Round {
       notes: Vec::new(),
+      trailing_notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -153,7 +155,7 @@ fn same_shape(a: &Session, b: &Session) -> bool {
           .rounds
           .iter()
           .zip(y.rounds.iter())
-          .all(|(p, q)| p.notes.len() == q.notes.len())
+          .all(|(p, q)| p.notes.len() == q.notes.len() && p.trailing_notes.len() == q.trailing_notes.len())
     })
 }
 
@@ -535,6 +537,7 @@ fn request_messages_synthesizes_a_call_for_an_orphan_result() {
     notes: vec![],
     rounds: vec![Round {
       notes: Vec::new(),
+      trailing_notes: Vec::new(),
       assistant: Assistant::default(),
       results: vec![ToolOutcome {
         id: "orphan".to_string(),
@@ -557,6 +560,7 @@ fn request_messages_synthesizes_a_call_for_an_orphan_result() {
 fn multi_round_turn_keeps_each_assistant_with_its_own_results() {
   let round = |id: &str, text: &str, out: &str| Round {
     notes: Vec::new(),
+    trailing_notes: Vec::new(),
     assistant: Assistant {
       custom: Vec::new(),
       reasoning: None,
@@ -644,6 +648,7 @@ fn question_round_trip_and_answer() {
     notes: vec![],
     rounds: vec![Round {
       notes: Vec::new(),
+      trailing_notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1452,6 +1457,7 @@ fn a_model_note_is_part_of_the_assistant_message_that_wrote_it() {
         by: NoteBy::Model,
         text: "remember: the user wants tests".to_string(),
       }],
+      trailing_notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1483,6 +1489,7 @@ fn a_model_note_is_sent_before_the_result_of_the_round_that_wrote_it() {
         by: NoteBy::Model,
         text: "remember: the next step is to re-run the tests".to_string(),
       }],
+      trailing_notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1533,6 +1540,7 @@ fn a_model_note_does_not_trail_the_empty_round_a_generation_starts_with() {
         by: NoteBy::Model,
         text: "remember: the findings are in the note".to_string(),
       }],
+      trailing_notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1612,6 +1620,7 @@ fn a_model_note_does_not_move_when_later_rounds_are_added() {
 
   let round = |id: &str, text: &str, out: &str| Round {
     notes: Vec::new(),
+    trailing_notes: Vec::new(),
     assistant: Assistant {
       custom: Vec::new(),
       reasoning: None,
@@ -1674,6 +1683,7 @@ fn a_model_note_renders_between_its_round_and_that_rounds_results() {
         by: NoteBy::Model,
         text: "tried X: no results".to_string(),
       }],
+      trailing_notes: Vec::new(),
       assistant: Assistant {
         custom: Vec::new(),
         reasoning: None,
@@ -1760,52 +1770,74 @@ fn a_note_added_while_a_call_is_pending_lands_before_that_calls_result() {
 }
 
 #[test]
-fn a_legacy_tail_note_attaches_to_the_last_round_on_reparse() {
-  // What the old renderer wrote: a model note at the end of the turn, after the results.
+fn a_harness_note_stays_put_when_a_later_round_is_added() {
+  // The failure note is written after a completed round. A retry then appends another round; the
+  // note must stay between them instead of being dragged to the tail by the renderer.
   let mut session = Session::default();
   session.turns.push(Turn {
-    custom: Vec::new(),
     user: Some("go".to_string()),
-    notes: vec![Note {
-      by: NoteBy::Model,
-      text: "tried X: no results".to_string(),
-    }],
-    rounds: vec![Round {
-      notes: Vec::new(),
-      assistant: Assistant {
-        custom: Vec::new(),
-        reasoning: None,
-        text: None,
-        calls: vec![Call {
-          id: "c1".to_string(),
-          name: "bash".to_string(),
-          arguments: r#"{"command":"ls"}"#.to_string(),
-        }],
-      },
-      results: vec![ToolOutcome {
-        id: "c1".to_string(),
-        name: "bash".to_string(),
-        ok: true,
-        ms: 0,
-        output: "src".to_string(),
-      }],
-    }],
-    question: None,
+    ..Turn::default()
   });
+  session.begin_round();
+  session.push_text("first answer");
+  session.finish_round(
+    vec![Call {
+      id: "c1".to_string(),
+      name: "bash".to_string(),
+      arguments: "{}".to_string(),
+    }],
+    vec![ToolOutcome {
+      id: "c1".to_string(),
+      name: "bash".to_string(),
+      ok: true,
+      ms: 0,
+      output: "out".to_string(),
+    }],
+  );
+  session.add_note(NoteBy::Harness, "the connection dropped");
 
-  let legacy = session.render();
+  session.begin_round();
+  session.push_text("second answer");
+
+  let rendered = session.render();
+  let first = rendered.find("first answer").unwrap();
+  let note = rendered.find("the connection dropped").unwrap();
+  let second = rendered.find("second answer").unwrap();
+  assert!(
+    first < note && note < second,
+    "the note must not move to the tail: {rendered}"
+  );
+  let (parsed, report) = parse(&rendered);
+  assert!(report.is_clean(), "{report:?}");
+  assert_eq!(parsed.render(), rendered, "reparse keeps the same order");
+}
+
+#[test]
+fn a_legacy_tail_note_stays_after_the_result_on_reparse() {
+  // What the old renderer wrote: a note at the end of the turn, after the results. It must stay
+  // there; moving it back before the result would be a context edit nobody asked for.
+  let legacy = session_file(&container(
+    TURN,
+    &format!(
+      "{}{}{}{}",
+      region(USER, "go"),
+      container(ASSISTANT, &call_region("c1", "bash", "{}")),
+      result_region("c1", "bash", true, 0, "src"),
+      note_region("model", "tried X: no results"),
+    ),
+  ));
   let (parsed, report) = parse(&legacy);
   assert!(report.is_clean(), "{report:?}");
   assert_eq!(
-    parsed.turns[0].rounds[0].notes[0].text,
+    parsed.turns[0].rounds[0].trailing_notes[0].text,
     "tried X: no results"
   );
   assert!(parsed.turns[0].notes.is_empty());
 
   let stabilised = parsed.render();
   assert!(
-    stabilised.find("tried X").unwrap() < stabilised.find("slopfile:result").unwrap(),
-    "the note moves back before the result on the first render: {stabilised}"
+    stabilised.find("tried X").unwrap() > stabilised.find("slopfile:result").unwrap(),
+    "the note stays after the result it followed: {stabilised}"
   );
   assert_eq!(parse(&stabilised).0.render(), stabilised);
 }

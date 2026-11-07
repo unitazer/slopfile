@@ -46,6 +46,11 @@ services:
     user: "1000:1000"
     group_add:
       - "${DOCKER_GID:-998}"
+    # Linux containers get no `host.docker.internal` by default; this maps it to the bridge
+    # gateway so host-run services (strata on :18090) are reachable. The service on the host
+    # must be bound to 0.0.0.0, not 127.0.0.1 -- a loopback listener never sees docker0 traffic.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ../workspace:/workspace
       - ../shared:/shared

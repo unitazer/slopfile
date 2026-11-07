@@ -126,8 +126,7 @@ pub(crate) fn record_provider_failure(
   };
   // A send against the same dead endpoint fails the same way, and a note per attempt would bury the
   // transcript it is trying to explain. Replace the previous one instead of stacking.
-  if let Some(last) = s.turns.last_mut()
-    && let Some(note_slot) = last.notes.last_mut()
+  if let Some(note_slot) = s.last_note_mut()
     && note_slot.by == session::NoteBy::Harness
     && (note_slot.text.contains("this turn was never answered")
       || note_slot.text.contains("left half-written")
@@ -195,8 +194,7 @@ pub(crate) fn record_config_failure(path: &Path, e: &str) -> Result<(), String> 
      there; otherwise it is the app-wide `provider` in `shared/slopfile.toml`, or a \
      `SLOPFILE_*` environment variable. Re-sending alone will fail the same way."
   );
-  if let Some(last) = s.turns.last_mut()
-    && let Some(note_slot) = last.notes.last_mut()
+  if let Some(note_slot) = s.last_note_mut()
     && note_slot.by == session::NoteBy::Harness
     && note_slot.text.contains("Nothing was sent")
   {
@@ -221,8 +219,7 @@ pub(crate) fn record_budget_failure(path: &Path, e: &str) -> Result<(), String> 
      (drop or compress old turns), or raise `max_context_tokens` if the model really has a bigger \
      window. The daemon does not trim it for you."
   );
-  if let Some(last) = s.turns.last_mut()
-    && let Some(note_slot) = last.notes.last_mut()
+  if let Some(note_slot) = s.last_note_mut()
     && note_slot.by == session::NoteBy::Harness
     && note_slot.text.contains("larger than the prompt budget")
   {
