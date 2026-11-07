@@ -12,6 +12,49 @@ description: >
 Never `tail`, `head`, `sed`, `grep` or `cat` the transcript: re-reading it puts the same bytes back
 in your context. `list`, `read` and `check` are the only exceptions.
 
+## Rule 1: every `list` is a debt the next batch pays
+
+A listing is not reference material you keep. It is a working set that is wrong the instant you
+edit: sizes shrink, siblings renumber, and a stale listing sends you on long reasoning chains about
+regions that no longer exist.
+
+So the rule is mechanical: **the batch that follows a `list` must drop that listing, and every
+earlier listing still in the window.** A compaction that removes output but leaves listings behind
+has not finished.
+
+```bash
+python3 /shared/skills/session-edit.py batch FILE <<'EOF'
+drop 'turn[3].assistant[1]'
+drop 'turn[3].result[1]'
+set 'self.reasoning' | pruned turn[3]; state in the note
+droplists
+EOF
+```
+
+`droplists` is the whole cleanup in one line: it finds every round that ran `session-edit.py list`
+and drops the round and its listing. Use it instead of hunting for indices.
+
+Every `list` prints, at the bottom, the exact drop lines for the listings it can see:
+
+```
+# every list round is dead once you edit: drop it in the next batch
+#   drop 'turn[12].assistant[18]'
+#   drop 'turn[12].result[31]'   (that listing)
+# ...or the whole job in one line: droplists
+```
+
+You cannot delete a stale listing without running `list`. That is fine: the new listing pays for
+the old one. List once, and in the batch it plans drop the old list round *and* this one.
+
+- **Never run `list` to check that an edit worked.** The receipt already printed the resolved paths
+  and the new size; that is the verification. A verification listing costs more context than the
+  edit saved and leaves another debt.
+- **Run `list` bare.** `list | head -20` is still a listing, and piping is exactly what hides the
+  cleanup hint and the `← live (self)` marker. If the tree is too big to read, use
+  `list --turns 6` (older turns are folded) rather than a pipe.
+- A batch that dropped output but left a listing prints `warning: N list round(s) still in
+  context`. That warning is the point: read it, then run `droplists`.
+
 ## List first
 
 ```bash
@@ -60,7 +103,8 @@ If the session runs without thinking there is no reasoning block; summarize `sel
 If a receipt shows `self` is smaller than you expected, an interruption moved it. The old block is
 still at the turn you listed; target it by turn.
 
-removing your own reasoning about the session edit plan is generally a good idea
+Removing your own reasoning about the session-edit plan is generally a good idea: the batch's own
+receipt is the record.
 
 ## While your tool runs
 
@@ -126,6 +170,7 @@ add 'turn[-1].note' <<'END'
 ## Findings
 - ...
 END
+droplists
 EOF
 ```
 
@@ -134,32 +179,13 @@ next request. The note's own call would create another reasoning block to clean 
 the summary and the cleanup are one batch. The note body is multi-line; the outer shell heredoc
 must use a different tag (`EOF`).
 
-The listing that planned the batch is dead too: the round that ran `list`, the output it printed,
-and the reasoning that read it. `list` prints the exact paths for that round (or for its call, if
-the round had other calls) and for the result it will produce; use the ones from the listing you
-are acting on, and put them in the same batch as the compaction:
+Each line is `drop PATH`, `droplists`, `set PATH | BODY`, `append PATH | BODY`, `add PATH | BODY`,
+or `add PATH <<'TAG'`. Quotes around a path are stripped; `drop` and `droplists` take no body. If
+any line fails, the whole batch is abandoned and the file is untouched. Do not chain single
+commands with `&&`. Nested heredocs inside a batch do not work: for a short body use `op PATH |
+body`, or write the body to a temp file and pass it with `--body -`.
 
-```bash
-set 'self.reasoning' | <one-line summary>
-drop '<the assistant or call path printed by list>'
-drop '<the result path printed by list>'
-```
-
-When `list` ran alone in the immediately previous round, those paths are
-`turn[-1].assistant[-2]` and `turn[-1].result[-1]`. Do not assume that shorthand in any other case.
-If the list round contained other calls, `list` prints the `call` path instead of the round path:
-drop that call and its result, not the whole assistant, or the other call is lost while its result
-stays behind. If another round landed after `list`, or a new turn started, use the absolute paths
-`list` printed -- `[-2]`/`[-1]` then point at the wrong regions.
-
-The note is memory, not your reply. Do not paste its body into `text` or `reasoning` as well, and
-do not treat the batch result as the end of the turn: keep working with the next tool call. The
-note is written before this call's result, so later rounds are appended after it; you do not need
-to add it again. A note duplicated into prose is how the model talks itself into stopping.
-
-Each line is `drop PATH`, `set PATH | BODY`, `append PATH | BODY`, `add PATH | BODY`, or
-`add PATH <<'TAG'`. Quotes around a path are stripped. If any line fails, the whole batch is
-abandoned and the file is untouched. Do not chain single commands with `&&`.
+Use ranges (`2..7`, inclusive) instead of repeating the same operation.
 
 To cut a tail, drop the old turns with an explicit end and summarize the live turn in the same
 batch. If the live turn is `turn[12]`:
@@ -175,9 +201,13 @@ add 'turn[-1].note' <<'END'
 END
 EOF
 ```
-please use ranges like 2..7 (this is from 2 to 7 inclusive) instead of writing the same operation many times
 
 Keep every user message unless the user says to drop it.
+
+The note is memory, not your reply. Do not paste its body into `text` or `reasoning` as well, and
+do not treat the batch result as the end of the turn: keep working with the next tool call. The
+note is written before this call's result, so later rounds are appended after it; you do not need
+to add it again. A note duplicated into prose is how the model talks itself into stopping.
 
 ## Single edits
 
@@ -223,15 +253,29 @@ transcript as you generate them, so the file grows between a `list` and the next
 compare a count from an earlier `list` to a later receipt: the difference is your own output plus
 whatever tool results landed since, not what the edit did. The receipt's count is the size now.
 
-when doing a batch edit to compact your own session, remove all previous outputs of the listed tree
-stale information is a frequent source of confusion and sends you on long reasoning chains about
-things that no longer matter since the edit has already happened. ignore all previous list command 
-outputs and only reason about an up to date representation of the context file structure
+## `ctx:N` is one call behind
+
+The token tag on a tool result was sampled **before** that call ran, not after. So a tag on a
+compaction receipt shows the size the file had when the batch was issued — the drops it reports
+have already happened and are not in that number. Do not read a big `ctx` tag on a batch receipt as
+"still full, compact again now": the next call's tag is the one that reflects the edit. Judge by
+trend across two calls, and trust the receipt's own line count.
+
+## Keep this skill in the window
+
+Dropping this skill out of context is a bad idea: after a compaction the agent gets confused by
+exactly the things this file says are not worth reasoning about. A batch can drop the very text
+that explains why listings must be dropped.
+
+After any edit that drops regions, the tool prints a reminder to stderr:
+
+```
+reminder: a drop may have removed the session-edit skill from your context. if these rules are no
+longer in your window, read /shared/skills/session-edit.md before editing again.
+```
+
+If that reminder fires and the rules are gone, re-read this file before the next edit. Prefer
+keeping it: a whole-turn drop that removes the skill's read round is usually a net loss.
 
 Keep stderr visible: a validation error means it refused to write, and `2>/dev/null` turns that
-into a silent no-op. `ctx:N` lags one call; judge by trend. `note` lives at the turn level; inside
-an assistant use your own role name.
-
-dropping this skill itself out of context is a bad idea. it is often the case that the agent 
-gets confused after the drops by things that are explicitly stated to be not worth reasoning 
-about in this file.
+into a silent no-op.

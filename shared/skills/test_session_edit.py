@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Tests for session-edit.py. Run with `python3 -m unittest shared/skills/test_session_edit.py`."""
 
+import contextlib
 import importlib.util
+import io
 import pathlib
 import tempfile
 import unittest
@@ -65,6 +67,28 @@ def many_turns(count):
         )
     out.append(INPUT)
     return "".join(out)
+
+
+def duplicate_ids_live():
+    """Two calls sharing one id, the second running `list`: pairing must fall back to order."""
+    return (
+        FENCE
+        + BEGIN
+        + SYSTEM
+        + "<!-- slopfile:turn -->\n"
+        + "<!-- slopfile:user -->\ndo it\n" + END
+        + "<!-- slopfile:assistant -->\n"
+        + "<!-- slopfile:reasoning -->\nthought\n" + END
+        + '<!-- slopfile:call {"id":"c1","name":"bash","arguments":'
+        + '"{\\\"command\\\":\\\"echo first\\\"}"} -->\n' + END
+        + '<!-- slopfile:call {"id":"c1","name":"bash","arguments":'
+        + '"{\\\"command\\\":\\\"python3 session-edit.py list s.md\\\"}"} -->\n' + END
+        + END
+        + '<!-- slopfile:result {"id":"c1","name":"bash","ok":true} -->\nfirst out\n' + END
+        + '<!-- slopfile:result {"id":"c1","name":"bash","ok":true} -->\nlisting output\n' + END
+        + END
+        + INPUT
+    )
 
 
 def live():
@@ -500,6 +524,61 @@ class TestCheck(Base):
         editor.drop("turn[0].result[*]")
         self.assertIsNone(se.check(editor.lines))
 
+
+class TestDropReminder(Base):
+    def test_drop_prints_the_skill_reminder(self):
+        editor, _ = self.editor(balanced())
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            editor.drop("turn[0].result[*]")
+            editor.save()
+            se.drop_reminder()
+        self.assertIn("session-edit.md", err.getvalue())
+        self.assertIn("removed the session-edit skill", err.getvalue())
+
+    def test_write_without_a_drop_prints_nothing(self):
+        editor, _ = self.editor(balanced())
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            editor.write("turn[0].note[0]", "note")
+            editor.save()
+            se.stale_warning(editor)
+        self.assertEqual(err.getvalue(), "")
+
+    def test_droplists_batch_prints_the_reminder(self):
+        text = balanced().replace(
+            "echo hi", "python3 /shared/skills/session-edit.py list s.md"
+        )
+        editor, path = self.editor(text)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ops = se.parse_batch("droplists\n")
+            new_lines, _, labels = se.plan_batch(editor, ops)
+            editor.commit(new_lines)
+            editor.save()
+        self.assertIn("droplists: dropped 1 list round", "\n".join(labels))
+        self.assertIn("session-edit.md", err.getvalue())
+        self.assertNotIn("session-edit.py list", path.read_text())
+        self.assertIsNone(se.check(se.Editor(str(path)).lines))
+
+
+    def test_duplicate_ids_pair_by_order(self):
+        editor, _ = self.editor(duplicate_ids_live())
+        rounds = se.list_rounds(editor)
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0]["round"], "turn[0].assistant[0].call[1]")
+        self.assertEqual(rounds[0]["result"], "turn[0].result[1]")
+        self.assertTrue(rounds[0]["settled"])
+
+    def test_droplists_with_duplicate_ids(self):
+        editor, path = self.editor(duplicate_ids_live())
+        ops = se.parse_batch("droplists\n")
+        new_lines, _, labels = se.plan_batch(editor, ops)
+        editor.commit(new_lines)
+        editor.save()
+        self.assertIn("droplists: dropped 1 list round", "\n".join(labels))
+        text = path.read_text()
+        self.assertIn("first out", text)
+        self.assertNotIn("listing output", text)
+        self.assertNotIn("session-edit.py list", text)
+        self.assertIsNone(se.check(se.Editor(str(path)).lines))
 
 if __name__ == "__main__":
     unittest.main()

@@ -322,40 +322,126 @@ def live_assistant(editor):
     return assistants[-1] if assistants else None
 
 
-def live_list_paths(editor):
-    """Exact paths for the live `list` call and the result it will produce.
+LIST_CMD = re.compile(r"session-edit\.py\s+list\b")
 
-    The result index is the one this call will get when the round settles: results from earlier
-    rounds are already in the tree, and the calls in this round are settled in order. Absolute
-    paths stay correct even if another round or a new turn lands before the cleanup batch.
+
+def is_list_call(node):
+    """True for a bash call that ran `session-edit.py list`.
+
+    A piped listing (`list | tail -20`) is still a listing: it is the round that must be
+    dropped, and piping is exactly what hides the cleanup hint from the model.
     """
-    turn = live_turn(editor)
-    assistant = live_assistant(editor)
-    if turn is None or assistant is None:
-        return None
-    calls = [n for n in assistant.children if n.name == "call"]
-    if not calls:
-        return None
-    list_index = None
-    for i, call in enumerate(calls):
-        try:
-            outer = json.loads(call.payload or "{}")
-            args = json.loads(outer.get("arguments") or "{}")
-        except (TypeError, ValueError):
+    if node.name != "call":
+        return False
+    args = parse_arguments(parse_payload(node))
+    return bool(LIST_CMD.search(str(args.get("command", ""))))
+
+
+def list_rounds(editor):
+    """Every round in the transcript that ran `session-edit.py list`, with the paths that remove it.
+
+    Each entry gives the path of the round (or just the call, when the round ran several
+    calls) and the path of the listing it printed. For a settled round both exist in the
+    tree; for the round currently running, the result path is the index it will get when
+    the round settles, which is why the hint says "in the next batch".
+    """
+    rounds = []
+    for turn in top_nodes(editor):
+        if turn.name != "turn":
             continue
-        if re.search(r"session-edit\.py\s+list\b", str(args.get("command", ""))):
-            list_index = i
-            break
-    if list_index is None:
-        return None
-    turn_path = path_of(turn, editor.index_of)
-    assistant_path = path_of(assistant, editor.index_of)
-    existing_results = sum(1 for n in turn.children if n.name == "result")
-    return (
-        assistant_path,
-        f"{assistant_path}.call[{list_index}]",
-        f"{turn_path}.result[{existing_results + list_index}]",
-        len(calls),
+        turn_path = path_of(turn, editor.index_of)
+        assistants = [n for n in turn.children if n.name == "assistant"]
+        results = [n for n in turn.children if n.name == "result"]
+        ids = [parse_payload(r).get("id") for r in results]
+        # Some harnesses reuse one id for every call, so ids cannot be trusted to pair a
+        # result with its call. Pair by id only when the ids are actually distinct.
+        unique_ids = len(set(i for i in ids if i)) == len([i for i in ids if i])
+        by_id = {parse_payload(r).get("id"): r for r in results} if unique_ids else {}
+        all_calls = [c for a in assistants for c in a.children if c.name == "call"]
+        for ai, assistant in enumerate(assistants):
+            calls = [n for n in assistant.children if n.name == "call"]
+            open_assistant = assistant.close_line is None
+            for ci, call in enumerate(calls):
+                if not is_list_call(call):
+                    continue
+                cid = parse_payload(call).get("id")
+                result = by_id.get(cid) if cid is not None else None
+                if result is None and len(results) == len(all_calls):
+                    # No usable ids: results follow calls in order within a turn.
+                    position = all_calls.index(call)
+                    if position < len(results):
+                        result = results[position]
+                if result is None:
+                    result_path = f"{turn_path}.result[{len(results) + ci}]"
+                    settled = False
+                else:
+                    result_path = path_of(result, editor.index_of)
+                    settled = True
+                if len(calls) == 1:
+                    round_path = f"{turn_path}.assistant[{ai}]"
+                else:
+                    round_path = f"{turn_path}.assistant[{ai}].call[{ci}]"
+                rounds.append(
+                    {
+                        "round": round_path,
+                        "call": f"{turn_path}.assistant[{ai}].call[{ci}]",
+                        "result": result_path,
+                        "settled": settled,
+                        "open": open_assistant,
+                        "calls": len(calls),
+                    }
+                )
+    return rounds
+
+
+def compacting_hint(editor):
+    """The drop lines that make this listing disappear, printed on every `list`.
+
+    Printed even when the file is balanced or streaming: a listing is only useful while it
+    is fresh, and every one left behind is stale context that has to be dropped by the
+    next batch.
+    """
+    rounds = list_rounds(editor)
+    if not rounds:
+        return []
+    out = [
+        "# every list round is dead once you edit: drop it in the next batch "
+        "(a listing from before a drop has the wrong indices)"
+    ]
+    for r in rounds:
+        note = ""
+        if r["calls"] > 1:
+            note = f"   (this round has {r['calls']} calls: drop the call, not the round)"
+        out.append(f"#   drop '{r['round']}'{note}")
+        out.append(f"#   drop '{r['result']}'   (that listing)")
+    out.append("# ...or the whole job in one line: droplists")
+    return out
+
+
+def stale_warning(editor):
+    """Print on every write receipt: listings you have not paid for yet."""
+    rounds = [r for r in list_rounds(editor) if r["settled"]]
+    if not rounds:
+        return
+    pairs = ", ".join(f"{r['round']} + {r['result']}" for r in rounds)
+    print(
+        f"warning: {len(rounds)} list round(s) still in context ({pairs}); "
+        "the next batch must drop them, or run `droplists`"
+    )
+
+
+def drop_reminder():
+    """Printed after any write that dropped regions.
+
+    A compaction batch can drop the session-edit skill itself, so the rules need a
+    pointer that survives the drop: without it, the next session has nothing to
+    remind it that every `list` round has to be dropped by the next batch.
+    """
+    print(
+        "reminder: a drop may have removed the session-edit skill from your context. "
+        "if these rules are no longer in your window, read /shared/skills/session-edit.md "
+        "before editing again.",
+        file=sys.stderr,
     )
 
 
@@ -385,7 +471,11 @@ def total_chars(editor, sizes=None):
     return sum(sizes[node] for node in top_nodes(editor))
 
 
-def render_tree(nodes, depth, index_of, lines, sizes, out, live_path=None, stream_path=None):
+def render_tree(
+    nodes, depth, index_of, lines, sizes, out, live_path=None, stream_path=None, fold=None
+):
+    turns = [n for n in nodes if n.name == "turn"]
+    fold_before = len(turns) - fold if fold is not None and depth == 0 else None
     for node in nodes:
         detail = ""
         if node.name == "call":
@@ -398,15 +488,19 @@ def render_tree(nodes, depth, index_of, lines, sizes, out, live_path=None, strea
             mark = "  ← live (self)"
         elif path == stream_path:
             mark = "  ← streaming"
+        folded = fold_before is not None and index_of[node] < fold_before
         out.append(
             f"{'  ' * depth}{node.name}[{index_of[node]}]  {sizes[node]:,}c{detail}{mark}"
+            + ("  (folded)" if folded else "")
         )
+        if folded:
+            continue
         render_tree(
-            node.children, depth + 1, index_of, lines, sizes, out, live_path, stream_path
+            node.children, depth + 1, index_of, lines, sizes, out, live_path, stream_path, fold
         )
 
 
-def list_output(editor):
+def list_output(editor, fold=None):
     sizes = size_map(editor)
     header = (
         f"{len(editor.lines)} lines, {total_chars(editor, sizes):,} content chars; "
@@ -423,27 +517,15 @@ def list_output(editor):
         stream_path = path_of(editor.open_nodes[-1], editor.index_of)
     out = [header]
     render_tree(
-        top_nodes(editor), 0, editor.index_of, editor.lines, sizes, out, live_path, stream_path
+        top_nodes(editor), 0, editor.index_of, editor.lines, sizes, out, live_path, stream_path,
+        fold,
     )
     inp = find_input(editor.roots)
     if inp is not None:
         size = sizes.get(inp, 0)
         if size:
             out.append(f"input  {size:,}c")
-    if state == "live":
-        paths = live_list_paths(editor)
-        if paths is not None:
-            assistant_path, call_path, result_path, call_count = paths
-            out.append("# compacting? in the next batch:")
-            out.append("#   set 'self.reasoning' | <summary>")
-            if call_count == 1:
-                out.append(f"#   drop '{assistant_path}'   (the round that ran this list)")
-            else:
-                out.append(
-                    f"#   drop '{call_path}'   (this list call; this round has {call_count} calls, "
-                    "so do not drop the whole assistant)"
-                )
-            out.append(f"#   drop '{result_path}'   (this listing)")
+    out.extend(compacting_hint(editor))
     return "\n".join(out)
 
 
@@ -659,6 +741,7 @@ class Editor:
         with open(path) as fh:
             self.initial_text = fh.read()
         self.lines = self.initial_text.splitlines(keepends=True)
+        self.dropped = False
         self.reindex()
 
     def reindex(self):
@@ -745,6 +828,7 @@ class Editor:
         for node in targets:
             doomed.update(range(node.open_line, node.close_line + 1))
         self.commit([line for i, line in enumerate(self.lines) if i not in doomed])
+        self.dropped = True
         return len(targets), f"dropped {len(targets)} region(s): {self.size_suffix()}"
 
     def write(self, spec, raw, append=False):
@@ -862,6 +946,8 @@ class Editor:
                 "run `list` again and re-apply."
             )
         write_atomic(self.path, self.text())
+        if self.dropped:
+            drop_reminder()
 
 
 def insert_point(view, holder):
@@ -887,7 +973,7 @@ def insert_point(view, holder):
     return at, [CLOSE + "\n"] * closes
 
 
-BATCH_OPS = ("drop", "set", "append", "add")
+BATCH_OPS = ("drop", "set", "append", "add", "droplists")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z0-9_]+)\1\s*$")
 
 
@@ -929,7 +1015,10 @@ def parse_batch(text):
             raise SystemExit(
                 f"batch line {lineno}: unknown op {op!r}; use drop, set, append or add"
             )
-        if not spec:
+        if op == "droplists":
+            if spec:
+                raise SystemExit(f"batch line {lineno}: droplists takes no path")
+        elif not spec:
             raise SystemExit(f"batch line {lineno}: {op} needs a region path")
         if len(spec) > 1 and spec[0] == spec[-1] and spec[0] in "'\"":
             spec = spec[1:-1]
@@ -937,9 +1026,9 @@ def parse_batch(text):
             raise SystemExit(
                 f"batch line {lineno}: use either `| body` or a <<'TAG' heredoc, not both"
             )
-        if op == "drop":
+        if op in ("drop", "droplists"):
             if sep or heredoc_body is not None:
-                raise SystemExit(f"batch line {lineno}: drop takes no body")
+                raise SystemExit(f"batch line {lineno}: {op} takes no body")
         elif heredoc_body is None:
             if not sep:
                 raise SystemExit(
@@ -969,6 +1058,7 @@ def plan_batch(editor, ops):
         try:
             if op == "drop":
                 nodes = editor.targets(spec)
+                editor.dropped = True
                 if split_spec(spec)[0] == "self":
                     labels.append(self_label(editor, spec, nodes))
                 drops.extend((n.open_line, n.close_line + 1, lineno) for n in nodes)
@@ -990,6 +1080,19 @@ def plan_batch(editor, ops):
                         new = escape(body)
                     edits.append((node.body_start, node.close_line, seq, to_lines(new), lineno))
                 regions += len(nodes)
+            elif op == "droplists":
+                editor.dropped = True
+                rounds = [r for r in list_rounds(editor) if r["settled"]]
+                if not rounds:
+                    raise SystemExit("droplists: no settled `list` rounds in the transcript")
+                for r in rounds:
+                    for path in (r["round"], r["result"]):
+                        nodes = editor.targets(path)
+                        drops.extend((n.open_line, n.close_line + 1, lineno) for n in nodes)
+                        regions += len(nodes)
+                labels.append(
+                    f"droplists: dropped {len(rounds)} list round(s) and their listings"
+                )
             else:
                 parent_spec, _, new_name = spec.rpartition(".")
                 if not new_name:
@@ -1091,6 +1194,10 @@ def main():
     ap.add_argument("session")
     ap.add_argument("path", nargs="?")
     ap.add_argument("--body", help="new body text; use '-' to read the body from stdin")
+    ap.add_argument(
+        "--turns", type=int,
+        help="list: show detail only for the last N turns, fold the older ones",
+    )
     args = ap.parse_args()
 
     if args.cmd not in ("list", "check", "batch") and not args.path:
@@ -1113,10 +1220,11 @@ def main():
             f"applied {len(ops)} {'edit' if len(ops) == 1 else 'edits'} ({regions} regions): "
             f"{editor.size_suffix()}"
         )
+        stale_warning(editor)
         return
 
     if args.cmd == "list":
-        print(list_output(editor))
+        print(list_output(editor, args.turns))
         return
 
     if args.cmd == "check":
@@ -1137,6 +1245,8 @@ def main():
         _, message = editor.write(args.path, body_arg(args.body), append=(args.cmd == "append"))
     editor.save()
     print(message)
+    if args.cmd != "read":
+        stale_warning(editor)
 
 
 if __name__ == "__main__":
