@@ -174,7 +174,7 @@ fn frontmatter_summary(lines: &[&str]) -> Option<String> {
   if desc.is_empty() {
     title.filter(|t| !t.is_empty())
   } else {
-    Some(truncate_chars(&desc, 160))
+    Some(truncate_words(&desc, 160))
   }
 }
 
@@ -197,22 +197,18 @@ fn body_summary(lines: &[&str]) -> Option<String> {
     if trimmed.is_empty() || trimmed.starts_with('#') {
       continue;
     }
-    desc = Some(truncate_chars(trimmed, 48));
+    desc = Some(truncate_words(trimmed, 48));
     break;
   }
   desc.or(title.map(|s| s.to_string()))
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-  if s.split_ascii_whitespace().count() <= max {
+fn truncate_words(s: &str, max: usize) -> String {
+  let words: Vec<&str> = s.split_whitespace().collect();
+  if words.len() <= max {
     return s.to_string();
   }
-  let cut: String = s.split_ascii_whitespace().take(max).collect();
-  format!("{cut}..")
-  // match cut.rfind(' ') {
-  //   Some(i) => format!("{}...", &cut[..i]),
-  //   None => format!("{cut}..."),
-  // }
+  format!("{}...", words[..max].join(" "))
 }
 
 /// The paragraph that explains the context file. Written once when the session is created; after

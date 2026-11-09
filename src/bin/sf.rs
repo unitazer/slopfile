@@ -117,18 +117,8 @@ async fn remote_inner(
   {
     println!("{status}");
   }
-  info!("command `{}` sent to task `{}`", cmd_name(cmd), session);
+  info!("command `{}` sent to task `{}`", cmd.as_str(), session);
   Ok(())
-}
-
-fn cmd_name(cmd: Cmd) -> &'static str {
-  match cmd {
-    Cmd::Send => "send",
-    Cmd::Stop => "stop",
-    Cmd::Abort => "abort",
-    Cmd::Status => "status",
-    Cmd::Question => "question",
-  }
 }
 
 /// Creating a session is pure local file work, and must work with no daemon running. The only hard

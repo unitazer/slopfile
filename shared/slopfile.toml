@@ -23,6 +23,7 @@ abort_restart_server = true
 llama_container = "clanker-llama"
 subagent_max_depth = 2
 burst_max_turns = 0  
+dont_kill_my_ssd = false
 # tell_model_context_size = true   # per-session override of the setting above
 
 # Any OpenAI-compatible endpoint. A session selects one with `provider = "<name>"` in its fence.

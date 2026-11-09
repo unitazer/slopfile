@@ -477,7 +477,7 @@ async fn run_generation_turn(
 
   client.ensure_model_loaded(&model).await;
 
-  let mut active = StreamWriter::new(path, work);
+  let mut active = StreamWriter::new(path, work, cfg.dont_kill_my_ssd);
   info!(
     "→ {path:?}: generating (provider={}, model={model}, thinking={thinking}, messages={}, tokens={})",
     endpoint,

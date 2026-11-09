@@ -159,6 +159,18 @@ pub enum Cmd {
   Question,
 }
 
+impl Cmd {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Cmd::Send => "send",
+      Cmd::Stop => "stop",
+      Cmd::Abort => "abort",
+      Cmd::Status => "status",
+      Cmd::Question => "question",
+    }
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Req {
   pub cmd: Cmd,
@@ -383,42 +395,31 @@ fn dispatch(cfg: &AppConfig, req: &Req) -> Resp {
     Ok(name) => name.to_string(),
     Err(e) => return Resp::failed(e),
   };
-  match req.cmd {
-    // Arming a file that does not exist can never be swept, so `sf send typo` would report
-    // success and exit 0 while doing nothing at all. Every arming command checks first.
-    Cmd::Send => match resolve_path(cfg, &req.session) {
-      Ok(path) if path.exists() => {
-        update(&name, |s| s.arm());
-        Resp::done(snapshot(&name).status(&name))
-      }
-      _ => Resp::failed(format!("no such task `{}`", req.session)),
-    },
-    Cmd::Stop => match resolve_path(cfg, &req.session) {
-      Ok(path) if path.exists() => {
-        update(&name, |s| s.disarm());
-        Resp::done(snapshot(&name).status(&name))
-      }
-      _ => Resp::failed(format!("no such task `{}`", req.session)),
-    },
-    Cmd::Abort => match resolve_path(cfg, &req.session) {
-      Ok(path) if path.exists() => {
-        update(&name, |s| s.request_abort());
-        Resp::done(snapshot(&name).status(&name))
-      }
-      _ => Resp::failed(format!("no such task `{}`", req.session)),
-    },
-    Cmd::Status => match resolve_path(cfg, &req.session) {
-      Ok(path) if path.exists() => Resp::done(snapshot(&name).status(&name)),
-      _ => Resp::failed(format!("no such task `{}`", req.session)),
-    },
-    Cmd::Question => match answer(cfg, req) {
+
+  if req.cmd == Cmd::Question {
+    return match answer(cfg, req) {
       Ok(()) => {
         update(&name, |s| s.arm());
         Resp::done(snapshot(&name).status(&name))
       }
       Err(e) => Resp::failed(e),
-    },
+    };
   }
+
+  // Arming or inspecting a file that does not exist can never be swept, so `sf send typo`
+  // would report success while doing nothing.
+  if !resolve_path(cfg, &req.session).is_ok_and(|p| p.exists()) {
+    return Resp::failed(format!("no such task `{}`", req.session));
+  }
+
+  match req.cmd {
+    Cmd::Send => update(&name, |s| s.arm()),
+    Cmd::Stop => update(&name, |s| s.disarm()),
+    Cmd::Abort => update(&name, |s| s.request_abort()),
+    Cmd::Status => {}
+    Cmd::Question => unreachable!(),
+  }
+  Resp::done(snapshot(&name).status(&name))
 }
 
 /// The one rule for turning user input into a session name: a bare stem, no path, no surprises.

@@ -35,6 +35,7 @@ fn yolo_cfg() -> AppConfig {
     abort_restart_server: false,
     llama_container: "test-llama".into(),
     subagent_max_depth: 2,
+    dont_kill_my_ssd: false,
   }
 }
 
@@ -349,7 +350,7 @@ fn stream_writer_closes_sections_and_keeps_the_file_valid() {
   session.begin_round();
   write_session(&path, &session);
 
-  let mut w = StreamWriter::new(&path, load(&path));
+  let mut w = StreamWriter::new(&path, load(&path), false);
   w.handle(&StreamEvent::Text("hello ".into()));
   w.handle(&StreamEvent::Text("world".into()));
   w.handle(&StreamEvent::Reasoning("a thought".into()));
@@ -366,6 +367,39 @@ fn stream_writer_closes_sections_and_keeps_the_file_valid() {
 }
 
 #[test]
+fn stream_writer_dont_kill_my_ssd_buffers_until_finish() {
+  let dir = scratch("ssd-buffer");
+  let path = dir.join("buffer.md");
+  let mut session = template(&yolo_cfg(), &[]);
+  session.input = "hi".into();
+  session.promote_input();
+  session.begin_round();
+  write_session(&path, &session);
+  let before = read_to_string(&path).unwrap();
+
+  let mut w = StreamWriter::new(&path, load(&path), true);
+  w.handle(&StreamEvent::Text("hello ".into()));
+  w.handle(&StreamEvent::Text("world".into()));
+  w.handle(&StreamEvent::Reasoning("a thought".into()));
+
+  let mid = read_to_string(&path).unwrap();
+  assert_eq!(
+    mid, before,
+    "buffered mode must not write to disk during streaming"
+  );
+  assert!(
+    !mid.contains("hello world"),
+    "streamed text leaked to disk before finish: {mid}"
+  );
+
+  w.finish_section();
+  let after = read_to_string(&path).unwrap();
+  assert!(after.contains("hello world"), "{after}");
+  assert!(after.contains("a thought"), "{after}");
+  assert!(after.contains("<!-- slopfile:text -->"), "{after}");
+}
+
+#[test]
 fn stream_translates_raw_think_tags_and_drops_orphans() {
   let dir = scratch("thinktags");
   let path = dir.join("thinktags.md");
@@ -373,7 +407,7 @@ fn stream_translates_raw_think_tags_and_drops_orphans() {
   session.begin_round();
   write_session(&path, &session);
 
-  let mut w = StreamWriter::new(&path, load(&path));
+  let mut w = StreamWriter::new(&path, load(&path), false);
   w.handle(&StreamEvent::Text("</think>answer text".into()));
   w.handle(&StreamEvent::Reasoning("hmm".into()));
   w.handle(&StreamEvent::Text("<think>ignored open".into()));
@@ -1477,7 +1511,7 @@ async fn concurrent_writes_leave_the_file_intact() {
 fn the_prompt_budget_leaves_room_for_the_answer() {
   let budget = 131_072;
   let allowance = tokens::output_allowance(budget);
-  assert_eq!(allowance, 32_768);
+  assert_eq!(allowance, 21_845);
   assert_eq!(
     tokens::prompt_budget(budget),
     budget - allowance,
@@ -1600,7 +1634,7 @@ fn text_the_user_types_during_a_stream_is_not_clobbered() {
   )
   .unwrap();
   let s = transcript::load(&p).expect("parse");
-  let mut w = StreamWriter::new(&p, s);
+  let mut w = StreamWriter::new(&p, s, false);
 
   w.handle(&crate::types::StreamEvent::Text("hello".into()));
   w.finish_section();
@@ -2659,7 +2693,11 @@ fn the_tag_survives_into_the_next_request_without_growing() {
   let b = load(&path).request_messages();
   let count = |m: &[crate::types::ChatMessage]| {
     m.iter()
-      .filter(|x| x.content.as_deref().is_some_and(|c| c.contains("[ctx:")))
+      .filter(|x| {
+        x.content
+          .as_deref()
+          .is_some_and(|c| c.contains("[ctx:12345]"))
+      })
       .count()
   };
   assert_eq!(count(&a), 1, "the tag is written once into the file");

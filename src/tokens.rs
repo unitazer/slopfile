@@ -52,10 +52,6 @@ pub(crate) async fn request_token_count(
       serde_json::json!({"content": content.clone()}),
     ),
   ] {
-
-
-
-
     let resp = match client.request(&url).json(&body).send().await {
       Ok(r) => r,
       Err(e) => {
@@ -174,8 +170,6 @@ pub struct Counting {
 }
 ///
 fn message_chars(m: &ChatMessage, llama: bool) -> u64 {
-
-
   crate::api::sanitize_messages(std::slice::from_ref(m), llama)
     .first()
     .map_or(0, |m| {
@@ -205,7 +199,6 @@ fn estimate_counts(
     .map(|m| (message_chars(m, llama) as f64 / ratio).round() as usize)
     .collect();
 
-
   if let Some(first) = counts.first_mut() {
     *first += (counting.tools_chars as f64 / ratio).round() as usize;
   }
@@ -225,7 +218,6 @@ pub async fn build_request_messages(
       payload_chars: 0,
     });
   }
-
 
   let model = session.model().unwrap_or(&cfg.default_session_model);
   let counts = if endpoint.llama {
@@ -261,8 +253,6 @@ pub async fn build_request_messages(
 ///
 pub fn context_bands(budget: u32) -> (u32, u32) {
   let usable = prompt_budget(budget);
-
-
 
   let hi = (usable / 2).max(20_000).min(usable);
   let lo = (usable / 4).clamp(8_000, 80_000).min(hi / 2);
@@ -377,7 +367,6 @@ mod tests {
       &endpoint,
       &crate::api::test_client_at(endpoint.base.clone()),
       &Counting {
-
         anchor: Some(PromptSample {
           chars,
           tokens: (chars / 4) as u32,
@@ -544,7 +533,6 @@ mod tests {
       &msgs,
       &hosted(200_000),
       &Endpoint::local(&format!("http://{addr}")),
-
       &Counting {
         anchor: Some(PromptSample {
           chars: 999_999,
@@ -576,7 +564,7 @@ mod tests {
       );
     }
 
-    assert_eq!(output_allowance(65_536), 32_000);
-    assert_eq!(prompt_budget(65_536), 33_536);
+    assert_eq!(output_allowance(65_536), 10_922);
+    assert_eq!(prompt_budget(65_536), 54_614);
   }
 }

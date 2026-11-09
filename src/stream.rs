@@ -7,11 +7,6 @@ use tracing::warn;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
-fn fingerprint(path: &Path) -> Option<(std::time::SystemTime, u64)> {
-  let md = std::fs::metadata(path).ok()?;
-  Some((md.modified().ok()?, md.len()))
-}
-
 pub struct StreamWriter {
   path: PathBuf,
   session: Session,
@@ -19,15 +14,19 @@ pub struct StreamWriter {
   /// (mtime, len) of the file as of our own last write, so the common case costs one `stat`
   /// instead of a full re-read and re-parse twenty times a second.
   last_written: Option<(std::time::SystemTime, u64)>,
+  /// When true, skip periodic writes and persist only on forced commits (end of a streamed
+  /// section / explicit finish). Trades live on-disk streaming for fewer writes.
+  dont_kill_my_ssd: bool,
 }
 
 impl StreamWriter {
-  pub fn new(path: &Path, session: Session) -> Self {
+  pub fn new(path: &Path, session: Session, dont_kill_my_ssd: bool) -> Self {
     Self {
       path: path.to_path_buf(),
       session,
       last_flush: Instant::now(),
-      last_written: fingerprint(path),
+      last_written: transcript::fingerprint(path),
+      dont_kill_my_ssd,
     }
   }
 
@@ -86,14 +85,16 @@ impl StreamWriter {
   }
 
   fn flush(&mut self, force: bool) {
-    if !force && self.last_flush.elapsed() < FLUSH_INTERVAL {
-      return;
+    if !force {
+      if self.dont_kill_my_ssd || self.last_flush.elapsed() < FLUSH_INTERVAL {
+        return;
+      }
     }
     self.last_flush = Instant::now();
     self.absorb_user_input();
     let rendered = self.session.render();
     match transcript::write_file(&self.path, rendered) {
-      Ok(()) => self.last_written = fingerprint(&self.path),
+      Ok(()) => self.last_written = transcript::fingerprint(&self.path),
       Err(e) => warn!("stream write failed: {e}"),
     }
   }
@@ -104,7 +105,7 @@ impl StreamWriter {
   fn absorb_user_input(&mut self) {
     // Our own write is the overwhelmingly common case; only re-read when the file is not exactly
     // what we last left there, which means the human saved something.
-    let now = fingerprint(&self.path);
+    let now = transcript::fingerprint(&self.path);
     if now.is_none() || now == self.last_written {
       return;
     }

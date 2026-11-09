@@ -559,6 +559,11 @@ pub struct AppConfig {
   /// appended to the `ctx:N` tag. `None` never adds the reminder.
   pub compaction_reminder_threshold: Option<u32>,
   pub subagent_max_depth: u32,
+  /// Buffer streaming output in memory and write the context file only at commit points (when a
+  /// streamed response section ends, and when tool/results are persisted) instead of flushing every
+  /// ~50ms. Reduces SSD churn at the cost of live on-disk streaming progress.
+  #[serde(default)]
+  pub dont_kill_my_ssd: bool,
 }
 
 fn default_api_base() -> String {
@@ -622,6 +627,7 @@ impl Default for AppConfig {
       what_to_tell_when_above_reminder_threshold: default_compaction_reminder(),
       compaction_reminder_threshold: None,
       subagent_max_depth: default_subagent_max_depth(),
+      dont_kill_my_ssd: false,
     }
   }
 }
@@ -814,6 +820,7 @@ burst_max_turns = 0
 tell_model_context_size = true
 what_to_tell_when_above_reminder_threshold = ", please compact!"
 subagent_max_depth = 2
+dont_kill_my_ssd = false
 {top}
 [providers]
 {providers}

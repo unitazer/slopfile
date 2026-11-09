@@ -151,11 +151,9 @@ fn same_shape(a: &Session, b: &Session) -> bool {
       x.user == y.user
         && x.notes.len() == y.notes.len()
         && x.rounds.len() == y.rounds.len()
-        && x
-          .rounds
-          .iter()
-          .zip(y.rounds.iter())
-          .all(|(p, q)| p.notes.len() == q.notes.len() && p.trailing_notes.len() == q.trailing_notes.len())
+        && x.rounds.iter().zip(y.rounds.iter()).all(|(p, q)| {
+          p.notes.len() == q.notes.len() && p.trailing_notes.len() == q.trailing_notes.len()
+        })
     })
 }
 

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use slopfile::control::{Cmd, Req};
-use slopfile::{api::LlamaClient, control, daemon, load_app_config, scan_transcripts};
+use slopfile::{api::LlamaClient, control, daemon, load_app_config, scan_transcripts, transcript};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,22 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+async fn record_park(
+  path: &Path,
+  name: &str,
+  token: u64,
+  parked: &Mutex<HashMap<PathBuf, Option<SystemTime>>>,
+  parked_at_token: &Mutex<HashMap<PathBuf, u64>>,
+) {
+  let parked_at = transcript::fingerprint(path).map(|(t, _)| t);
+  parked.lock().await.insert(path.to_path_buf(), parked_at);
+  parked_at_token
+    .lock()
+    .await
+    .insert(path.to_path_buf(), token);
+  control::update(name, |s| s.parked = true);
+}
 
 const THROTTLE_SECS: u64 = 5;
 const PARK_AFTER_FAILURES: u32 = 5;
@@ -63,11 +79,6 @@ fn acquire_daemon_lock(transcripts_dir: &str) -> std::fs::File {
     std::process::exit(1);
   }
   file
-}
-
-fn file_fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
-  let meta = std::fs::metadata(path).ok()?;
-  Some((meta.modified().ok()?, meta.len()))
 }
 
 #[tokio::main]
@@ -146,8 +157,7 @@ async fn main() {
     };
     // Entries for files that no longer exist are never revisited, so they would accumulate forever.
     {
-      let live: std::collections::HashSet<&std::path::Path> =
-        files.iter().map(|p| p.as_path()).collect();
+      let live: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
       let mut throttled = throttled.lock().await;
       throttled.retain(|p, _| live.contains(p.as_path()));
       drop(throttled);
@@ -183,7 +193,7 @@ async fn main() {
           Some(t) => control::snapshot(&name).arm_token() > t,
           None => true,
         };
-        if at.is_some() && !user_asked && file_fingerprint(&path).map(|(t, _)| t) == at {
+        if at.is_some() && !user_asked && transcript::fingerprint(&path).map(|(t, _)| t) == at {
           continue;
         }
         parked.lock().await.remove(&path);
@@ -250,10 +260,7 @@ async fn main() {
               Some(s.arm_token())
             });
             if let Some(token) = token {
-              let parked_at = file_fingerprint(&path).map(|(t, _)| t);
-              parked.lock().await.insert(path.clone(), parked_at);
-              parked_at_token.lock().await.insert(path.clone(), token);
-              control::update(&name, |s| s.parked = true);
+              record_park(&path, &name, token, &parked, &parked_at_token).await;
               warn!(
                 "session {}: parked; the provider refused this one (noted in the transcript). Edit \
                  the file or `sf send` to try again.",
@@ -272,11 +279,8 @@ async fn main() {
             };
             if count >= PARK_AFTER_FAILURES {
               failures.lock().await.remove(&path);
-              let parked_at = file_fingerprint(&path).map(|(t, _)| t);
               let token = control::snapshot(&name).arm_token();
-              parked.lock().await.insert(path.clone(), parked_at);
-              parked_at_token.lock().await.insert(path.clone(), token);
-              control::update(&name, |s| s.parked = true);
+              record_park(&path, &name, token, &parked, &parked_at_token).await;
               warn!(
                 "session {}: parked after {PARK_AFTER_FAILURES} consecutive failures; edit the file to retry",
                 path.display()

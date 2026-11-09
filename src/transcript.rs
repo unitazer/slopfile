@@ -1,8 +1,14 @@
 use crate::session::{self, Session};
 use std::path::Path;
+use std::time::SystemTime;
 
 pub fn read_file(path: &Path) -> Result<String, String> {
   std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
+}
+
+pub fn fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
+  let meta = std::fs::metadata(path).ok()?;
+  Some((meta.modified().ok()?, meta.len()))
 }
 
 /// Write via a temp file in the same directory and rename. A plain `fs::write` truncates first, so
